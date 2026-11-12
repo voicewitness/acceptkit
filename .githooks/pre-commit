@@ -1,0 +1,3 @@
+#!/bin/sh
+# 提交前泄漏扫描。私有词表路径由本机环境变量 ACCEPTKIT_DENYLIST 提供（词表不在仓库里）。
+node scripts/leakscan.mjs || { echo "leakscan 未通过，提交已拦下"; exit 1; }

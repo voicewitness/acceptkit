@@ -1,0 +1,58 @@
+{
+  "name": "acceptkit",
+  "version": "0.1.0",
+  "description": "A local acceptance-testing toolkit your coding agent drives: human-readable cases, evidence-gated verdicts, human approval gates, and no model calls in the tool layer.",
+  "type": "module",
+  "bin": {
+    "acceptkit": "bin/acceptkit.mjs"
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check:leaks": "node scripts/leakscan.mjs"
+  },
+  "license": "Apache-2.0",
+  "files": [
+    "bin",
+    "core",
+    "adapters",
+    "skill",
+    "docs",
+    "!docs/design",
+    "examples",
+    "!examples/**/.acceptkit",
+    "!examples/**/runs",
+    "!examples/**/state",
+    "!examples/**/dashboard.html",
+    "!examples/**/shots",
+    "!examples/**/evidence",
+    "README.md",
+    "README.en.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/voicewitness/acceptkit.git"
+  },
+  "homepage": "https://github.com/voicewitness/acceptkit#readme",
+  "bugs": {
+    "url": "https://github.com/voicewitness/acceptkit/issues"
+  },
+  "keywords": [
+    "acceptance-testing",
+    "qa",
+    "e2e",
+    "agent",
+    "coding-agent",
+    "claude-code",
+    "codex",
+    "android",
+    "ios",
+    "web",
+    "cdp",
+    "evidence"
+  ]
+}

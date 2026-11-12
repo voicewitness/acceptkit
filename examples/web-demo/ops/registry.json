@@ -1,0 +1,28 @@
+{
+  "_why": "示例项目的操作库：用例只说做什么，这里说各平台怎么做。",
+  "ops": {
+    "page-text": {
+      "kind": "observe",
+      "title": "读页面上的文字（同一刻截图）",
+      "why": "判据就是用户在页面上看到的文字，直接从 DOM 读。",
+      "platforms": {
+        "web": {
+          "exec": "web",
+          "strength": "S2",
+          "state": "confirmed"
+        }
+      }
+    },
+    "app-diag": {
+      "kind": "observe",
+      "title": "被测页面的诊断接口（项目扩展 pack.mjs 里的 demo-diag 通道）",
+      "why": "被测对象主动报告的状态真值，不受文案改动影响，证据强度 S1。示例里由页面的 window.__demoState 模拟；真实项目换成 App 的调试接口。",
+      "platforms": {
+        "web": {
+          "exec": "demo-diag",
+          "state": "confirmed"
+        }
+      }
+    }
+  }
+}

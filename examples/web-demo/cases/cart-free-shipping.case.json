@@ -1,0 +1,150 @@
+{
+  "case": "cart-free-shipping",
+  "title": "购物车满 99 包邮：差一点时提示还差多少，满额后运费为 0",
+  "platform": "web",
+  "kind": "acceptance",
+  "origin": {
+    "id": "DEMO-1",
+    "title": "示例需求：满 99 包邮"
+  },
+  "why": "演示 acceptkit 的用例形态：人话断言 + 观测规格；项目扩展提供的诊断通道；以及要求的证据拿不到时降级、记为阻塞。",
+  "classifications": {
+    "carrier": [
+      "web"
+    ],
+    "lever": [
+      "threshold"
+    ]
+  },
+  "tree": [
+    {
+      "op": "打开购物车页，合计 98.99 元",
+      "tags": {
+        "carrier": "web",
+        "lever": "threshold"
+      },
+      "expect": [
+        {
+          "id": "E1",
+          "assert": "页面提示「再买 0.01 元包邮」，运费显示 8.00",
+          "seen_at": "购物车页的提示条和运费一栏",
+          "observe": {
+            "op": "page-text",
+            "params": {
+              "url": "file://{project}/site/index.html?total=98.99",
+              "wait_ms": 800,
+              "eval": "({tip: document.getElementById('tip').textContent, shipping: document.getElementById('shipping').textContent})"
+            },
+            "checks": [
+              {
+                "pick": "tip",
+                "predicate": {
+                  "eq": "再买 0.01 元包邮"
+                }
+              },
+              {
+                "pick": "shipping",
+                "predicate": {
+                  "eq": "8.00"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "id": "E2",
+          "assert": "被测对象自己报告的状态：未包邮",
+          "via": "diag",
+          "why_not_ui": "「是否包邮」是被测对象内部的判定结果，用户看到的只是由它渲染出来的提示语；这条直接读判定本身（项目扩展 pack.mjs 提供的 demo-diag 通道）",
+          "observe": {
+            "op": "app-diag",
+            "params": {},
+            "checks": [
+              {
+                "pick": "free",
+                "predicate": {
+                  "eq": false
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "children": [
+        {
+          "op": "合计改为 99.00 元，重新打开页面",
+          "tags": {
+            "carrier": "web",
+            "lever": "threshold"
+          },
+          "expect": [
+            {
+              "id": "E3",
+              "assert": "页面提示「已满 99 元，免运费」，运费显示 0.00",
+              "seen_at": "购物车页的提示条和运费一栏",
+              "observe": {
+                "op": "page-text",
+                "params": {
+                  "url": "file://{project}/site/index.html?total=99",
+                  "wait_ms": 800,
+                  "eval": "({tip: document.getElementById('tip').textContent, shipping: document.getElementById('shipping').textContent})"
+                },
+                "checks": [
+                  {
+                    "pick": "tip",
+                    "predicate": {
+                      "eq": "已满 99 元，免运费"
+                    }
+                  },
+                  {
+                    "pick": "shipping",
+                    "predicate": {
+                      "eq": "0.00"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "id": "E4",
+              "assert": "订单后台结算出的运费为 0（要求被测对象直接报告，证据强度至少 S1）",
+              "via": "diag",
+              "why_not_ui": "页面上的运费只是展示，结算以订单后台为准，界面上看不到结算结果；示例站点没有后台，诊断通道读不到这一项，会降级读页面上的运费（S2），强度不够，记为阻塞",
+              "observe": {
+                "op": "app-diag",
+                "params": {
+                  "need": "settled_shipping"
+                },
+                "fallback": [
+                  {
+                    "op": "page-text",
+                    "params": {
+                      "eval": "({shipping: document.getElementById('shipping').textContent})"
+                    },
+                    "checks": [
+                      {
+                        "pick": "shipping",
+                        "predicate": {
+                          "eq": "0.00"
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "checks": [
+                  {
+                    "pick": "settled_shipping",
+                    "predicate": {
+                      "eq": 0
+                    }
+                  }
+                ],
+                "min_strength": "S1"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

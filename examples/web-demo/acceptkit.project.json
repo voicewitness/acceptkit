@@ -1,0 +1,10 @@
+{
+  "name": "web-demo",
+  "gate": {
+    "label": "目标闸",
+    "allow": [
+      { "value": "web-demo/site", "kind": "bundle", "note": "示例站点：本仓库里的本地静态页 site/index.html，没有后台、不存数据，可以随意操作" }
+    ]
+  },
+  "hosts": { "site": { "title": "示例站点", "web": { "port": 9360, "tabMatch": "web-demo/site" } } }
+}

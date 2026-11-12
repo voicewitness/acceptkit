@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>示例商城 · 购物车</title>
+<style>body{font:15px/1.6 sans-serif;max-width:520px;margin:40px auto;padding:0 16px}.tip{padding:8px 12px;border-radius:8px;background:#eef6ee}.tip.none{display:none}</style></head>
+<body>
+<h1>购物车</h1>
+<p>商品合计：<b id="total"></b> 元</p>
+<p>运费：<b id="shipping"></b> 元</p>
+<p class="tip" id="tip"></p>
+<script>
+  // 示例被测逻辑：满 99 包邮。合计从地址参数 ?total= 读入，方便验收时构造不同金额。
+  const THRESHOLD = 99, FEE = 8;
+  const total = Number(new URLSearchParams(location.search).get('total') || '0');
+  const free = total >= THRESHOLD;
+  document.getElementById('total').textContent = total.toFixed(2);
+  document.getElementById('shipping').textContent = (free ? 0 : FEE).toFixed(2);
+  const tip = document.getElementById('tip');
+  if (free) { tip.textContent = '已满 99 元，免运费'; }
+  else { tip.textContent = `再买 ${(THRESHOLD - total).toFixed(2)} 元包邮`; }
+  // 示例的「诊断接口」：被测页面主动暴露的状态真值（S1 通道）。真实项目里由 App / 后台提供，经扩展钩子接入。
+  window.__demoState = { total, free, shipping: free ? 0 : FEE };
+</script>
+</body>
+</html>

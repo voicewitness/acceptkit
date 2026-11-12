@@ -1,0 +1,10 @@
+# 项目运行数据不进仓库（示例项目跑出来的也一样）
+node_modules/
+.acceptkit/
+**/runs/
+**/state/
+**/dashboard.html
+**/shots/
+**/evidence/
+*.bak*
+.DS_Store

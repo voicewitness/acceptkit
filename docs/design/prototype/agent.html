@@ -1,0 +1,441 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>acceptkit · 验收 Agent 原型</title>
+<style>
+  :root { --ink:#1f2328; --sub:#656d76; --line:#e3e6ea; --bg:#f7f8fa; --acc:#3b5bfd; --acc-bg:#eef1ff; --ok:#1a7f37; --ok-bg:#e6f6ea; --warn:#9a6700; --warn-bg:#fff6d6; --bad:#cf222e; }
+  * { box-sizing:border-box; }
+  html, body { height:100%; margin:0; }
+  body { font:14px/1.6 "PingFang SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif; color:var(--ink); background:#fff; }
+  .hidden { display:none !important; }
+  button { font:inherit; cursor:pointer; }
+
+  /* ---------- 首屏：只配模型 ---------- */
+  #setup { height:100%; display:flex; align-items:center; justify-content:center; background:radial-gradient(1200px 600px at 50% -10%, #eef1ff, #fff); }
+  .setup-card { width:560px; }
+  .brand { font-size:15px; font-weight:700; letter-spacing:.2px; color:var(--sub); margin-bottom:28px; }
+  .setup-card h1 { font-size:28px; margin:0 0 8px; }
+  .setup-card p.lead { color:var(--sub); margin:0 0 26px; }
+  .opt { border:1px solid var(--line); border-radius:12px; padding:14px 16px; margin-bottom:10px; display:flex; gap:12px; align-items:flex-start; cursor:pointer; background:#fff; }
+  .opt.sel { border-color:var(--acc); box-shadow:0 0 0 3px var(--acc-bg); }
+  .opt .t { font-weight:600; } .opt .d { color:var(--sub); font-size:13px; }
+  .opt .badge { margin-left:auto; font-size:12px; color:var(--ok); background:var(--ok-bg); border-radius:20px; padding:1px 10px; white-space:nowrap; }
+  .keyrow { display:flex; gap:8px; margin:6px 0 0; }
+  .keyrow input, .keyrow select { flex:1; border:1px solid var(--line); border-radius:8px; padding:8px 10px; font:inherit; }
+  .primary { background:var(--ink); color:#fff; border:0; border-radius:10px; padding:11px 18px; font-weight:600; }
+  .primary:disabled { opacity:.4; cursor:default; }
+  .fine { color:var(--sub); font-size:12px; margin-top:14px; }
+
+  /* ---------- 工作台 ---------- */
+  #work { height:100%; display:flex; }
+  .side { width:220px; background:var(--bg); border-right:1px solid var(--line); padding:16px 12px; display:flex; flex-direction:column; gap:4px; }
+  .side .brand { margin:0 6px 14px; }
+  .side .proj { font-weight:600; padding:6px 8px; }
+  .side .item { padding:6px 8px; border-radius:8px; color:var(--sub); }
+  .side .item.cur { background:#fff; color:var(--ink); border:1px solid var(--line); }
+  .side .sp { flex:1; }
+  .side .model { font-size:12px; color:var(--sub); padding:8px; border-top:1px solid var(--line); }
+
+  .chat { flex:1; display:flex; flex-direction:column; min-width:0; }
+  .chat-head { padding:14px 24px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:10px; }
+  .chat-head .t { font-weight:600; }
+  .chat-head .s { color:var(--sub); font-size:13px; }
+  .stream { flex:1; overflow:auto; padding:24px 0; }
+  .msg { max-width:760px; margin:0 auto 18px; padding:0 24px; }
+  .msg.user .bubble { margin-left:auto; background:var(--acc-bg); border-radius:14px; padding:9px 14px; width:fit-content; max-width:80%; }
+  .msg.agent .who { font-size:12px; color:var(--sub); margin-bottom:4px; }
+  .tools { border:1px solid var(--line); border-radius:10px; background:var(--bg); font:12.5px/1.7 Menlo,"SF Mono",monospace; padding:8px 12px; margin:6px 0 10px; color:#444; }
+  .tools .l { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .tools .l::before { content:"› "; color:var(--sub); }
+  .tools .l.ok::after { content:"  ✓"; color:var(--ok); }
+  .tools .head { font-family:"PingFang SC",sans-serif; color:var(--sub); font-size:12px; margin-bottom:2px; }
+  .acts { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  .act { border:1px solid var(--line); background:#fff; border-radius:20px; padding:5px 14px; font-size:13px; }
+  .act.pri { background:var(--ink); color:#fff; border-color:var(--ink); }
+  .act:disabled { opacity:.45; cursor:default; }
+  .run { border:1px solid var(--line); border-radius:12px; overflow:hidden; margin-top:8px; }
+  .run .rh { padding:10px 14px; background:var(--bg); display:flex; gap:8px; align-items:center; font-weight:600; }
+  .run .rh .st { margin-left:auto; font-size:12px; font-weight:600; border-radius:20px; padding:1px 10px; }
+  .st.ing { background:var(--acc-bg); color:var(--acc); } .st.ok { background:var(--ok-bg); color:var(--ok); }
+  .run table { width:100%; border-collapse:collapse; font-size:13px; }
+  .run td { padding:8px 14px; border-top:1px solid var(--line); vertical-align:top; }
+  .run td.res { width:70px; }
+  .ev { font-size:12px; color:var(--sub); }
+  .shots { display:flex; gap:8px; padding:10px 14px; border-top:1px solid var(--line); }
+  .shot { width:64px; height:112px; border-radius:8px; border:1px solid var(--line); background:repeating-linear-gradient(45deg,#f1f3f5,#f1f3f5 5px,#e8ebee 5px,#e8ebee 10px); }
+  .plan { border:1px solid var(--line); border-radius:12px; margin-top:8px; }
+  .plan .ph { padding:10px 14px; font-weight:600; border-bottom:1px solid var(--line); display:flex; }
+  .plan .ph span { margin-left:auto; font-weight:400; color:var(--sub); font-size:12px; }
+  .plan .row { padding:9px 14px; border-bottom:1px solid var(--line); display:flex; gap:10px; font-size:13px; }
+  .plan .row:last-child { border-bottom:0; }
+  .tag { font-size:11.5px; border-radius:6px; padding:0 7px; border:1px solid var(--line); color:var(--sub); white-space:nowrap; height:20px; line-height:18px; }
+  .tag.new { color:var(--acc); border-color:#c9d2ff; background:var(--acc-bg); }
+  .tag.reuse { color:var(--ok); border-color:#b7e2c1; background:var(--ok-bg); }
+  .composer { border-top:1px solid var(--line); padding:14px 24px; }
+  .composer .box { max-width:760px; margin:0 auto; border:1px solid var(--line); border-radius:14px; padding:10px 12px; display:flex; gap:10px; align-items:center; }
+  .composer input { flex:1; border:0; outline:0; font:inherit; }
+  .composer .attach { color:var(--sub); font-size:13px; border:1px dashed var(--line); border-radius:8px; padding:3px 10px; }
+  .composer .send { background:var(--ink); color:#fff; border:0; border-radius:10px; padding:6px 14px; }
+
+  /* ---------- 知识面板 ---------- */
+  .kb { width:360px; border-left:1px solid var(--line); display:flex; flex-direction:column; background:#fcfcfd; }
+  .kb-head { padding:14px 18px; border-bottom:1px solid var(--line); }
+  .kb-head .t { font-weight:600; }
+  .kb-head .s { color:var(--sub); font-size:12.5px; }
+  .kb-body { flex:1; overflow:auto; padding:12px 14px; }
+  .sec { font-size:12px; color:var(--sub); font-weight:600; margin:14px 4px 6px; letter-spacing:.3px; }
+  .sec:first-child { margin-top:2px; }
+  .k { border:1px solid var(--line); border-radius:10px; background:#fff; padding:10px 12px; margin-bottom:8px; animation:in .35s ease; }
+  @keyframes in { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:none; } }
+  .k .kt { font-weight:600; font-size:13.5px; display:flex; gap:6px; align-items:center; }
+  .k .kv { font-size:13px; margin-top:2px; }
+  .k .src { font-size:12px; color:var(--sub); margin-top:4px; }
+  .k .state { margin-left:auto; font-size:11.5px; font-weight:600; border-radius:20px; padding:0 8px; }
+  .state.guess { background:var(--warn-bg); color:var(--warn); }
+  .state.ok { background:var(--ok-bg); color:var(--ok); }
+  .state.verified { background:var(--acc-bg); color:var(--acc); }
+  .k .kacts { margin-top:8px; display:flex; gap:6px; }
+  .k .kacts button { border:1px solid var(--line); background:#fff; border-radius:6px; font-size:12px; padding:2px 10px; }
+  .empty { color:var(--sub); font-size:13px; padding:20px 6px; text-align:center; }
+  .k.locked .kt::after { content:"产品锁定"; margin-left:auto; font-size:11px; color:var(--sub); }
+
+  .demo { position:fixed; top:0; left:0; right:0; height:40px; z-index:20; background:#1f2328; color:#c9d1d9; display:flex; align-items:center; gap:6px; padding:0 14px; font-size:13px; }
+  .demo b { color:#fff; margin-right:8px; }
+  .demo button { background:transparent; color:#c9d1d9; border:1px solid #3d444d; border-radius:6px; padding:3px 10px; font-size:12.5px; }
+  .demo button.on { background:#3b5bfd; border-color:#3b5bfd; color:#fff; }
+  .demo .r { margin-left:auto; color:#8b949e; font-size:12px; }
+  #setup, #work { padding-top:40px; }
+  .state.gap { background:#ffebe9; color:var(--bad); }
+  .state.risk { background:#fff1e5; color:#bc4c00; }
+  .profile { border:1px solid var(--line); border-radius:12px; margin-top:8px; overflow:hidden; }
+  .profile .pr { display:flex; gap:12px; padding:8px 14px; border-top:1px solid var(--line); font-size:13px; }
+  .profile .pr:first-child { border-top:0; }
+  .profile .pk { width:96px; color:var(--sub); flex:none; }
+</style>
+</head>
+<body>
+
+<div class="demo"><b>原型 · 冷启动</b>用户环境：
+  <button data-sc="A">A 只有代码</button><button data-sc="B">B 只有安装包</button><button data-sc="C">C 大仓 + 多宿主</button><button data-sc="D">D 内网配置后台</button>
+  <span class="r">（真实产品里不需要选——Agent 自己发现。这里切换只为演示不同环境）</span></div>
+
+<div id="setup">
+  <div class="setup-card">
+    <div class="brand">acceptkit · 本机验收 Agent</div>
+    <h1>先连上一个模型</h1>
+    <p class="lead">这是唯一需要你配置的东西。要测什么、怎么连、能看到什么、哪些操作危险——我会自己去发现，拿不准的再问你。</p>
+    <div class="opt sel" data-opt="cli"><div><div class="t">使用本机已登录的编码 agent</div><div class="d">检测到本机有已登录的 agent CLI，复用它的模型和额度</div></div><div class="badge">已检测到</div></div>
+    <div class="opt" data-opt="key"><div style="flex:1"><div class="t">填写 API Key</div><div class="d">选择模型服务商，Key 存进系统钥匙串</div>
+      <div class="keyrow hidden" id="keyrow"><select><option>服务商</option></select><input placeholder="sk-…"></div></div></div>
+    <div class="opt" data-opt="gw"><div style="flex:1"><div class="t">公司模型网关</div><div class="d">填写兼容接口的地址和模型名</div></div></div>
+    <div style="display:flex; align-items:center; gap:12px; margin-top:18px"><button class="primary" id="connect">连接并开始</button><span id="conn" class="fine" style="margin:0"></span></div>
+    <div class="fine">截图、日志默认只在本机处理；发给模型的内容可以在「设置 → 数据」里查看和限制。</div>
+  </div>
+</div>
+
+<div id="work" class="hidden">
+  <div class="side">
+    <div class="brand">acceptkit</div>
+    <div class="proj" id="proj">新项目</div>
+    <div class="item cur">对话</div><div class="item">需求与验收</div><div class="item">用例</div><div class="item">运行记录</div><div class="item">知识</div>
+    <div class="sp"></div>
+    <div class="model">模型：本机 agent CLI · 已连接</div>
+  </div>
+  <div class="chat">
+    <div class="chat-head"><span class="t">验收 Agent</span><span class="s" id="phase">正在了解你的环境</span></div>
+    <div class="stream" id="stream"></div>
+    <div class="composer"><div class="box"><span class="attach">＋ 拖入仓库 / 安装包 / 文档 / 旧用例</span><input id="input" placeholder="和验收 Agent 说话……"><button class="send" id="send">发送</button></div></div>
+  </div>
+  <div class="kb">
+    <div class="kb-head"><div class="t">我知道的</div><div class="s">每条都有来源。黄色是推测，你确认或我实测之后才会用来做决定；红色是缺口。「设置」是流程要用的：构建方式、驱动 App 的工具，你可以直接改。</div></div>
+    <div class="kb-body" id="kb"></div>
+  </div>
+</div>
+
+<script>
+const $ = q => document.querySelector(q);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const stream = $('#stream'), kb = $('#kb');
+const STATE = { guess:'推测', ok:'已确认', verified:'已验证', gap:'缺口', risk:'风险' };
+const SECS = ['被测对象', '设置', '环境', '可动范围', '观测通道', '带到可测状态', '判读陷阱', '资料'];
+
+/* ================= 四种环境的剧本 =================
+   say: Agent 说话 | tools: 展示命令与结果 | know: 写知识面板 | ask: 给选项后暂停 | go: 选项跳到的标签
+   run: 冒烟执行 | profile: 环境画像 | user: 用户说的话 | end: 结束 */
+const S = {
+A: { proj: 'my-saas-app', steps: [
+  { say: '你好。我先检查一下这台机器的环境。' },
+  { tools: ['检查本机', 'adb devices  →  无设备', 'xcrun simctl list  →  未安装 Xcode', '查找 Chrome  →  已安装', '启动目录  →  ~/code/my-saas-app（Next.js 项目，git 仓库）'] },
+  { know: ['环境', 'dev', '设备', '没有手机设备', 'adb / xcrun', 'verified'] },
+  { know: ['环境', 'chrome', '浏览器', 'Chrome 已安装，验收时使用独立实例', '本机', 'verified'] },
+  { ask: '你是在 <b>~/code/my-saas-app</b> 目录里启动的。这次验收这个项目吗？', opts: [['验收这个项目', 'projA', 1], ['选择其他项目', 'pickA']] },
+  { label: 'pickA' },
+  { say: '<span style="color:var(--sub)">（这里会弹出项目选择：代码目录 / 安装包 / 网址。原型继续演示当前目录。）</span>' },
+  { label: 'projA' },
+  { know: ['被测对象', 'sut', 'Web 应用', '~/code/my-saas-app · commit a41f9c2（main）', '你确认的 + git', 'ok'] },
+  { tools: ['检查服务', 'lsof -i :3000  →  无进程监听', 'package.json  →  scripts.dev = next dev'] },
+  { say: '服务现在没在运行，<b>package.json</b> 里有 <code>npm run dev</code>。由我启动的话，我可以直接读取服务端日志。' },
+  { ask: '用 <code>npm run dev</code> 启动服务？', opts: [['启动服务', 'boot', 1]] },
+  { label: 'boot' },
+  { tools: ['启动服务', 'npm run dev  →  进程 48213', '等待 localhost:3000 …', 'GET http://localhost:3000  →  200'] },
+  { know: ['带到可测状态', 'boot', '怎么起服务', 'npm run dev（package.json）· 约 6 秒就绪', '实测', 'verified'] },
+  { tools: ['阅读仓库', 'app/ 下发现 14 个页面路由', 'auth.ts  →  账号密码登录', 'prisma/seed.ts  →  测试用户 demo@example.com', '.env  →  STRIPE_SECRET_KEY=sk_test_…、RESEND_API_KEY=…', '.env  →  DATABASE_URL=postgres://localhost:5432/dev'] },
+  { know: ['可动范围', 'scope', '只访问', 'localhost:3000', '服务是我起的', 'ok', 1] },
+  { know: ['可动范围', 'ext', '会打到外部的操作', '支付（Stripe 测试环境）、发邮件（Resend）——执行前问你', '.env 里的第三方服务密钥', 'risk'] },
+  { know: ['带到可测状态', 'acct', '测试账号', 'demo@example.com（种子数据）', 'prisma/seed.ts', 'guess'] },
+  { know: ['观测通道', 'o-dom', '页面内容 / 网络 / 控制台', '浏览器内置', '本机', 'verified'] },
+  { know: ['观测通道', 'o-srv', '服务端日志', '进程 48213 的输出', '服务是我起的', 'verified'] },
+  { say: '读完了。两个需要注意的：<br>• 项目接了<b>支付和发邮件</b>的第三方服务，冒烟里我不会触发它们，以后的用例碰到也会先问你。<br>• 本地有数据库。' },
+  { ask: '我能<b>只读</b>查询本地数据库，用来确认数据真的落库了吗？（不写、不删）', opts: [['允许只读访问', 'db', 1], ['不允许', 'nodb']] },
+  { label: 'db' },
+  { know: ['观测通道', 'o-db', '本地数据库（只读）', 'postgres://localhost:5432/dev · 只读连接', '你同意了', 'ok'] },
+  { goto: 'smokeA' },
+  { label: 'nodb' },
+  { know: ['观测通道', 'o-db', '本地数据库', '你不让碰——数据是否落库只能看页面和接口', '你说的', 'gap'] },
+  { label: 'smokeA' },
+  { ask: '跑一条最小的冒烟吧：用种子账号登录，看首页渲染、控制台没报错。', opts: [['运行冒烟用例', 'runA', 1]] },
+  { label: 'runA' },
+  { run: ['冒烟：登录并进入首页', 1, [['打开登录页', '页面内容 · 有「登录」按钮'], ['用 demo@example.com 登录', '网络 · POST /api/auth 200'], ['首页渲染', '页面内容 · 出现「控制台」标题'], ['浏览器控制台无报错', '控制台 · 0 error'], ['服务端无异常', '服务端日志 · 无 stack trace']]] },
+  { know: ['带到可测状态', 'acct', '测试账号', 'demo@example.com（种子数据）· 冒烟登录成功', '实测', 'verified'] },
+  { profile: [['被测对象', 'my-saas-app @ a41f9c2，每次运行记录 commit'], ['可动范围', '只访问 localhost；支付、发邮件先问'], ['观测', '页面 · 网络 · 控制台 · 服务端日志 · 数据库(只读)'], ['缺口', '无']] },
+  { end: '告诉我这次要验收什么——一段需求、一个 issue 链接，或者一句话。' },
+]},
+
+B: { proj: 'shop-app-qa', steps: [
+  { say: '你好。我先检查一下这台机器的环境。' },
+  { tools: ['检查本机', 'adb devices  →  1A2B3C（Pixel 7 真机）、emulator-5554（模拟器）', '真机已安装第三方 App  →  com.example.shop 3.2.1、微信、银行 App……', '模拟器已安装第三方 App  →  com.example.shop 3.2.1', '启动目录  →  ~（不是项目目录）'] },
+  { know: ['环境', 'emu', '模拟器', 'emulator-5554 · Android 14', 'adb', 'verified'] },
+  { know: ['环境', 'phone', '真机 Pixel 7', '装着微信、银行等个人 App——默认不在真机上操作', 'adb', 'risk'] },
+  { ask: '这次要验收什么？可以选择一个代码目录、安装包、设备上已安装的 App，或者一个网址。', opts: [['选择安装包', 'pickApk', 1], ['选择设备上已安装的 App', 'old'], ['选择代码目录', 'pickDir'], ['输入网址', 'pickDir']] },
+  { label: 'pickDir' },
+  { say: '<span style="color:var(--sub)">（原型只演示「选择安装包」这条路。）</span>' },
+  { label: 'pickApk' },
+  { user: '~/Downloads/shop-3.3.0-rc2.apk' },
+  { tools: ['读取安装包', 'aapt dump badging shop-3.3.0-rc2.apk  →  com.example.shop · versionName 3.3.0-rc2 · versionCode 330002', '同目录  →  回归用例.xlsx'] },
+  { know: ['被测对象', 'sut', 'Android App', 'com.example.shop 3.3.0-rc2（你选的安装包）', '你选的 + apk 清单', 'ok'] },
+  { know: ['被测对象', 'mismatch', '设备上的版本', '两台设备上装的都是 3.2.1，和待测包不一致', 'adb', 'risk'] },
+  { say: '这个安装包是 <b>3.3.0-rc2</b>，但两台设备上装的都是 <b>3.2.1</b>，需要先装上才能验。<br>真机上装着微信、银行这些 App，看起来是个人手机，我只用模拟器。' },
+  { ask: '把 3.3.0-rc2 安装到模拟器 emulator-5554？（覆盖安装，不卸载，保留数据）', opts: [['安装到模拟器', 'install', 1], ['取消', 'old']] },
+  { label: 'old' },
+  { know: ['被测对象', 'sut', 'Android App', 'com.example.shop 3.2.1（设备上已安装）', '你选的', 'ok'] },
+  { goto: 'obsB' },
+  { label: 'install' },
+  { tools: ['安装', 'adb -s emulator-5554 install -r shop-3.3.0-rc2.apk  →  Success', '装完核对：dumpsys package  →  versionName 3.3.0-rc2 ✓'] },
+  { know: ['被测对象', 'sut', 'Android App', 'com.example.shop 3.3.0-rc2 · 已装到 emulator-5554 并核对版本', '安装后实测', 'verified'] },
+  { know: ['可动范围', 'scope', '只在这些目标上动手', 'emulator-5554 · com.example.shop；真机不碰', '上面的判断', 'ok', 1] },
+  { label: 'obsB' },
+  { tools: ['检查观测通道', 'logcat --pid=$(pidof com.example.shop)  →  有输出', '截图 + 文字识别  →  可用', '找 App 内诊断接口  →  没有源码，release 包里也没发现', '网络抓包  →  需要在模拟器上装代理证书'] },
+  { know: ['观测通道', 'o-log', '系统日志', '按 App 进程过滤', '实测', 'verified'] },
+  { know: ['观测通道', 'o-shot', '截图 + 文字识别', '本机系统 OCR', '实测', 'verified'] },
+  { know: ['观测通道', 'o-diag', 'App 内部状态', '没有源码也没有 debug 包——结论主要靠截图和日志', '检查结果', 'gap'] },
+  { know: ['观测通道', 'o-net', '网络请求', '可以开，需要在模拟器装代理证书（只装在模拟器上）', '检查结果', 'guess'] },
+  { tools: ['读取旧用例', '回归用例.xlsx  →  142 条，列：模块 / 步骤 / 预期', '预期可判定  →  87 条', '预期写的是「显示正常」「无异常」这类  →  55 条'] },
+  { know: ['资料', 'cases', '旧用例', '142 条；55 条预期没法判定，导入时会逐条问清楚', '安装包同目录的 回归用例.xlsx', 'verified'] },
+  { say: '观测这块要跟你说清楚：<b>我拿不到 App 内部状态</b>，所以我的结论主要靠截图和日志，报告里每条都会标出来。<br>如果开发能给一个 debug 包，我能看到的东西会多很多。<br><br>App 需要手机号 + 验证码登录。' },
+  { ask: '有测试账号吗？（会弹一个密钥输入框，账号不进对话、不发给模型）', opts: [['填写测试账号', 'acctB', 1]] },
+  { label: 'acctB' },
+  { tools: ['登录', '在密钥输入框收到测试账号  →  存入钥匙串 shop-test-account', '模拟器上登录  →  首页出现昵称 ✓'] },
+  { know: ['带到可测状态', 'login', '登录', '测试账号在钥匙串 shop-test-account；登录态在 emulator-5554 上', '实测', 'verified'] },
+  { ask: '跑一条冒烟：冷启动 → 首页 → 购物车能打开。', opts: [['运行冒烟用例', 'runB', 1]] },
+  { label: 'runB' },
+  { run: ['冒烟：冷启动到购物车', 2, [['冷启动 com.example.shop', '截图 1'], ['首页显示昵称', '截图识别 · 「Hi, 测试001」'], ['打开购物车', '截图 2 · 识别到「购物车」「结算」'], ['启动过程无崩溃', '系统日志 · 无 FATAL']]] },
+  { profile: [['被测对象', 'com.example.shop 3.3.0-rc2 @ emulator-5554，每次运行核对版本'], ['可动范围', '只用模拟器；真机不碰；装包覆盖不卸载'], ['观测', '日志 · 截图识别；网络可选'], ['缺口', '拿不到 App 内部状态——结论强度以截图/日志为主']] },
+  { end: '可以导入那 142 条旧用例，或者直接告诉我这次 rc2 要重点验什么。' },
+]},
+
+C: { proj: 'media-sdk', steps: [
+  { say: '你好。我先检查一下这台机器的环境。' },
+  { tools: ['检查本机', 'xcrun simctl list  →  3 台已启动的 iOS 模拟器：A、B、C', 'Xcode  →  16.1', '启动目录  →  ~/code/media-sdk（git 仓库，规模很大）'] },
+  { ask: '你是在 <b>~/code/media-sdk</b> 目录里启动的。这次验收这个项目吗？', opts: [['验收这个项目', 'projC', 1], ['选择其他项目', 'pickC']] },
+  { label: 'pickC' },
+  { say: '<span style="color:var(--sub)">（这里会弹出项目选择。原型继续演示当前目录。）</span>' },
+  { label: 'projC' },
+  { tools: ['了解构建方式', 'scripts/build.sh  →  仓库自带的官方构建脚本', '构建历史  →  完整构建要几十分钟'] },
+  { know: ['设置', 'build', 'iOS · 构建', 'run：仓库自带的官方构建脚本（scripts/build.sh）。默认不构建，先用现成的包', '仓库 scripts/build.sh + 构建历史 · 写在 settings/ios/build.md', 'guess'] },
+  { say: '这个仓库很大，完整构建要几十分钟，而且自带官方构建脚本。<b>我默认不构建</b>，先看现成的包能不能用；真要构建，我只会调用仓库自己的脚本，不自己拼命令。' },
+  { tools: ['阅读仓库', '发现两个宿主 App：samples/HostDemo（示例宿主）和 apps/MainApp（主 App）', 'samples/HostDemo  →  自带 mock 配置，只有 1 份示例配置', 'apps/MainApp  →  接真实的远程配置与设置存储', 'Podfile.lock  →  MediaCore 1.4.0'] },
+  { know: ['被测对象', 'hosts', '两个宿主', '示例宿主：验得了 SDK 行为，验不了宿主集成；主 App：两者都能验', 'samples/ 与 apps/ 目录', 'verified'] },
+  { ask: '这次要验<b>SDK 本身的行为</b>，还是<b>接进主 App 之后的集成</b>？（示例宿主上的结论，碰到「本宿主没有某某」时都要回主 App 复验）', opts: [['宿主集成（主 App）', 'main', 1], ['SDK 行为（示例宿主）', 'demo']] },
+  { label: 'demo' },
+  { know: ['被测对象', 'sut', '被测对象', 'MediaCore 1.4.0 @ 示例宿主', '你选的 + Podfile.lock', 'ok'] },
+  { goto: 'simC' },
+  { label: 'main' },
+  { know: ['被测对象', 'sut', '被测对象', 'MediaCore 1.4.0 @ 主 App', '你选的 + Podfile.lock', 'ok'] },
+  { label: 'simC' },
+  { tools: ['检查模拟器占用', '模拟器 A  →  主 App 在运行；装的包来自分支 feature/perf-x，2 天前', '模拟器 A  →  测试账号已登录', '模拟器 B  →  主 App 已装（当前分支，昨天构建），未登录', '模拟器 C  →  空'] },
+  { know: ['环境', 'simA', '模拟器 A', '装着别的分支的包、App 在运行，可能有人在用；登录态只在这台', '安装包来源 + 进程', 'risk'] },
+  { know: ['环境', 'simB', '模拟器 B', '当前分支昨天的包，未登录', '安装包来源', 'verified'] },
+  { say: '模拟器 A 上装的是<b>另一个分支两天前的包</b>，App 还在运行，可能有人在用。而测试账号的登录态只在 A 上。<br>B 上装的是当前分支昨天的包，可以直接用，但需要重新登录。' },
+  { ask: '用哪台？', opts: [['使用模拟器 B', 'useB', 1], ['使用模拟器 A（覆盖）', 'useA']] },
+  { label: 'useA' },
+  { know: ['可动范围', 'lease', '设备占用', '模拟器 A 由本项目占用（你确认可以覆盖）', '你说的', 'ok'] },
+  { goto: 'obsC' },
+  { label: 'useB' },
+  { know: ['可动范围', 'lease', '设备占用', '模拟器 B 由本项目占用；A 不碰', '你选的', 'ok'] },
+  { tools: ['登录', '在模拟器 B 上打开主 App 登录页，等待你登录……', '检测到登录成功'] },
+  { know: ['带到可测状态', 'login', '登录', '测试账号登录态在模拟器 B 上；卸载会清掉它（卸载需要你单独批准）', '实测', 'verified'] },
+  { label: 'obsC' },
+  { tools: ['找观测通道', 'debug/Diagnostics  →  debug 包内的诊断命令通道', 'debug/Telemetry  →  采集开关读环境变量 TRACE_ON=1', '注释：「开关只在启动时读取，启动后再开无效」'] },
+  { know: ['观测通道', 'o-diag', '诊断命令通道', '可读 SDK 初始化状态、事件记录（仅 debug 包）', 'debug/Diagnostics', 'guess'] },
+  { know: ['判读陷阱', 't-collect', '采集开关时序', '必须带 TRACE_ON=1 冷启动；启动后再开，什么都采不到——「没采到」不能当阴性', 'debug/Telemetry 注释', 'guess'] },
+  { tools: ['找驱动 App 的方式', 'debug/UIInspector  →  debug 包内置调试 SDK：读 UI 层级、按文字 / 元素点击', 'Podfile  →  只在 debug 包里链接'] },
+  { know: ['设置', 'driver', 'iOS · 驱动 App', 'ui-tree：读 UI 层级 · tap：按文字点击（debug 包内置调试 SDK）', 'debug/UIInspector · 写在 settings/ios/driver.md', 'guess'] },
+  { say: '构建方式和驱动 App 的方式我各写了一条<b>设置</b>，现在都是推测。你在右侧确认之前，我不会执行它们；不对的话直接改，流程以后都按这里来。' },
+  { say: '找到了 debug 包里的诊断通道，能直接读 SDK 状态。但有个关键前提：<b>采集开关必须在 App 启动前打开</b>，启动后再开什么都采不到。我把它记成了判读陷阱，以后每次都会带着开关冷启动。' },
+  { ask: '冒烟：带采集开关冷启动 → 诊断通道读到 SDK 已初始化 → 截图确认。', opts: [['运行冒烟用例', 'runC', 1]] },
+  { label: 'runC' },
+  { run: ['冒烟：SDK 冷启动初始化', 1, [['带 TRACE_ON=1 冷启动主 App', '启动参数已记录'], ['诊断通道可连接', '诊断通道 · 响应 200'], ['SDK 已初始化', '诊断通道 · ready=true · 版本 1.4.0'], ['采集已生效', '诊断通道 · 事件记录 3 条（不为空才可信）'], ['首页可见', '截图识别']]] },
+  { know: ['观测通道', 'o-diag', '诊断命令通道', '冒烟中实测可用；读到的 SDK 版本与 Podfile.lock 一致', '实测', 'verified'] },
+  { know: ['判读陷阱', 't-collect', '采集开关时序', '必须带 TRACE_ON=1 冷启动；启动后再开无效', '注释 + 冒烟实测', 'verified'] },
+  { profile: [['被测对象', 'MediaCore 1.4.0，每次运行从诊断通道读版本核对'], ['设置', 'iOS 构建：仓库官方脚本（默认不构建）· iOS 驱动：debug 包调试 SDK'], ['可动范围', '只用已占用的那台模拟器；卸载单独批准；不自己构建'], ['观测', '诊断通道（强）· 截图 · 日志'], ['判读陷阱', '采集开关必须启动前打开']] },
+  { end: '告诉我这次的改动——MR 链接、分支名或者一句话，我来出验收计划。' },
+]},
+
+D: { proj: 'config-console', steps: [
+  { say: '你好。我先检查一下这台机器的环境。' },
+  { tools: ['检查本机', 'adb devices  →  无设备', '查找 Chrome  →  已安装', '办公网络  →  可访问', '启动目录  →  ~（不是项目目录）'] },
+  { know: ['环境', 'net', '网络', '可以访问办公网络', '本机', 'verified'] },
+  { say: '这次要验收什么？可以选择代码目录、安装包，或者输入一个网址。' },
+  { user: 'https://console.corp.example.com' },
+  { tools: ['准备浏览器', '启动独立浏览器实例（单独的用户目录和调试端口，不动你日常用的浏览器）', '打开 https://console.corp.example.com  →  跳转到公司 SSO'] },
+  { know: ['环境', 'browser', '浏览器实例', '独立实例，和你日常浏览器隔离', '本机', 'verified'] },
+  { ask: '请在弹出的窗口里登录一次公司 SSO。', opts: [['已完成登录', 'sso', 1]] },
+  { label: 'sso' },
+  { tools: ['登录检测', '页面出现用户名与「退出」  →  已登录', '登录态存入钥匙串 console-sso（我只引用名字）'] },
+  { know: ['带到可测状态', 'login', '登录', 'SSO 登录态在钥匙串 console-sso，过期时我会提醒你重新登录', '实测', 'verified'] },
+  { tools: ['了解后台', '空间下拉框  →  12 个空间', '名称含 staging 的  →  staging-a、staging-b', '页面组件库  →  识别为一个常见的企业组件库', '抓包  →  列表页背后是 /api/items'] },
+  { know: ['可动范围', 'spaces', '空间', '12 个空间里只有 2 个是测试空间，其余疑似生产', '空间名称', 'risk'] },
+  { say: '空间下拉框里有 12 个空间，只有两个名字里带 staging。<b>我只会在测试空间里操作</b>，其余的一律不碰。' },
+  { ask: '这次用哪个测试空间？', opts: [['staging-a', 'tA', 1], ['staging-b', 'tA']] },
+  { label: 'tA' },
+  { know: ['被测对象', 'sut', '配置后台', 'console.corp.example.com · staging-a 空间；每次运行记录页面版本号', '你给的地址 + 页面底部版本号', 'verified'] },
+  { know: ['可动范围', 'scope', '只在这个空间里操作', 'staging-a；其它 11 个空间一律拒绝', '你选的', 'ok', 1] },
+  { tools: ['识别危险操作', '按钮「发布」「删除」「重置」', '确认框「此操作不可撤销，继续」'] },
+  { know: ['可动范围', 'danger', '危险操作', '发布、删除、重置、任何「不可撤销」的确认——每次先问你', '页面按钮与确认框', 'verified'] },
+  { know: ['观测通道', 'o-ui', '页面内容', '直接读页面', '实测', 'verified'] },
+  { know: ['观测通道', 'o-api', '后台接口', '/api/items* · 只用来回读结果核对', '抓包', 'verified'] },
+  { know: ['判读陷阱', 't-api', '接口不等于页面', '用接口直接造请求不算验收：页面能不能产出那个请求，才是最容易坏的一环。接口只用来回读', '验收原则', 'ok'] },
+  { know: ['判读陷阱', 't-ui', '组件库自动化', '下拉框要真实鼠标悬停才展开；填完表单要读回确认值真的写进去了', '组件库识别', 'guess'] },
+  { say: '页面背后的接口我也找到了。说清楚一点：<b>接口我只用来回读结果</b>，验收时的操作一定走页面——直接调接口「验过」，不代表用户在页面上点得通。' },
+  { ask: '冒烟：打开条目列表，读出条数，再用接口回读核对。不做任何发布。', opts: [['运行冒烟用例', 'runD', 1]] },
+  { label: 'runD' },
+  { run: ['冒烟：条目列表读取', 1, [['切到 staging-a', '页面内容 · 空间名已切换'], ['打开条目列表', '截图 · 列表加载完成'], ['页面显示 23 条', '页面内容'], ['接口回读条数一致', '后台接口 · total=23'], ['未触发任何写操作', '网络 · 只有 GET 请求']]] },
+  { profile: [['被测对象', 'console.corp.example.com · staging-a 空间'], ['可动范围', '只在 staging-a；发布、删除、重置先问'], ['观测', '页面（操作）· 接口（只回读）'], ['判读陷阱', '接口不等于页面；组件库要真实悬停、写完读回']] },
+  { end: '把 bug 单或需求贴给我，我对到具体页面和按钮，出验收计划。' },
+]},
+};
+
+/* ================= 渲染 ================= */
+let cur = null, cursor = 0, msgEl = null, gen = 0;
+function reset(sc) {
+  gen++; cur = S[sc]; cursor = 0; msgEl = null;
+  stream.innerHTML = ''; kb.innerHTML = '<div class="empty" id="kbEmpty">还什么都不知道</div>';
+  $('#proj').textContent = cur.proj; $('#phase').textContent = '正在了解你的环境';
+  $('#input').placeholder = '和验收 Agent 说话……';
+  document.querySelectorAll('.demo button').forEach(b => b.classList.toggle('on', b.dataset.sc === sc));
+}
+function scroll() { stream.scrollTop = stream.scrollHeight; }
+function agentBox() {
+  if (!msgEl) { msgEl = document.createElement('div'); msgEl.className = 'msg agent'; msgEl.innerHTML = '<div class="who">验收 Agent</div>'; stream.appendChild(msgEl); }
+  return msgEl;
+}
+function userSay(t) { msgEl = null; const d = document.createElement('div'); d.className = 'msg user'; d.innerHTML = `<div class="bubble">${t}</div>`; stream.appendChild(d); scroll(); }
+function know([sec, id, title, val, src, state = 'guess', locked]) {
+  $('#kbEmpty')?.remove();
+  const order = SECS.indexOf(sec);
+  let h = kb.querySelector(`.sec[data-s="${sec}"]`);
+  if (!h) {
+    h = document.createElement('div'); h.className = 'sec'; h.dataset.s = sec; h.textContent = sec;
+    const after = [...kb.querySelectorAll('.sec')].find(x => SECS.indexOf(x.dataset.s) > order);
+    kb.insertBefore(h, after || null);
+  }
+  let k = document.getElementById('k-' + id);
+  if (!k) {
+    k = document.createElement('div'); k.id = 'k-' + id;
+    let n = h.nextElementSibling; while (n && n.classList.contains('k')) n = n.nextElementSibling;
+    kb.insertBefore(k, n);
+  }
+  k.className = 'k' + (locked ? ' locked' : '');
+  k.innerHTML = `<div class="kt">${title}${locked ? '' : `<span class="state ${state}">${STATE[state]}</span>`}</div>
+    <div class="kv">${val}</div><div class="src">来源：${src}</div>
+    ${state === 'guess' ? `<div class="kacts"><button data-ok="${id}">对的</button><button data-edit="${id}">不对，改一下</button></div>` : ''}`;
+  k.style.animation = 'none'; k.offsetHeight; k.style.animation = '';
+}
+kb.addEventListener('click', e => {
+  const id = e.target.dataset.ok || e.target.dataset.edit; if (!id) return;
+  const k = document.getElementById('k-' + id);
+  if (e.target.dataset.edit) { const v = prompt('正确的是什么？（来源会记成「你说的」）'); if (!v) return; k.querySelector('.kv').textContent = v; k.querySelector('.src').textContent = '来源：你说的'; }
+  const st = k.querySelector('.state'); st.className = 'state ok'; st.textContent = '已确认'; k.querySelector('.kacts')?.remove();
+});
+
+async function play(myGen) {
+  const steps = cur.steps;
+  while (cursor < steps.length) {
+    if (myGen !== gen) return;
+    const s = steps[cursor++];
+    if (s.label) continue;
+    if (s.goto) { cursor = steps.findIndex(x => x.label === s.goto); continue; }
+    if (s.say) { await sleep(350); const p = document.createElement('div'); p.innerHTML = s.say; agentBox().appendChild(p); scroll(); }
+    if (s.user) { await sleep(500); userSay(s.user); }
+    if (s.know) { await sleep(180); know(s.know); }
+    if (s.tools) {
+      const [head, ...lines] = s.tools; const box = document.createElement('div'); box.className = 'tools';
+      box.innerHTML = `<div class="head">${head}</div>`; agentBox().appendChild(box);
+      for (const l of lines) { await sleep(330); if (myGen !== gen) return; const r = document.createElement('div'); r.className = 'l ok'; r.textContent = l; box.appendChild(r); scroll(); }
+    }
+    if (s.run) {
+      const [title, shots, rows] = s.run; $('#phase').textContent = '正在执行';
+      const run = document.createElement('div'); run.className = 'run';
+      run.innerHTML = `<div class="rh">${title}<span class="st ing">执行中</span></div><div class="shots"></div><table></table>`;
+      agentBox().appendChild(run); scroll();
+      for (let i = 0; i < shots; i++) { await sleep(400); run.querySelector('.shots').insertAdjacentHTML('beforeend', '<div class="shot"></div>'); }
+      for (const [name, ev] of rows) { await sleep(550); if (myGen !== gen) return; run.querySelector('table').insertAdjacentHTML('beforeend', `<tr><td>${name}</td><td class="res" style="color:var(--ok)">✓ 通过</td><td class="ev">${ev}</td></tr>`); scroll(); }
+      const st = run.querySelector('.st'); st.className = 'st ok'; st.textContent = '通过'; $('#phase').textContent = '就绪';
+    }
+    if (s.profile) {
+      await sleep(400); msgEl = null;
+      const p = document.createElement('div'); p.innerHTML = '冷启动完成。这是我对你环境的画像（右边是完整版，每条都有来源）：';
+      agentBox().appendChild(p);
+      const box = document.createElement('div'); box.className = 'profile';
+      box.innerHTML = s.profile.map(([k, v]) => `<div class="pr"><span class="pk">${k}</span><span>${v}</span></div>`).join('');
+      agentBox().appendChild(box); scroll();
+    }
+    if (s.ask) {
+      await sleep(350);
+      const p = document.createElement('div'); p.innerHTML = s.ask; agentBox().appendChild(p);
+      const a = document.createElement('div'); a.className = 'acts';
+      s.opts.forEach(([label, to, pri]) => {
+        const b = document.createElement('button'); b.className = 'act' + (pri ? ' pri' : ''); b.textContent = label;
+        b.onclick = () => { a.querySelectorAll('button').forEach(x => x.disabled = true); userSay(label); cursor = steps.findIndex(x => x.label === to); play(myGen); };
+        a.appendChild(b);
+      });
+      agentBox().appendChild(a); scroll(); return;
+    }
+    if (s.end) { await sleep(350); const p = document.createElement('div'); p.innerHTML = s.end; agentBox().appendChild(p); $('#input').placeholder = '比如：这次要验……'; scroll(); return; }
+  }
+}
+
+/* ================= 首屏与切换 ================= */
+let chosen = 'A';
+document.querySelectorAll('.opt').forEach(o => o.onclick = () => {
+  document.querySelectorAll('.opt').forEach(x => x.classList.remove('sel')); o.classList.add('sel');
+  $('#keyrow').classList.toggle('hidden', o.dataset.opt !== 'key');
+});
+$('#connect').onclick = async () => {
+  $('#connect').disabled = true; $('#conn').textContent = '正在测试连接……';
+  await sleep(800); $('#conn').textContent = '✓ 已连接'; await sleep(400);
+  $('#setup').classList.add('hidden'); $('#work').classList.remove('hidden');
+  reset(chosen); play(gen);
+};
+document.querySelectorAll('.demo button').forEach(b => b.onclick = () => {
+  chosen = b.dataset.sc;
+  if ($('#work').classList.contains('hidden')) { document.querySelectorAll('.demo button').forEach(x => x.classList.toggle('on', x === b)); return; }
+  reset(chosen); play(gen);
+});
+document.querySelector('.demo button[data-sc="A"]').classList.add('on');
+$('#send').onclick = () => { const v = $('#input').value.trim(); if (v) { $('#input').value = ''; userSay(v); const m = agentBox(); m.insertAdjacentHTML('beforeend', '<div style="color:var(--sub)">（原型到此为止：下一轮演示「需求 → 验收计划」）</div>'); } };
+$('#input').addEventListener('keydown', e => { if (e.key === 'Enter') $('#send').click(); });
+</script>
+</body>
+</html>
