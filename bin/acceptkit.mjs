@@ -654,6 +654,20 @@ async function login({ pos, opt }) {
   if (!j.ok) die(j.error);
   console.log(`✓ 独立浏览器实例（端口 ${port}，用户目录 ${profile}）已打开 ${url}\n  需要登录的话在这个窗口里登录一次；登录态留在这个独立用户目录里，不影响你日常用的浏览器。`);
 }
+// 空闲浏览器回收：acceptkit 起的调试 Chrome 超过阈值（缺省 60 分钟，prefs browsers.idle_minutes）没用就关。
+// 关的是窗口，独立用户目录（登录态）留着，下次 login / 驱动复用。用户自己的 Chrome、别的工具起的不动（adapters/web/cdp.mjs sweepBrowsers）
+async function browserSweep({ opt }, listOnly = false) {
+  const { sweepBrowsers } = await import('../adapters/web/cdp.mjs');
+  const idleMin = Number(readUserConfig().prefs?.browsers?.idle_minutes) || 60;
+  const r = await sweepBrowsers({ idleMin, dry: listOnly || !!opt['dry-run'], roots: knownProjects() });
+  if (opt.json) { console.log(JSON.stringify(r, null, 1)); return r; }
+  const dry = r.dry_run;
+  console.log(`调试浏览器（空闲阈值 ${idleMin} 分钟${dry ? '，只看不动' : ''}）`);
+  if (!r.browsers.length) console.log('  没有开着的调试浏览器');
+  const verb = { keep: '留着', close: dry ? '会关' : '已关', gone: '已不在', adopt: dry ? '会收进台账' : '收进台账', foreign: '不动' };
+  for (const x of r.browsers) console.log(`  ${x.action === 'close' ? '⏹' : '·'} 端口 ${x.port}  ${x.profile}：${verb[x.action]} —— ${x.why}${x.result && x.result !== '已关' ? '，' + x.result : ''}`);
+  return r;
+}
 // ---------------- 管理页面（acceptkit serve） ----------------
 // acceptkit 自己的本机网站：项目列表 + 各项目看板（core/server.mjs）。link / open 缺省都指向它，
 // 没在跑就在后台起一个；登记过的项目（project init / use）都在上面。
@@ -718,6 +732,19 @@ async function serveCmd({ pos, opt }) {
   console.log(`✓ acceptkit 管理页面：${s.url}/`);
   for (const p of s.projects) console.log(`  ${s.url}/p/${p.id}/   ${p.name} · ${p.root}`);
   if (host !== '127.0.0.1' && host !== 'localhost') console.log('  ⚠️ 不只听本机：看板里是被测系统的内部数据，同网段的人都能打开');
+  // 空闲设备回收：看板服务是本机唯一常驻的 acceptkit 进程，由它定时跑 device sweep。
+  // 不放在 startServer 里：测试会起很多个服务，不能让它们去关机器。子进程跑，不阻塞页面。
+  const sweep = () => { for (const p of s.projects) {
+    const ch = spawn(process.execPath, [join(REPO_ROOT, 'bin', 'acceptkit.mjs'), 'device', 'sweep'], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ACCEPTKIT_PROJECT: p.root } });
+    let o = ''; ch.stdout.on('data', d => { o += d; }); ch.stderr.on('data', d => { o += d; });
+    ch.on('close', () => { if (/⏹/.test(o)) console.log(`[${new Date().toISOString()}] ${p.id} ${o.trim()}`); });
+  } };
+  // 浏览器不分项目，一轮只跑一次
+  const sweepB = () => { const ch = spawn(process.execPath, [join(REPO_ROOT, 'bin', 'acceptkit.mjs'), 'browser', 'sweep'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let o = ''; ch.stdout.on('data', d => { o += d; }); ch.stderr.on('data', d => { o += d; });
+    ch.on('close', () => { if (/⏹/.test(o)) console.log(`[${new Date().toISOString()}] ${o.trim()}`); }); };
+  setInterval(() => { sweep(); sweepB(); }, 10 * 60e3).unref?.();
+  setTimeout(() => { sweep(); sweepB(); }, 60e3).unref?.();
 }
 
 async function open({ opt }) {
@@ -882,7 +909,7 @@ const own = {
   index: () => index(flags(3)),
   query: () => query(flags(3)),
   login: () => login(flags(3)),
-  browser: () => { argv.splice(3, 0, 'web'); return login(flags(3)); },
+  browser: () => (['sweep', 'list'].includes(sub) ? browserSweep(flags(4), sub === 'list') : (argv.splice(3, 0, 'web'), login(flags(3)))),
   open: () => open(flags(3)),
   // 用户自己的偏好（不是项目配置，只存在本机 ~/.config/acceptkit/config.json 的 prefs 下，别人不受影响）
   prefs: async () => {
@@ -890,6 +917,8 @@ const own = {
     const { DISPLAY_PREFS, screens, pickScreen, applyDevicePref } = await import('../core/display.mjs');
     const KEYS = { 'devices.display': `设备窗口开在哪块显示器：${Object.entries(DISPLAY_PREFS).map(([k, v]) => `${k}（${v}）`).join(' / ')} / 数字（从左往右第几块）。目前只管 Android 模拟器`,
       'devices.new_device': '新增设备时你自己那边还要做的事（一句话，原话）。acceptkit 要新建设备时会把它带进问你的问题里',
+      'devices.idle_minutes': '设备空闲多少分钟算没人用、被回收关机（缺省 60）',
+      'browsers.idle_minutes': 'acceptkit 起的调试浏览器空闲多少分钟就关掉（缺省 60；只关窗口，登录态留着）',
       'devices.reinstall': '装包时什么情况要先卸载、什么情况覆盖安装就行（你的判断，原话）。过装包 / 卸载的闸时 acceptkit 会把它带出来' };
     const [sub = 'show', key, value] = pos;
     const u = readUserConfig();
@@ -903,6 +932,7 @@ const own = {
     const [g, k] = key.split('.');
     if (sub === 'unset') { if (u.prefs?.[g]) delete u.prefs[g][k]; save(); console.log(`✓ 已清掉 ${key}`); return; }
     if (sub !== 'set' || !value) { console.error('acceptkit: 用法：acceptkit prefs [show] | set <键> <值> | unset <键>'); process.exitCode = 1; return; }
+    if (/idle_minutes$/.test(key) && !/^[1-9]\d*$/.test(value)) { console.error(`acceptkit: ${key} 要一个正整数（分钟）`); process.exitCode = 1; return; }
     if (key === 'devices.display' && !DISPLAY_PREFS[value] && !/^[1-9]\d*$/.test(value)) { console.error(`acceptkit: devices.display 只能是 ${Object.keys(DISPLAY_PREFS).join(' / ')} 或一个数字`); process.exitCode = 1; return; }
     ((u.prefs ||= {})[g] ||= {})[k] = value; save();
     if (key !== 'devices.display') { console.log(`✓ ${key} = ${value}`); return; }

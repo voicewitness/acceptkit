@@ -97,7 +97,16 @@ test('观测：内置通道判定、缺失通道按 fallback 降级、低于最�
   // 没有一张 app 截图时 observe 不落结论（与 record 同一道闸）
   const bare = ak(dir, 'observe', id);
   assert.notEqual(bare.status, 0); assert.match(bare.stderr, /没有一张 app 操作截图/);
+  // 不能先打「✅ = pass」再退回：输出里要说判定出来了但没记，也不写证据文件
+  assert.doesNotMatch(bare.stdout, /✅/);
+  assert.match(bare.stdout, /E1 判定成立（pass）但没记：本运行还没有 app 截图/);
+  const obsDir = join(dir, 'runs', id, 'evidence', 'obs');
+  assert.ok(!(existsSync(obsDir) ? readdirSync(obsDir) : []).some(f => /^obs-E1-/.test(f)), '没记的观测不该留证据文件');
   assert.equal(JSON.parse(readFileSync(join(dir, 'runs', id, 'result.json'), 'utf8')).results.E1.status, 'todo');
+  // --json 同样：每条带 refused，退出码非零
+  const bj = ak(dir, 'observe', id, '--expect', 'E1', '--json');
+  assert.notEqual(bj.status, 0);
+  assert.match(JSON.parse(bj.stdout).results[0].refused, /没记：本运行还没有 app 截图/);
   mkdirSync(join(dir, 'runs', id, 'shots'), { recursive: true });
   writeFileSync(join(dir, 'runs', id, 'shots', 'app-01-home.png'), Buffer.alloc(2048));
   writeFileSync(join(dir, 'runs', id, 'shots', 'app-01-home.png.json'), JSON.stringify({ kind: 'process_shot', file: 'shots/app-01-home.png' }));
@@ -379,4 +388,29 @@ test('平台不适用：observe 没有本端读法记 na 且落盘；断言 plat
   // 对照：没声明平台范围、也没声明版本范围的断言不能记 na；命令行也伪造不了内部的平台 na
   assert.notEqual(ak(dir, 'record', id, '--expect', 'E3', '--status', 'na', '--actual', 'x').status, 0);
   assert.notEqual(ak(dir, 'record', id, '--expect', 'E3', '--status', 'na', '--actual', 'x', '--platform-na', 'web').status, 0);
+});
+
+test('断言声明 platforms 不含本轮平台：建 run 预填 na；observe 不跑另一端的配方，把记错的（假 blocked）改成 na', () => {
+  const C = { case: 'c1', title: '只在 iOS 有的读值', platform: 'android', classifications: { carrier: ['web'] },
+    tree: [{ op: '读产物', tags: { carrier: 'web' }, expect: [
+      { id: 'E1', assert: 'iOS 才有的启动判定', platforms: ['ios'], observe: { op: 'read-json', params: { file: 'evidence/ios-only.json' }, checks: [{ pick: 'ok', predicate: { eq: true } }] } },
+      { id: 'E2', assert: '两端都有', observe: { op: 'read-json', params: { file: 'evidence/out.json' }, checks: [{ pick: 'ok', predicate: { eq: true } }] } }] }] };
+  const ops = { ops: { 'read-json': { kind: 'observe', title: '读产物', platforms: { android: { exec: 'json-file', strength: 'S2' } } } } };
+  const dir = project({}, { 'cases/c1.case.json': C, 'ops/registry.json': ops, 'state/plans/D1.json': { ...PLAN(true), platform: 'android' } });
+  const run = ak(dir, 'run', 'c1', '--demand', 'D1');
+  assert.equal(run.status, 0, run.stderr);
+  const id = readdirSync(join(dir, 'runs'))[0];
+  const res = () => JSON.parse(readFileSync(join(dir, 'runs', id, 'result.json'), 'utf8'));
+  assert.equal(res().results.E1.status, 'na');
+  assert.equal(res().results.E1.na_platform, 'android');
+  assert.match(res().results.E1.actual, /platforms=\[ios\]/);
+  assert.equal(res().results.E2.status, 'todo');
+  // 早先被另一端的配方记成了假 blocked：重跑 observe 改成 na，且不去读 iOS 那份产物
+  const r = res(); r.results.E1 = { status: 'blocked', actual: '前提不成立，无从判定', evidence: [] };
+  writeFileSync(join(dir, 'runs', id, 'result.json'), JSON.stringify(r));
+  const o = ak(dir, 'observe', id, '--expect', 'E1');
+  assert.equal(o.status, 0, o.stderr + o.stdout);
+  assert.match(o.stderr, /平台不适用：断言声明 platforms=\[ios\]/);
+  assert.equal(res().results.E1.status, 'na');
+  assert.ok(!existsSync(join(dir, 'runs', id, 'evidence', 'obs')), '不该跑任何观测配方');
 });

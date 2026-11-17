@@ -86,3 +86,13 @@ test('blockers --ack takes a comma list and confirms by reading back', () => {
   assert.equal(got.find(x => x.id === 'B2').answer, 'skip these');
   assert.equal(got.find(x => x.id === 'B3').answer, null);
 });
+
+test('blockers --ack B1,B2 --json returns one card per blocker instead of crashing after the write', () => {
+  const dir = root(); seed(dir, [B('B1'), B('B2'), B('B3')]);
+  const r = spawnSync(process.execPath, [BIN, 'blockers', 'D1', '--ack', 'B1,B2', '--answer', 'skip these', '--by', 'owner', '--json'],
+    { cwd: dir, encoding: 'utf8', env: { ...process.env, ACCEPTKIT_PROJECT: dir } });
+  assert.equal(r.status, 0, r.stderr + r.stdout);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.refused, undefined, r.stdout);
+  assert.deepEqual(out.results.map(c => [c.blocker, c.status]), [['B1', 'answered'], ['B2', 'answered']]);
+});

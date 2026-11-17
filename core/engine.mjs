@@ -8,7 +8,7 @@
 import { parseUiDump, readPool } from './screen-read.mjs';
 import { judgeParallel } from './parallel.mjs';
 import { dropSplashIfPageIsUp } from './android-splash.mjs';
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, unlinkSync, appendFileSync } from 'node:fs';
 import { spawnSync, execSync } from 'node:child_process';
 import { join, dirname, resolve, sep, basename } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -44,8 +44,10 @@ import { formatCards, deviceCard as cardDevice, deviceAttentionCard as cardDevic
          reviewDueCard, rejectedCard } from './cards.mjs';
 import { findDef, unknownFlags, pageText, pageList } from './protocol.mjs';
 import { format } from 'node:util';
-import { loadRounds, saveRounds, repoSnapshot, changedFiles, deriveHistory, resolveState, demandRecords, roundMembers } from './rounds.mjs';
-import { loadProject, REPO_ROOT, readUserConfig } from './project.mjs';
+import { loadRounds, saveRounds, repoSnapshot, changedFiles, deriveHistory, resolveState, demandRecords, roundMembers, recordTime } from './rounds.mjs';
+import { loadProject, REPO_ROOT, readUserConfig, readConfig, USER_CONFIG } from './project.mjs';
+import { syncIosNames, renameAvd, nameFor, baseName, AVD_NAME } from './device-names.mjs';
+import { smokeCase, smokeCaseId, smokeSpec, hostChecks, androidChecks } from './smoke.mjs';
 import { loadLeases as dbLoadLeases, saveLeases as dbSaveLeases, LeaseConflict, recordApproval, loadQualityBaseline, saveAssessment, latestAssessment, upsertSuggestion, settleMissingSuggestions, decideSuggestion, setSuggestionRetro, listSuggestions, getSuggestion } from './store/db.mjs';
 import { mask, maskDeep } from './secrets.mjs';
 // Android 设备载体：身份（AVD 名）↔ 地址（adb serial）、状态五问、能力读取 —— 见 skill/devices.md
@@ -70,6 +72,7 @@ function parseArgs(argv) {
   const pos = []; const opt = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
+    if (a === '--') break;   // 之后是原样透传的参数（acceptkit adb --run R -- <adb 参数>），不当 acceptkit 的参数解析
     if (a.startsWith('--')) {
       // --k=v：值可以以 -- 开头（原话可能就是这样写的）；看板转发用户原话一律用这个形式
       const eq = a.indexOf('=');
@@ -121,6 +124,21 @@ const KNOWN_FLAGS = new Set([
 // 平台不适用的 na 只由 observe 的平台分流写入。用 Symbol 做键：命令行解析只产出字符串键，
 // 造不出它，所以手工 record 绕不过版本范围闸。
 const PLATFORM_NA = Symbol('platform-na');
+// 断言级平台范围（platforms: ["ios"]）在本轮平台上不适用时的说明；适用 / 没声明 / 平台未定时返回 null
+const platformNaWhy = (e, plat) => plat && Array.isArray(e?.platforms) && e.platforms.length && !e.platforms.includes(plat)
+  ? `平台不适用：断言声明 platforms=[${e.platforms.join(', ')}]，本轮跑在 ${plat}` : null;
+// 本轮平台一定下来（建 run 时单平台用例、占设备时 both 用例）就把不适用的断言预填 na，不开成 todo 挡报告。
+// 只动还是 todo 的：已经有结论的不在这里改（要改走 observe，它会按同一条规则改记 na）
+function prefillPlatformNa(results, c, plat) {
+  const hit = [];
+  for (const e of allExpects(c)) {
+    const why = platformNaWhy(e, plat);
+    if (!why || (results[e.id] && results[e.id].status !== 'todo')) continue;
+    results[e.id] = { status: 'na', auto_na: true, na_platform: plat, actual: why, evidence: [] };
+    hit.push(e.id);
+  }
+  return hit;
+}
 function rejectUnknownFlags(opt, extra = []) {
   const ok = new Set([...KNOWN_FLAGS, ...extra]);
   const bad = Object.keys(opt).filter(k => !ok.has(k));
@@ -519,6 +537,50 @@ function cmdValidate({ pos }) {
   console.log(`✅ ${c.case} 合法：${nodes} 节点 / ${exp.length} 断言 / ${Object.keys(c.classifications || {}).length} 切面`);
 }
 
+// 运行挂错了需求（例如用 --skip-plan-gate 开在别的需求名下）时改挂回去。
+// 挪运行能把一个需求里的失败 / 阻塞挪出视线，所以护栏是硬的：
+//  - 用例在原需求的评审单里 → 不能挪（它的结论就是这个需求的，坏了也得留着）；
+//  - 目标需求得真认这条用例（用例出处是它，或它的评审单里有）→ 不许挪到随便哪个需求；
+//  - 必须写理由；改挂记录留在运行里，原需求台账上的阻塞写明「改挂到哪、为什么」后关掉，没解决的在目标需求重新登记。
+function cmdRefile({ pos, opt }) {
+  const run = pos[0] || die('用法：acceptkit refile <运行> --demand <目标需求> --why "<为什么挂错了>"');
+  const to = opt.demand ? String(opt.demand) : die('refile 要带 --demand <目标需求>');
+  const why = opt.why && opt.why !== true ? String(opt.why).trim() : die('refile 要带 --why "<为什么挂错了>"：挪运行会改变两个需求的结论，理由要留档');
+  const r = loadResult(run);
+  const from = r.demand?.id || r.demand || null;
+  if (!from) die(`运行 ${run} 没有需求归属（旧引擎的运行），不用改挂`);
+  if (from === to) die(`运行 ${run} 已经挂在 ${to} 下`);
+  if (!knownDemands().has(to) && !loadPlan(ROOT, to)) die(`没有需求 ${to}`);
+  const fromPlan = loadPlan(ROOT, from);
+  if (fromPlan && planCases(fromPlan).has(r.case))
+    die(`用例 ${r.case} 在 ${from} 的评审单里：这个运行的结论就是 ${from} 的，不能挪走（坏了也得留着，重跑去修）`);
+  const c = tryLoadCase(r.case_ref || r.case);
+  const toPlan = loadPlan(ROOT, to);
+  const owns = c?.origin?.id === to || (toPlan && planCases(toPlan).has(r.case));
+  if (!owns) die(`${to} 不认用例 ${r.case}（用例出处是 ${c?.origin?.id || '没写'}，${to} 的评审单里也没有）：先让 ${to} 的评审单加上它，或改挂到它的出处需求`);
+  const at = new Date().toISOString();
+  // 阻塞：原台账上写明改挂、关掉；没解决的在目标台账重新登记（编号按目标台账重排）
+  const olds = readBlockers(ROOT, from);
+  const mine = olds.filter(b => b.run === run);
+  const moved = [];
+  for (const b of mine) {
+    if (!b.resolved) {
+      const nb = raiseBlocker(ROOT, { demand: to, run, caseName: b.case, expect: b.expect, kind: b.kind, text: b.text, unlock: b.unlock });
+      if (nb) moved.push(`${b.id}→${nb.id}`);
+      Object.assign(b, { resolved: true, resolved_by: 'tool', resolved_at: at, resolved_how: `运行 ${run} 改挂到 ${to}（${why}），阻塞转到 ${to} 的台账${nb ? ' ' + nb.id : ''}` });
+    }
+  }
+  if (mine.length) writeBlockers(ROOT, from, olds);
+  const dreg = knownDemands().get(to);
+  r.refiled = [...(r.refiled || []), { from, to, at, why }];
+  r.demand = { id: to, title: dreg?.title || toPlan?.title || to };
+  if (r.session && r.session.endsWith(`-${from}`)) r.session = r.session.slice(0, -from.length) + to;
+  r.round = attachRunToRound(to, run, r.session) || null;
+  saveResult(run, r);
+  console.log(`↪️  ${run}：${from} → ${to}（${why}）${moved.length ? `；阻塞转过去 ${moved.join(' ')}` : ''}`);
+  return { run, from, to, why, blockers: moved };
+}
+
 function cmdCoverage({ pos }) {
   const c = loadCase(pos[0] || die('用法：acceptkit coverage <case>'));
   const { hit, uncovered } = coverage(c);
@@ -531,7 +593,7 @@ function cmdCoverage({ pos }) {
 // 这次 run 为哪条需求跑：--demand 显式给；不给就从评审单反查（恰好一条已批准的评审单引用它才自动选）。
 // 调查型（probe）不过评审闸，需求取 --demand 或用例出处。
 function resolveRunDemand(c, opt) {
-  const isProbe = (c.kind || 'acceptance') === 'probe';
+  const isProbe = ['probe', 'smoke'].includes(c.kind || 'acceptance');
   if (opt.demand) return String(opt.demand);
   const refs = demandsReferencing(ROOT, c.case);
   const approved = [...new Set(refs.filter(x => x.approved).map(x => x.demand))];
@@ -546,14 +608,14 @@ function resolveRunDemand(c, opt) {
 
 function createRun(c, opt = {}) {
   const demandId = resolveRunDemand(c, opt);
-  const isProbe = (c.kind || 'acceptance') === 'probe';
+  const isProbe = ['probe', 'smoke'].includes(c.kind || 'acceptance');
   // 闸 1：没做过用例评审的需求不许开跑。
   // 症状是「同一个需求 N 条执行记录里用例都不一样」—— 根因是从没有这一步。
   if (isProbe) { /* 调查型不过评审闸：它就是「只是查个 bug / 复现一下」那条路 */ }
   else if (!opt['skip-plan-gate']) { const g = gateRun(ROOT, c, CASES, demandId); if (g) die(g); }
   else console.error(`   ⚠️  --skip-plan-gate：这一轮声明不走用例评审流程（会写进 run.result，报告里看得见）`);
   // 需求执行轮：代码变了就先开新轮做影响评估，再跑 —— 否则这次 run 会被记到旧代码版本名下。
-  const roundDrift = isProbe ? null : roundCodeDrift(demandId);
+  const roundDrift = isProbe && c.kind !== 'smoke' ? null : roundCodeDrift(demandId);   // 冒烟要打在这一轮的代码上
   if (roundDrift && !opt['allow-stale-round']) die(roundDrift);
   const errs = validate(c);
   if (errs.length) {
@@ -581,6 +643,8 @@ function createRun(c, opt = {}) {
       actual: `版本不适用（建 run 时按用例声明的范围自动判定）：被测包 ${sc.component}@${j.version} ≥ ${sc.below}。${sc.why}` };
     else if (j.state === 'unknown') unknownScoped.push(id);
   }
+  { const p0 = runtimePlatform(c, null); const naP = prefillPlatformNa(results, c, p0);
+    if (naP.length) console.error(`   ⏭️  ${naP.join(' ')} 声明只适用别的平台，本轮跑在 ${p0}：建 run 时记 na`); }
   if (unknownScoped.length) console.error(`   ⚠️  ${unknownScoped.length} 条断言声明了适用版本范围，但没给 --build 里对应组件的版本 —— 全部留 todo（照常要跑）：${unknownScoped.slice(0, 12).join(' ')}${unknownScoped.length > 12 ? ' …' : ''}`
     + `\n      若被测包已超出范围：acceptkit run ${c.case} --build <组件>@<版本>，或在本 run 里 record 时带 --build`);
   // steps：操作节点级过程证据（每走一步就 record --step，截图落这里）。与断言级证据分开存。
@@ -1301,14 +1365,10 @@ function cmdObserve({ pos }) {
     }
     return JSON_MODE ? { results: ids.map(id => ({ ...scopeCard(run, id), dry_run: true })) } : undefined;
   }
-  // 有效截图规则（与 record 同一道闸，见 cmdRecord）：以前 observe 这条路只在 stderr 提醒一句，结论照样落 pass ——
-  // 一个需求跑了两百多个运行、一百多个一张 app 截图都没有，看板照样全绿。现在：观测后这个运行里仍没有 app 画面
-  // （UI 通道观测时截的也算），这次观测出来的 pass / fail 退回原样，不落盘。
-  const noShotRevert = (id, prev) => {
-    if (!['pass', 'fail'].includes(r.results?.[id]?.status) || !needsShot(run, r)) return null;
-    r.results[id] = prev;
-    return `这个运行里还没有一张 app 操作截图，观测结果没落盘（和 record 同一条规则）：先 acceptkit shot ${run} --step <nN> 截一张当前 app 画面，再 observe`;
-  };
+  // 有效截图规则（与 record 同一道闸，见 cmdRecord）：这个运行里还没有 app 画面、观测也不是 UI 通道时，
+  // pass / fail 不落盘。observeOne 在打印判定之前就拦下（返回 held），不打 ✅、不写证据、不动阻塞台账；
+  // 这里只负责把「没记」说出来并以非零退出 —— 以前先打 ✅ 再退回，执行者看输出以为记上了。
+  const heldWhy = `判定出来了但没记：本运行还没有 app 截图，先 acceptkit shot ${run} --step <nN> 截一张当前 app 画面，再重跑 observe（和 record 同一条规则）`;
   // --try：真执行（可以用推测的配方），打印判定，不写回结果 —— 配方先试通、核对，再 ops verify，再正式观测
   if (opt.try) {
     const scratch = structuredClone(r);
@@ -1318,23 +1378,24 @@ function cmdObserve({ pos }) {
   }
   if (!JSON_MODE) {
     const blocked = [];
-    for (const id of ids) { const prev = structuredClone(r.results?.[id] ?? { status: 'todo' }); observeOne(run, r, c, id, opt); if (noShotRevert(id, prev)) blocked.push(id); }
+    for (const id of ids) if (observeOne(run, r, c, id, opt)?.held) blocked.push(id);
     saveResult(run, r);
-    if (blocked.length) die(`${blocked.join('、')} 的观测结果没落盘：这个运行里还没有一张 app 操作截图。\n${shotPlaybook(shotCtx(run, r)).join('\n')}`);
+    if (blocked.length) die(`${blocked.join('、')} 判定出来了但没记：这个运行里还没有一张 app 操作截图。先截图，再重跑 observe。\n${shotPlaybook(shotCtx(run, r)).join('\n')}`);
     return;
   }
   // --json：一条一个结果。被拒的（规格不对、通道没拿到判据）带 refused，其余照常观测、写回
   const refused = new Map();
+  let held = false;
   for (const id of ids) {
     const tried = (r.results?.[id]?.attempts || []).length;
-    const prev = structuredClone(r.results?.[id] ?? { status: 'todo' });
-    try { observeOne(run, r, c, id, opt); } catch (e) { if (!(e instanceof Refused)) throw e; refused.set(id, e.message); continue; }
-    const why = noShotRevert(id, prev); if (why) { refused.set(id, why); continue; }
+    let got; try { got = observeOne(run, r, c, id, opt); } catch (e) { if (!(e instanceof Refused)) throw e; refused.set(id, e.message); continue; }
+    if (got?.held) { refused.set(id, heldWhy); held = true; continue; }
     const a = (r.results?.[id]?.attempts || [])[tried];
     if (a) refused.set(id, `${ATTEMPT_WORDS[a.outcome] || a.outcome}${a.why ? `：${a.why}` : ''}，没改记录${a.shot ? `（这一刻的截图 ${a.shot}）` : ''}`);
   }
   saveResult(run, r);
   if (needsShot(run, r)) console.error(shotNudge(shotCtx(run, r)));
+  if (held) process.exitCode = 4;   // 有判定没落盘：非零退出，别让「输出正常」被当成记上了
   return { results: ids.map(id => refused.has(id) ? { expect: id, refused: refused.get(id) } : scopeCard(run, id)) };
 }
 // observe 没成的那几次（noteAttempt 的 outcome）怎么跟执行者说
@@ -1346,12 +1407,24 @@ const ATTEMPT_WORDS = {
 
 // 端口 → 监听它的 app 进程属于哪台模拟器。多台模拟器同时跑被测 App 时各占一个端口，
 // 连错端口读到的是别人那台的诊断数据，而且看起来和正常结果一模一样。
-function portOwnerSim(port) {
+// 一个端口可能有好几个进程在听（IPv4 / IPv6、端口复用），只看第一行会放过「别人那台也在听」。全部列出来，
+// 只有一个、且是这台，才算这台的端口。不在模拟器里的进程记成 pid:<n>。
+function portOwnerSims(port) {
+  if (!/^\d+$/.test(String(port))) return [];
   const l = spawnSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN'], { encoding: 'utf8' }).stdout || '';
-  const pid = l.split('\n')[1]?.trim().split(/\s+/)[1];
-  if (!pid) return null;
-  const cmd = spawnSync('ps', ['-o', 'command=', '-p', pid], { encoding: 'utf8' }).stdout || '';
-  return /Devices\/([0-9A-F-]{36})\//.exec(cmd)?.[1] || null;
+  const pids = [...new Set(l.split('\n').slice(1).map(x => x.trim().split(/\s+/)[1]).filter(Boolean))];
+  return [...new Set(pids.map(pid => {
+    const cmd = spawnSync('ps', ['-o', 'command=', '-p', pid], { encoding: 'utf8' }).stdout || '';
+    return /Devices\/([0-9A-F-]{36})\//.exec(cmd)?.[1] || `pid:${pid}`;
+  }))];
+}
+function portOwnerSim(port) { const o = portOwnerSims(port); return o.length === 1 && !o[0].startsWith('pid:') ? o[0] : null; }
+/** 端口不是（只是）这台模拟器的 → 说明；是 → null */
+function portNotOf(port, udid) {
+  const o = portOwnerSims(port);
+  if (!o.length) return `端口 ${port || '(空)'} 没有 app 在监听，不是本 run 占用的 ${udid}`;
+  if (o.length === 1 && o[0] === udid) return null;
+  return `端口 ${port} 在 ${o.join(' / ')} 上监听，不是（只是）本 run 占用的 ${udid}：连上去读到的可能是别人那台的画面`;
 }
 
 // UI 观测通道：截图不是独立动作，是观测的副产品。
@@ -1401,7 +1474,7 @@ function execObserveUI(recipe, params, dir, udid, ctx = {}) {
   const android = ctx.platform === 'android';
   if (android && !udid) return { error: 'Android 的 UI 通道要本 run 占着的设备：先 acceptkit device acquire --run <运行>' };
   let port = android ? '' : resolvePort(recipe, udid, ctx);
-  if (udid && !android) { const owner = portOwnerSim(port); if (owner !== udid) return { error: `端口 ${port} ${owner ? `属于模拟器 ${owner}` : '没有 app 在监听'}，不是本 run 占用的 ${udid}` }; }
+  if (udid && !android) { const bad = portNotOf(port, udid); if (bad) return { error: bad }; }
   const sim = udid || portOwnerSim(port);
   if (!sim) return { error: `端口 ${port} 没有 app 在监听，UI 通道无法导航` };
   const adb = android ? `${adbPath()} -s ${sim}` : '';
@@ -1417,6 +1490,7 @@ function execObserveUI(recipe, params, dir, udid, ctx = {}) {
   const ran = [];
   for (const st of recipe.steps || []) {
     if (!st.cmd) continue;
+    if (!android && /\{port\}/.test(st.cmd)) { const bad = portNotOf(port, sim); if (bad) return { error: `步骤「${st.do}」开跑前：${bad}`, raw: ran.join('\n') }; }
     const cmd = fill(st.cmd);
     if (/\{param\./.test(cmd)) return { error: `步骤「${st.do}」里的参数没填上：${cmd}` };
     if (/\{var\./.test(cmd)) return { error: `步骤「${st.do}」引用了还没被 capture 的变量：${cmd}` };
@@ -1439,8 +1513,10 @@ function execObserveUI(recipe, params, dir, udid, ctx = {}) {
   // 步骤里可能冷启过（--relaunch）：主 app 换了端口就跟过去，读画面与截图都要对着它
   const moved = android ? '' : resolvePort(recipe, sim, ctx);
   if (moved && moved !== String(port)) { ran.push(`（冷启后主 app 端口 ${port} → ${moved}）`); port = moved; }
+  if (!android) { const bad = portNotOf(port, sim); if (bad) return { error: `读画面前：${bad}`, raw: ran.join('\n') }; }
   const h = android ? androidScreen(adb) : fetchHierarchy(port);
   if (h.unknown) return { error: `导航完了但拿不到 UI 层级：${h.reason}`, raw: ran.join('\n') };
+  if (!android) { const bad = portNotOf(port, sim); if (bad) return { error: `读画面时端口换了主人：${bad}`, raw: ran.join('\n') }; }
   const seq = (android ? h.nodes.map(n => n.text) : h.nodes.filter(h.visible).map(h.textOf)).map(t => t.trim()).filter(Boolean);
   const texts = [...new Set(seq)];
   const read = {}, readMatch = {};
@@ -1635,6 +1711,16 @@ function observeOne(run, r, c, id, opt) {
       return;
     }
   }
+  // 断言声明了 platforms 且本轮平台不在里面：记 na，不跑任何配方（以前会拿另一端的参数跑本端配方，
+  // 参数全空，记出假 blocked 或静默不记）。已经记错的（例如假 blocked）重跑 observe 就改成 na，阻塞随之关掉。
+  const naWhy = platformNaWhy(e, runtimePlatform(c, r));
+  if (naWhy) {
+    console.error(`⏭️  ${id}：${naWhy} —— 不观测，记 na`);
+    if (opt.try) return;
+    cmdRecord({ pos: [run], opt: { expect: id, status: 'na', actual: naWhy, since: '', 'blocked-kind': '', [PLATFORM_NA]: runtimePlatform(c, r) } });
+    Object.assign(r, loadResult(run));
+    return;
+  }
   const o0 = e.observe || die(`${id} 没有 observe 规格${e.machine ? `（只有文本 machine：${e.machine}）` : ''}`);
   const plat = runtimePlatform(c, r) || die(`${c.case} 是 platform=both 的用例，这轮跑在哪端要先 device acquire --run ${run}（它会把平台记进 run）`);
   // 一条断言一个目的、各端一份翻译：按本轮平台取那一支。
@@ -1664,7 +1750,7 @@ function observeOne(run, r, c, id, opt) {
       if (!existsSync(src)) die(`--from-file 不存在：${src}`);
       return { raw: readFileSync(src, 'utf8'), cmdLine: `（离线复判）读取已采集的原始输出 ${src.startsWith(dir) ? src.slice(dir.length + 1) : src}` };
     }
-    return execObserve(rc, params, dir, r.device?.udid, { run, id, c, op: o.op, platform: plat });
+    return execObserve(rc, params, dir, r.device?.key ? liveAddress(run, r) : r.device?.udid, { run, id, c, op: o.op, platform: plat });
   };
   const parse = (x) => {
     if (x.error) return { error: x.error };
@@ -1746,6 +1832,13 @@ function observeOne(run, r, c, id, opt) {
     reason = `证据强度不够：实际 ${strength}（${usedOp}），断言要求至少 ${o.min_strength}`;
   }
   if (usedOp !== o.op) lines.push(`（主通道 ${o.op} 不可用：${ladder[0].error}；降级到 ${usedOp}，强度 ${strength}）`);
+  // 有效截图规则（与 record 同一道闸）：这个运行还没有 app 截图、这次也不是 UI 通道（读值那一刻会截图），
+  // pass / fail 就不记。在打印之前拦：以前先打「✅ = pass」再把结果退回去，执行者看输出以为记上了。
+  // 正式观测才拦；--try / --dry-run 本来就不写，照常打印判定。
+  if (['pass', 'fail'].includes(status) && !main.ui_shot && !opt.try && !opt['dry-run'] && needsShot(run, r)) {
+    console.log(`⏸ ${id} 判定${status === 'pass' ? '成立' : '不成立'}（${status}）但没记：本运行还没有 app 截图，先 acceptkit shot ${run} --step <nN> 再重跑 observe\n   ${lines.join('\n   ')}`);
+    return { held: 'no_shot', status };
+  }
   console.log(`${ICON[status]} ${id} = ${status}  ← observe ${o.op}${o.params?.command ? ' ' + o.params.command : ''}\n   ${lines.join('\n   ')}\n   ${reason}`);
   if (opt['dry-run'] || opt.try) {
     if (recipe.state === 'guess') console.error(`   （试跑用的是推测的配方 ${o.op}：核对读到的值和截图对得上，再 acceptkit ops verify ${o.op} --platform ${plat}${host ? ` --host ${host}` : ''}，之后才记结论）`);
@@ -2241,6 +2334,73 @@ function cmdProbe({ pos }) {
   console.log(`   收口：acceptkit report <run>  —— 出 run.md + run.json，看板不再"推断"`);
 }
 
+// ---- 冒烟闸（core/smoke.mjs）----
+// acceptkit smoke <D> [--platform p]：按项目声明（smoke.<平台>.items）生成冒烟用例、为 D 开一次冒烟运行；
+// acceptkit smoke env <run> [--apk <本地被测包>]：冒烟前查环境，原始读数落 evidence/smoke-env.json、结论记进 run（smoke_env）。
+// 冒烟没过，next 不出 run_needed（见 next.mjs）。
+function cmdSmoke({ pos, opt }) {
+  if (pos[0] === 'env') return cmdSmokeEnv({ pos: pos.slice(1), opt });
+  const D = pos[0] || die('用法：acceptkit smoke <需求> [--platform ios|android]  ·  acceptkit smoke env <运行> [--apk <本地被测包>]');
+  const plan = loadPlan(ROOT, D) || die(`需求 ${D} 没有评审单：冒烟挡在用例运行前面，先有评审单`);
+  const plats = opt.platform ? [String(opt.platform)] : normalizePlatforms(plan).filter(p => RUNTIME_PLATFORMS.includes(p));
+  if (plats.length !== 1) die(`要说清在哪个平台冒烟：--platform ${plats.join('|') || 'ios|android'}`);
+  const p = plats[0];
+  const spec = smokeSpec(CFG, p) || die(`项目没声明 ${p} 的冒烟项：在 acceptkit.project.json 写 smoke.${p}.items（每项 { id, assert, observe }，形状和用例断言一样），可选 smoke.${p}.env（override_files / max_swap_pct / max_load_per_core）`);
+  if (!(spec.items || []).length) die(`smoke.${p}.items 是空的：至少声明一项（例：装配成功 / 冷启后决策数 > 0）`);
+  const c = smokeCase(spec, p);
+  if (!existsSync(CASES)) mkdirSync(CASES, { recursive: true });
+  writeFileSync(casePath(c.case), JSON.stringify(c, null, 2) + '\n');
+  const { run } = createRun(loadCase(c.case), { demand: D });
+  const ret = { kind: 'smoke', demand: D, platform: p, run, items: c.tree[0].expect.map(e => e.id),
+    note: `依次：${ak(`device acquire --run ${run}`)} → 装好这一轮的被测包（过目标闸）→ ${ak(`smoke env ${run}${p === 'android' ? ' --apk <本地被测包>' : ''}`)} → ${ak(`observe ${run} <冒烟项>`)} 逐项读数` };
+  if (JSON_MODE) return ret;
+  console.log(`🚬 冒烟运行 ${run} 建好（${D} · ${p}，${ret.items.length} 项：${ret.items.join(' ')}）\n   ${ret.note}\n   冒烟没过，这一轮不开用例运行；包修好出新包、开新一轮再冒烟`);
+  return ret;
+}
+const ak = s => `acceptkit ${s}`;
+function cmdSmokeEnv({ pos, opt }) {
+  const run = pos[0] || die('用法：acceptkit smoke env <运行> [--apk <本地被测包>]');
+  if (!existsSync(resultPath(run))) die(`没有运行 ${run}`);
+  const r = loadResult(run);
+  if (!/^smoke-/.test(r.case)) die(`${run} 不是冒烟运行（用例 ${r.case}）：acceptkit smoke <需求> 开冒烟运行`);
+  const p = r.platform || die(`${run} 还没定平台`);
+  const spec = smokeSpec(CFG, p) || {};
+  const env = spec.env || {};
+  const checks = hostChecks({ maxSwapPct: env.max_swap_pct ?? 80, maxLoadPerCore: env.max_load_per_core ?? 1.5 });
+  if (p === 'android') {
+    const addr = runDeviceAddress(run, opt) || die(`${run} 还没有设备：先 acceptkit device acquire --run ${run}`);
+    const pkg = appOf('android', { run }).package || die('宿主没登记 Android 包名：acceptkit host add <宿主> --platform android --package <包名>');
+    const key = r.device?.key || addr;
+    const same = k => k && deviceAliases(key).includes(k);
+    const installs = [], seen = [];
+    for (const x of existsSync(join(ROOT, 'runs')) ? readdirSync(join(ROOT, 'runs')) : []) {
+      let rr; try { rr = JSON.parse(readFileSync(resultPath(x), 'utf8')); } catch { continue; }
+      if (!same(rr.device?.key || rr.device?.udid)) continue;
+      for (const g of rr.gates || []) if (/install|安装|装包|重装/i.test(g.action || '')) installs.push(Date.parse(g.at));
+      if (x !== run) seen.push({ run: x, demand: rr.demand?.id || rr.demand || null, t: statSync(resultPath(x)).mtimeMs });
+    }
+    const last = seen.sort((a, b) => b.t - a.t)[0];
+    const adb = args => { const q = spawnSync(ANDROID.adbBin(), ['-s', addr, ...args], { encoding: 'utf8', timeout: 30_000, maxBuffer: 64 << 20 }); return { ok: q.status === 0, out: (q.stdout || '').trim() }; };
+    checks.push(...androidChecks({ adb, pkg, apk: opt.apk ? resolve(String(opt.apk)) : null, overrideFiles: env.override_files || [],
+      installs: installs.filter(Number.isFinite), lastRun: last ? { run: last.run, demand: last.demand, at: new Date(last.t).toISOString() } : null,
+      ops: (() => { try { return readFileSync(join(dirname(USER_CONFIG), 'device-ops.jsonl'), 'utf8').trim().split('\n').map(l => { try { return JSON.parse(l); } catch { return null; } })
+        .filter(o => o && ((o.devices || []).some(same) || same(o.device))); } catch { return []; } })() }));
+  }
+  const rel = 'evidence/smoke-env.json';
+  mkdirSync(join(runDir(run), 'evidence'), { recursive: true });
+  writeFileSync(join(runDir(run), rel), JSON.stringify({ at: new Date().toISOString(), platform: p, checks }, null, 2) + '\n');
+  const r2 = loadResult(run);
+  r2.smoke_env = { at: new Date().toISOString(), evidence: rel, checks: checks.map(({ id, title, ok, why }) => ({ id, title, ok, ...(why ? { why } : {}) })) };
+  saveResult(run, r2);
+  const bad = checks.filter(c => c.ok !== true);
+  const ret = { kind: 'smoke_env', run, ok: !bad.length, checks, evidence: rel };
+  if (JSON_MODE) return ret;
+  console.log(`冒烟环境检查 ${run}（原始读数：${rel}）`);
+  for (const c of checks) console.log(`  ${c.ok === true ? '✓' : c.ok === false ? '✗' : '?'} ${c.title}${c.why ? ' —— ' + c.why : ''}`);
+  if (bad.length) { console.log(`   有 ${bad.length} 项没过（? = 读不到，也算没过）：处理完再跑一次 smoke env`); process.exitCode = 4; }
+  return ret;
+}
+
 // ---- 目标闸 (target gate) ----
 // 任何「会改被测端状态」的动作（装包、重装、清数据、改存储、连真机、对后台的写操作）之前必须过闸。
 // **无法确认目标 = 不放行**（缺省拒绝）——白名单才是安全的那一侧，黑名单永远补不全。
@@ -2376,6 +2536,9 @@ function cmdGate({ pos, opt }) {
       const shown = key === u ? u : `${u}（身份 ${key}）`;
       if (!opt.run) { console.error(`⛔ 拒绝：动作打在 ${shown} 上，但没带 --run —— 不知道是哪次验收在用这台机器`); process.exit(4); }
       if (!l || leaseAgeH(l) > LEASE_STALE_H) {
+        // 空闲回收放掉的：说清楚是被回收了，重新 acquire 会起回同一台，别当成设备出了问题
+        let back = null; try { back = existsSync(resultPath(opt.run)) && (loadResult(opt.run).device_reclaims || []).findLast(x => x.device === key); } catch { /* 读不到就按普通拒绝说 */ }
+        if (!l && back) { console.error(`⛔ ${shown} 在 ${back.at} 因为 ${back.idle_min} 分钟没动被空闲回收（已关机）。接着做：acceptkit device acquire --run ${opt.run}，会重新起同一台`); process.exit(4); }
         console.error(`⛔ 拒绝：${shown} 没有被 run=${opt.run} 占用${l ? `（原占用 run=${l.run} 已过期）` : ''}。\n   先 acceptkit device status 看机器状态，再 acceptkit device acquire --run ${opt.run}（或手动 device claim ${key} --run ${opt.run} --holder "<迭代/worktree>"）`);
         process.exit(4);
       }
@@ -2587,8 +2750,25 @@ const appOf = (platform, ctx) => { const h = hostFor(platform, ctx); return h.er
 // 租约正本在 SQLite（只由 CLI 写，读改写在一个事务里）。旧版 state/devices.json 由 acceptkit doctor --fix 导入。
 const LEASE_STALE_H = 8;   // 这么久没续期（gate 每次放行都会续）视为过期
 function loadLeases() { return dbLoadLeases(ROOT); }
-function saveLeases(m) { try { dbSaveLeases(ROOT, m); } catch (e) { if (e instanceof LeaseConflict) die(e.message); throw e; } }
+function saveLeases(m) { try { dbSaveLeases(ROOT, m); } catch (e) { if (e instanceof LeaseConflict) die(e.message); throw e; } syncNames(m); }
+// 占用一变就把 iOS 模拟器名对齐（窗口标题 = 设备名）：谁占着、给哪个需求跑，看窗口就知道。
+// 项目扩展自己给设备快照（测试注入）时不碰真机名字
+const leaseDemand = run => { try { const d = loadResult(run).demand; return d ? { id: d.id || d, title: d.title || demandTitleOf(d.id || d) } : null; } catch { return null; } };
+function demandTitleOf(id) { try { return loadDemands(ROOT).get(id)?.title || ''; } catch { return ''; } }
+function syncNames(m) { if (PACK.listDevices || process.platform !== 'darwin' || process.env.ACCEPTKIT_NO_DEVICE_NAMES) return; try { syncIosNames(m, leaseDemand); } catch { /* 改不了名不影响占用本身 */ } }
 const leaseAgeH = l => (Date.now() - Date.parse(l.heartbeat || l.since)) / 3600e3;
+// 占用登记按项目各存一份，机器却是全机共用的：只看本项目，别的项目正占着的机器在这里就是「没人占」，
+// 会被选给本项目、被空闲回收关机（实测：两个项目的回收轮流把对方正在用的模拟器关掉，每 10 分钟一次）。
+// 选设备、占设备、回收、状态都要先问一遍别的项目。
+function foreignLease(ref) {
+  const roots = [...new Set(readUserConfig().projects || [])].filter(r => r !== ROOT);
+  for (const r of roots) {
+    let ls; try { ls = dbLoadLeases(r); } catch { continue; }
+    for (const k of deviceAliases(ref)) { const l = ls[k]; if (l && leaseAgeH(l) <= LEASE_STALE_H) return { project: basename(r), key: k, ...l }; }
+  }
+  return null;
+}
+const foreignWords = f => `${f.project} 项目的运行 ${f.run}（${f.holder || '?'}）`;
 // ---- 设备状态：五问必须答得出，答不出记「不确定」（skill/devices.md 第三节）----
 // 此前 Android 这一支直接 `return { kind:'android' }` —— 一个只说明「它是安卓」的空壳：
 // 开没开机、是哪一台、被测进程在不在，一个都读不到。于是「空闲」只能靠猜，
@@ -2680,7 +2860,7 @@ function runDeviceAddress(run, opt) {
     return s;
   }
   if (!bound) return null;
-  const addr = platformOfUdid(bound) === 'android' ? ANDROID.addressOf(bound) : bound;
+  const addr = r.device?.key ? liveAddress(run, r) : (platformOfUdid(bound) === 'android' ? ANDROID.addressOf(bound) : bound);
   if (!addr) die(`run=${run} 绑定的 ${bound} 现在没连上 —— 启动它（身份不变，地址会自动重新解析），或 device release 后重新 pick`);
   return addr;
 }
@@ -2742,8 +2922,30 @@ function bootDevice(ref) {
  * exclude：租约键 → 本 run 否决它的理由（device reject 记的）；only：只看这一台（run 已经绑了它）。
  * → { cands:[{ ref, key, platform, state, lease, tier, reasons, notes }], chosen, decision: reuse|boot|create }
  */
+// 设备最近被谁动过（全机账本 device-ops.jsonl，钩子和 acceptkit adb 记的，跨项目）。
+// 占用登记只说「现在谁占着」：一个运行做完自动放手、下一个运行还没占上的那几分钟里，登记是空的，
+// 但那个会话还在这台上接着干（实测：一个需求的运行出完报告自动放掉了它的模拟器，25 分钟后那台被分给了另一个需求，而后者自己一直在用另一台）。
+// 所以选设备时：本会话最近用过的排前面；别的会话 RECENT_OTHER_MIN 分钟内还动过的往后放，并在卡片上写明
+const RECENT_OTHER_MIN = 45;
+function recentDeviceUse() {
+  const by = new Map(), me = hostSession(), since = Date.now() - 6 * 3600e3;
+  let lines = [];
+  try { lines = readFileSync(join(dirname(USER_CONFIG), 'device-ops.jsonl'), 'utf8').trim().split('\n').slice(-5000); } catch { return by; }
+  for (const l of lines) {
+    let o; try { o = JSON.parse(l); } catch { continue; }
+    const t = Date.parse(o.at); if (!(t >= since) || o.denied) continue;
+    for (const d of [o.device, ...(o.devices || [])].filter(Boolean)) {
+      let k; try { k = leaseKeyOf(d); } catch { k = d; }
+      const m = by.get(k) || {}; const who = me && o.session === me ? 'mine' : 'other';
+      if (!m[who] || m[who].t < t) m[who] = { t, session: o.session, project: o.project, run: o.run };
+      by.set(k, m);
+    }
+  }
+  return by;
+}
 function pickDevice({ platform, need = {}, run = null, exclude = new Map(), host = {}, only = null, ours = new Set() }) {
   const leases = loadLeases();
+  const used = recentDeviceUse();
   const plats = [].concat(platform).filter(Boolean);
   // 候选 = 白名单 ∪ 实际连接
   const refs = new Set();
@@ -2765,11 +2967,13 @@ function pickDevice({ platform, need = {}, run = null, exclude = new Map(), host
     const [lkey, lease] = findLease(leases, ref);
     const allowed = isAllowedDevice(ref);
     const held = !!(lease && leaseAgeH(lease) <= LEASE_STALE_H && (!run || lease.run !== run) && !ours.has(lease.run));
+    const away = lease ? null : foreignLease(ref);
     const fit = ANDROID.profileMeets(s.profile, need);
     const reasons = [], notes = [];
     if (!allowed) reasons.push('不在白名单');
     if (exclude.has(lkey)) reasons.push(`本 run 否决过：${exclude.get(lkey)}`);
     if (held) reasons.push(`被 run=${lease.run}（${lease.holder}）占着`);
+    if (away) reasons.push(`被 ${foreignWords(away)} 占着`);
     if (fit.ok === false) reasons.push(`能力不满足：${fit.unmet.join('、')}`);
     if (fit.ok === null && fit.unknown.length) reasons.push(`能力读不到：${fit.unknown.join('、')}（按不确定处理，不当作满足）`);
     // 宿主：设备声明了装哪些宿主、却没有用例要的那个 → 淘汰；没声明 → 留给执行者核对
@@ -2778,16 +2982,21 @@ function pickDevice({ platform, need = {}, run = null, exclude = new Map(), host
     else if (want && !hs.length) notes.push(`这台没声明装了哪个宿主（白名单 profile.host）：核对装的是不是 ${want}`);
     // waiting：只差「被别的 run 占着」—— 那个 run 放了就能用，等一等再选，不用问人。
     // 启动中的机器落在启动档；「不存在」「没连上」要人去建、去接，不算等
-    const waiting = held && reasons.length === 1;
+    const waiting = (held || !!away) && reasons.length === 1;
     const usable = !reasons.length;
     let tier = 'out';
     if (usable) tier = (s.connected && s.state === '已开机') ? 'reuse' : (s.bootable ? 'boot' : 'out');
     if (usable && tier === 'out') reasons.push(s.state || '不可用');
-    return { ref, key: lkey, platform: plat, state: s, lease, tier, reasons, notes, waiting };
+    const u = used.get(lkey) || {};
+    const otherMin = u.other ? (Date.now() - u.other.t) / 60e3 : Infinity;
+    const contested = usable && !lease && otherMin <= RECENT_OTHER_MIN && !(u.mine && u.mine.t > u.other.t);
+    if (contested) notes.push(`没有占用登记，但会话 ${String(u.other.session || '?').slice(0, 8)}${u.other.project ? `（${u.other.project}${u.other.run ? ` · 运行 ${u.other.run}` : ''}）` : ''} ${Math.round(otherMin)} 分钟前还在动它：多半只是两轮之间放了手，能换别的就别用它`);
+    return { ref, key: lkey, platform: plat, state: s, lease, tier, reasons, notes, waiting, contested, mineAt: u.mine?.t || 0 };
   });
   const order = { reuse: 0, boot: 1, out: 2 };
-  cands.sort((a, b) => order[a.tier] - order[b.tier]);
-  const chosen = cands.find(c => c.tier === 'reuse') || cands.find(c => c.tier === 'boot') || null;
+  // 同一档里：别的会话刚用过的排后面（宁可启动一台空的，也不抢别人两轮之间的那台）、本会话最近用过的排前面
+  cands.sort((a, b) => (a.contested - b.contested) || (order[a.tier] - order[b.tier]) || (b.mineAt - a.mineAt));
+  const chosen = cands.find(c => c.tier === 'reuse' || c.tier === 'boot') || null;
   const decision = chosen ? (chosen.tier === 'reuse' ? 'reuse' : 'boot') : 'create';
   return { cands, chosen, decision };
 }
@@ -2833,6 +3042,7 @@ function cmdDevicePick({ opt }) {
 
 // 关机（release --shutdown 与 stop 共用）→ 一句说明
 function shutdownDevice(lkey, ref) {
+  if (PACK.shutdownDevice) { const r = PACK.shutdownDevice(lkey, HELPERS) || {}; return r.ok ? '，已关机' : `，关机没成功：${r.how || '项目扩展没说原因'}`; }
   const plat = platformOfUdid(lkey);
   const addr = plat === 'android' ? ANDROID.addressOf(lkey) : String(ref);
   const r = !addr ? null : plat === 'android' ? spawnSync(ANDROID.adbBin(), ['-s', addr, 'emu', 'kill'], { encoding: 'utf8', timeout: 15_000 })
@@ -2840,6 +3050,111 @@ function shutdownDevice(lkey, ref) {
   // 等它真退出再往下走：退出那一刻模拟器会写窗口位置，先写偏好会被它盖掉
   if (r?.status === 0 && plat === 'android') for (let i = 0; i < 20 && ANDROID.listDevices().some(d => d.serial === addr); i++) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1000);
   return !addr ? '，本来就没开' : r.status === 0 ? '，已关机' : `，关机没成功：${(r.stderr || r.stdout || '').trim().slice(0, 120)}`;
+}
+
+// ---- 设备强制管控 ----
+// 占用绑到宿主会话（Claude Code 的 CLAUDE_CODE_SESSION_ID 等，与钩子输入里的 session_id 同一个值）：钩子只放行占着这台的会话。
+// 占用时记下这一次开机的编号（Android boot_id）；之后每次动设备都按身份实时解析地址、核对开机号 ——
+// 实测：脚本写死 emulator-5554，原来那台中途停了，5554 改指另一台，读数打到了别人的机器上还一路放行。
+const hostSession = () => process.env.CLAUDE_CODE_SESSION_ID || process.env.GEMINI_SESSION_ID || process.env.CODEX_SESSION_ID || process.env.ACCEPTKIT_SESSION || null;
+function bootStamp(key, addr) {
+  if (platformOfUdid(key) !== 'android' || PACK.listDevices) return {};
+  const a = addr && /^emulator-|^[\w.:-]+$/.test(addr) ? addr : ANDROID.addressOf(key);
+  const id = a ? ANDROID.bootId(a) : null;
+  return id ? { boot_id: id, verified_at: new Date().toISOString() } : {};
+}
+/** 已占着的运行回来接着用：会话换了（接手的新会话）就把占用改到它名下；开机号没记过的补记 */
+function restamp(run, ref) {
+  const leases = loadLeases(); const [k, l] = findLease(leases, ref);
+  if (l && hostSession() && l.session !== hostSession()) { l.session = hostSession(); saveLeases(leases); }
+  const r = loadResult(run);
+  if (r.device && !r.device.boot_id) { Object.assign(r.device, bootStamp(k, null)); saveResult(run, r); }
+}
+/** 运行占着的设备现在在哪、还是不是占用时那一次开机。→ { addr, drift?: { kind: 'gone'|'rebooted'|'moved', why } } */
+function deviceCheck(r) {
+  const key = r.device?.key;
+  if (!key) return { addr: r.device?.udid || null };
+  if (platformOfUdid(key) !== 'android' || PACK.listDevices) return { addr: platformOfUdid(key) === 'android' ? (ANDROID.addressOf(key) || r.device.udid) : key };
+  const addr = ANDROID.addressOf(key);
+  if (!addr) return { addr: null, drift: { kind: 'gone', why: `${key} 现在没开（停了 / 被关了；之前的地址 ${r.device.address || r.device.udid || '?'} 可能已经指向别的设备）` } };
+  const boot = r.device.boot_id ? ANDROID.bootId(addr) : null;
+  if (boot && boot !== r.device.boot_id) return { addr, drift: { kind: 'rebooted', why: `${key} 在占用之后重启过（开机号变了），期间谁动过它不知道` } };
+  return { addr };
+}
+/** 动设备前调：设备停了 / 重启过就拒，并记进运行（next 出 device_changed 卡片） */
+function liveAddress(run, r = loadResult(run)) {
+  const d = deviceCheck(r);
+  // acceptkit 自己在设备上取证（observe / shot …）也记一笔：选设备时靠它认出「这个会话正在用这台」，见 recentDeviceUse
+  if (!d.drift) { if (r.device?.key) logDeviceOp({ run, device: r.device.key, address: d.addr, args: "(acceptkit 取证)", via: "acceptkit" }); return d.addr; }
+  const r2 = loadResult(run);
+  const last = (r2.device_events || []).at(-1);
+  if (!last || last.kind !== d.drift.kind || last.verified) { (r2.device_events ||= []).push({ kind: d.drift.kind, why: d.drift.why, at: new Date().toISOString() }); saveResult(run, r2); }
+  die(`${d.drift.why}。这之后在它上面取的读数不能算：先核对 acceptkit device verify --run ${run}（没开的话 acceptkit device acquire --run ${run} 会重新起同一台）`);
+}
+const driftOf = r => { try { return deviceCheck(r).drift || null; } catch { return null; } };
+/**
+ * acceptkit device verify --run R：重新核对占着的设备（身份对、占用在本运行、记下新的开机号）。
+ * 设备在上次核对之后重启过：这之后记的结论作废、退回待测（读数可能打在别的机器上，或期间被人动过）。
+ */
+function cmdDeviceVerify({ opt }) {
+  const run = opt.run ? String(opt.run) : die('用法：acceptkit device verify --run R');
+  const r = loadResult(run);
+  const key = r.device?.key || die(`运行 ${run} 还没有设备：acceptkit device acquire --run ${run}`);
+  const [, l] = findLease(loadLeases(), key);
+  if (!l || l.run !== run) die(`${key} 现在不在运行 ${run} 名下${l ? `（被 ${l.run} 占着）` : ''}：acceptkit device acquire --run ${run}`);
+  const addr = platformOfUdid(key) === 'android' ? ANDROID.addressOf(key) : key;
+  if (!addr) die(`${key} 没开：acceptkit device acquire --run ${run} 会重新起同一台`);
+  if (platformOfUdid(key) === 'android' && ANDROID.identityOf(addr) !== key) die(`地址 ${addr} 现在是 ${ANDROID.identityOf(addr)}，不是 ${key}`);
+  const since = r.device.verified_at || r.device.claimed_at;
+  const up = platformOfUdid(key) === 'android' ? ANDROID.uptimeSec(addr) : null;
+  const bootAt = up != null ? Date.now() - up * 1000 : null;
+  const rebooted = bootAt && since && bootAt > Date.parse(since);
+  const voided = [];
+  if (rebooted) for (const [e, x] of Object.entries(r.results || {})) {
+    if (!x || ['todo', 'na', 'skip'].includes(x.status)) continue;
+    if (recordTime(runDir(run), r, e) >= bootAt) { r.results[e] = { status: 'todo', actual: '', evidence: [], voided: { was: x, why: `设备 ${key} 在 ${new Date(bootAt).toISOString()} 重启过，这条记在那之后，读数可能不在这台、或期间被动过`, at: new Date().toISOString() } }; voided.push(e); }
+  }
+  Object.assign(r.device, { address: addr, udid: addr, ...bootStamp(key, addr) });
+  (r.device_events ||= []).push({ kind: 'verified', at: new Date().toISOString(), ...(rebooted ? { reboot_at: new Date(bootAt).toISOString() } : {}), ...(voided.length ? { voided } : {}) });
+  saveResult(run, r);
+  restamp(run, key);
+  const ret = { kind: 'device_verified', run, device: key, address: addr, rebooted: !!rebooted, voided };
+  if (!JSON_MODE) console.log(`✓ ${key} 在 ${addr}，归运行 ${run}${rebooted ? `；它在 ${new Date(bootAt).toISOString()} 重启过，${voided.length ? `之后记的 ${voided.length} 条结论退回待测：${voided.join(' ')}` : '之后没有记过结论'}` : ''}`);
+  return ret;
+}
+/**
+ * acceptkit adb --run R -- <adb 参数>：对运行占着的那台设备执行 adb。每次按身份现查地址、核对开机号和占用，
+ * 脚本里就不用写死 emulator-NNNN（地址按启动顺序分配，停一台、起一台就会指到别的设备上）。
+ * 装 / 卸 / 清数据还是先过 acceptkit gate；这里照样要求新鲜的闸。
+ */
+function cmdAdb({ pos, opt }) {
+  const run = opt.run ? String(opt.run) : die('用法：acceptkit adb --run R -- <adb 参数>');
+  const i = process.argv.indexOf('--');
+  const args = i > 0 ? process.argv.slice(i + 1) : pos;
+  if (!args.length) die('-- 后面要有 adb 参数，例：acceptkit adb --run R -- shell getprop ro.build.version.sdk');
+  // 只管子命令之前的全局选项（-s / -t / -e / -d 会改打到哪台）；子命令之后的照原样传（例：logcat -s TAG 是 logcat 的过滤）
+  for (const x of args) { if (!x.startsWith('-')) break; if (['-s', '-t', '-e', '-d', '-H', '-P', '-L'].includes(x)) die(`不要在子命令前给 ${x}：打到哪台由 acceptkit 按运行占着的设备现查`); }
+  const r = loadResult(run);
+  if (!r.device?.key || platformOfUdid(r.device.key) !== 'android') die(`运行 ${run} 没占着 Android 设备：acceptkit device acquire --run ${run}`);
+  const [, l] = findLease(loadLeases(), r.device.key);
+  if (!l || l.run !== run) die(`${r.device.key} 不在运行 ${run} 名下${l ? `（被 ${l.run} 占着${l.holder ? `，${l.holder}` : ''}）` : '（没人占）'}：acceptkit device acquire --run ${run}`);
+  if (!l.session && hostSession()) die(`${r.device.key} 的占用还没绑会话（旧版占的）：acceptkit device acquire --run ${run} 重新占一下（同一运行原样返回，并记到本会话名下）`);
+  if (l.session && hostSession() && l.session !== hostSession()) die(`${r.device.key} 被另一个会话占着（运行 ${run}）：在本会话里接手先 acceptkit device acquire --run ${run}`);
+  const addr = liveAddress(run, r);
+  const joined = args.join(' ');
+  if (/^(install|install-multiple|uninstall)\b|\bpm\s+(clear|uninstall|install)\b/.test(joined)) {
+    const fresh = (r.gates || []).filter(g => g.verdict === 'pass' && Date.now() - Date.parse(g.at) < 15 * 60e3).pop();
+    if (!fresh) die(`装 / 卸 / 清数据先过闸：acceptkit gate --action "<要做什么>" --sim ${r.device.key}（卸载、清数据还要带 --reason）`);
+  }
+  touchLease(r.device.key, run);
+  logDeviceOp({ run, device: r.device.key, address: addr, args: joined, via: 'acceptkit adb' });
+  const q = spawnSync(ANDROID.adbBin(), ['-s', addr, ...args], { stdio: 'inherit' });
+  process.exitCode = q.status ?? 1;
+}
+/** 动设备的命令记账（全机一本：~/.config/acceptkit/device-ops.jsonl）：没登记的装包被发现时，能查出是哪个会话、哪个运行干的 */
+function logDeviceOp(x) {
+  try { const f = join(dirname(USER_CONFIG), 'device-ops.jsonl'); mkdirSync(dirname(f), { recursive: true });
+    appendFileSync(f, JSON.stringify({ at: new Date().toISOString(), session: hostSession(), project: basename(ROOT), ...x }) + '\n'); } catch { /* 记账失败不挡操作 */ }
 }
 
 /** 占用登记 + 绑到 run（claim 与 acquire 共用；调用方先做完各自的检查） */
@@ -2850,16 +3165,23 @@ function writeClaim(ref, run, holder, s, { cur = null, note = '', takeOver = nul
   const live = findLease(leases, ref)[1];
   if (live && String(live.run) !== String(run) && String(live.run) !== String(cur?.run) && leaseAgeH(live) <= LEASE_STALE_H)
     die(`${key} 刚被 run=${live.run} 占走：再跑一次 acceptkit device acquire --run ${run}`);
+  const away = foreignLease(ref);
+  if (away) die(`${key} 正被 ${foreignWords(away)} 占着（since ${away.since}）：换一台，或等它放掉。跨项目不能抢占`);
   const now = new Date().toISOString();
   const platform = platformOfUdid(ref);
-  leases[key] = { run, holder, platform, since: cur?.run === run ? cur.since : now, heartbeat: now, note,
+  leases[key] = { run, holder, platform, since: cur?.run === run ? cur.since : now, heartbeat: now, note, ...(hostSession() ? { session: hostSession() } : {}),
                    ...(takeOver && cur ? { took_over_from: cur, take_over_reason: takeOver } : {}) };
   for (const alias of deviceAliases(ref)) if (alias !== key && leases[alias]) delete leases[alias];   // 同一台机器不留两条键
   saveLeases(leases);
+  logDeviceOp({ run, device: key, args: "(占上)", via: "acceptkit device" });
   if (existsSync(resultPath(run))) {
     const r = loadResult(run);
-    r.device = { key, udid: s.address || ref, address: s.address || null, name: s.name || s.avd || null, platform, holder, claimed_at: leases[key].since, profile: s.profile || null };
-    r.platform = r.platform || platform; saveResult(run, r);
+    r.device = { key, udid: s.address || ref, address: s.address || null, name: s.name || s.avd || null, platform, holder, claimed_at: leases[key].since, profile: s.profile || null,
+                 ...bootStamp(key, s.address) };
+    r.platform = r.platform || platform;
+    // 用例文件不在了就不预填（loadCase 读不到会直接退出进程）；observe 时照样会按同一条规则判
+    if (existsSync(casePath(r.case_ref || r.case))) prefillPlatformNa(r.results ||= {}, loadCase(r.case_ref || r.case), r.platform);
+    saveResult(run, r);
   }
   return key;
 }
@@ -2920,7 +3242,7 @@ function cmdDeviceAcquire({ opt }) {
   if (bound) {
     const [, l] = findLease(loadLeases(), bound);
     const s = stateOf(bound);
-    if (l && l.run === run && s.connected && s.state === '已开机') { touchLease(bound, run); return out(deviceCardOf(run, leaseKeyOf(bound), s, '已经占着', host[s.platform || plats[0]])); }
+    if (l && l.run === run && s.connected && s.state === '已开机') { touchLease(bound, run); restamp(run, bound); return out(deviceCardOf(run, leaseKeyOf(bound), s, '已经占着', host[s.platform || plats[0]])); }
   }
   // 一个需求同一平台只用一台：同需求别的运行占着一台，就接过来用；要第二台得 --parallel 给理由，核对过才另选
   if (bound && opt.parallel) refuse(`运行 ${run} 已经绑定 ${bound}，一次 run 只打一台。要双跑：另开一个运行（acceptkit run ${r.case} --demand ${demandIdOf(r)}），在那个运行上 acquire --parallel`);
@@ -3025,8 +3347,116 @@ function cmdDeviceReject({ pos, opt }) {
   return cmdDeviceAcquire({ opt });
 }
 
+// 回收空闲设备：开着却没人在用的机器吃掉内存（大配置模拟器一台 12G），用户看到一屏「不动的设备」。
+// 靠执行者记得 release --shutdown 不可靠：运行停在半路（等人、会话断了）就一直占着，出完报告只放不关。
+// 规则只看台账和运行记录：占着的看续期时间，没人占的看 acceptkit 最后一次碰它；都超过空闲阈值才动。
+// 关机不丢数据（模拟器的登录态、装好的包都还在），下一轮 acquire 会重新起同一台。
+// 不动：白名单条目写了 keep_on 的、不在白名单的（不是验收机）、acceptkit 从没用过的（可能是用户自己开的）。
+const SWEEP_IDLE_MIN = 60;
+function deviceLastTouch() {
+  const runsDir = join(ROOT, 'runs');
+  const last = new Map();
+  const bump = (k, t) => { if (k && t && !(last.get(k) >= t)) last.set(k, t); };
+  for (const x of existsSync(runsDir) ? readdirSync(runsDir) : []) {
+    const p = resultPath(x);
+    let r; try { r = JSON.parse(readFileSync(p, 'utf8')); } catch { continue; }   // 坏的 / 老的运行跳过，不挡回收
+    for (const pk of r.device_picks || []) bump(pk.chosen, Date.parse(pk.at));
+    if (r.device?.key) bump(r.device.key, statSync(p).mtimeMs);
+  }
+  return last;
+}
+function cmdDeviceSweep({ opt }) {
+  const idleMin = Number(readUserConfig().prefs?.devices?.idle_minutes) || SWEEP_IDLE_MIN;
+  const dry = !!opt['dry-run'];
+  const leases = loadLeases();
+  const touched = deviceLastTouch();
+  const used = recentDeviceUse();
+  const now = Date.now();
+  const out = [];
+  for (const a of DEVICE_ALLOW) {
+    const s = stateOf(a.value);
+    if (!(s.connected && s.state === '已开机')) continue;
+    const id = s.identity || a.value;
+    const [lkey, l] = findLease(leases, a.value);
+    const row = { device: id, name: s.name || s.avd || null };
+    if (a.keep_on) { out.push({ ...row, action: 'keep', why: '白名单写了 keep_on：常开' }); continue; }
+    const away = l ? null : foreignLease(a.value);
+    if (away) { out.push({ ...row, action: 'keep', why: `${foreignWords(away)} 占着` }); continue; }
+    const u = used.get(leaseKeyOf(a.value)) || {};
+    const lastOp = Math.max(u.mine?.t || 0, u.other?.t || 0);
+    if (lastOp && (now - lastOp) / 60e3 < idleMin) { const w = (u.other?.t || 0) >= (u.mine?.t || 0) ? u.other : u.mine;
+      out.push({ ...row, action: 'keep', why: `设备操作账本里会话 ${String(w.session || '?').slice(0, 8)}${w.project ? `（${w.project}）` : ''} ${Math.round((now - lastOp) / 60e3)} 分钟前还动过` }); continue; }
+    if (l) {
+      // 续期只在设备操作时发生，观测 / 记录这类只写运行记录的动作不续期：两者取较新的，别把正在干活的运行的机器关掉
+      let wrote = 0; try { wrote = statSync(resultPath(l.run)).mtimeMs; } catch { /* 运行没了就只看续期 */ }
+      const idle = (now - Math.max(Date.parse(l.heartbeat || l.since), wrote)) / 60e3;
+      if (idle < idleMin) { out.push({ ...row, action: 'keep', why: `run=${l.run} 在用（${Math.round(idle)} 分钟前还动过）` }); continue; }
+      const why = `run=${l.run} 占着，${Math.round(idle)} 分钟没动`;
+      if (!dry) {
+        const cur = loadLeases(); delete cur[lkey]; saveLeases(cur);
+        if (existsSync(resultPath(l.run))) { const r = loadResult(l.run); (r.device_reclaims ||= []).push({ device: lkey, at: new Date().toISOString(), idle_min: Math.round(idle), by: 'sweep' }); saveResult(l.run, r); }
+      }
+      out.push({ ...row, action: 'reclaim', why, run: l.run, ...(dry ? {} : { shutdown: shutdownDevice(lkey, a.value).replace(/^，/, '') }) });
+      continue;
+    }
+    const t = touched.get(leaseKeyOf(a.value)) ?? deviceAliases(a.value).map(k => touched.get(k)).find(Boolean);
+    if (!t) { out.push({ ...row, action: 'keep', why: 'acceptkit 没用过它，可能是用户自己开的' }); continue; }
+    const idle = (now - t) / 60e3;
+    if (idle < idleMin) { out.push({ ...row, action: 'keep', why: `没人占，${Math.round(idle)} 分钟前刚用过` }); continue; }
+    out.push({ ...row, action: 'stop', why: `没人占，${Math.round(idle)} 分钟没碰`, ...(dry ? {} : { shutdown: shutdownDevice(lkey, a.value).replace(/^，/, '') }) });
+  }
+  if (!dry && out.some(x => x.action !== 'keep')) applyDevicePref();
+  const ret = { idle_minutes: idleMin, dry_run: dry, devices: out };
+  if (JSON_MODE) return ret;   // --json 由统一出口打印
+  console.log(`空闲回收（阈值 ${idleMin} 分钟${dry ? '，只看不动' : ''}）`);
+  if (!out.length) console.log('  没有开着的白名单设备');
+  const verb = { keep: '留着', reclaim: dry ? '会放掉并关机' : '已放掉', stop: dry ? '会关机' : '已关' };
+  for (const x of out) console.log(`  ${x.action === 'keep' ? '·' : '⏹'} ${x.device}${x.name ? ' ' + x.name : ''}：${verb[x.action]} —— ${x.why}${x.shutdown ? '，' + x.shutdown : ''}`);
+  return ret;
+}
+
+/**
+ * 给设备起个看得懂的名字（窗口标题就是它）。iOS 开着也能改，切到 Simulator 时标题刷新；
+ * Android 的标题是 AVD 名，只能关机时改，改完把所有登记项目白名单里的 avd:<旧名> 一起换掉（不然白名单指着一台不存在的机器）
+ */
+function cmdDeviceRename({ pos, opt }) {
+  const ref = pos[1] || die('用法：acceptkit device rename <设备（UDID 或 avd:名字）> --to <新名字>');
+  const to = String(opt.to || die('缺 --to <新名字>')).trim();
+  if (to.includes(' ▸ ')) die('名字里不能带「 ▸ 」：那是 acceptkit 标「正被哪个需求占着」用的');
+  const leases = loadLeases();
+  if (platformOfUdid(ref) === 'ios') {
+    const [, l] = findLease(leases, ref);
+    const name = nameFor(to, l ? leaseDemand(l.run) : null);
+    const r = spawnSync('xcrun', ['simctl', 'rename', ref, name], { encoding: 'utf8', timeout: 15_000 });
+    if (r.status !== 0) die(`改不了：${(r.stderr || '').trim() || '没有这台模拟器'}`);
+    const ret = { device: ref, name, note: '窗口标题在下次切到 Simulator 时刷新' };
+    if (!JSON_MODE) console.log(`✓ ${ref} → 「${name}」（${ret.note}）`);
+    return ret;
+  }
+  const m = /^avd:(.+)$/.exec(ref) || die('Android 用 avd:<AVD 名> 指定（真机的名字改不了）');
+  const from = m[1];
+  if (!AVD_NAME.test(to)) die('AVD 名只能用英文字母、数字和 . _ -（模拟器的限制）');
+  if (ANDROID.available() && ANDROID.addressOf(ref)) die(`${from} 正开着：AVD 只能关机时改名。等它空闲被回收，或用完后再改`);
+  const roots = [...new Set([ROOT, ...(readUserConfig().projects || [])])];
+  for (const r of roots) { let ls; try { ls = dbLoadLeases(r); } catch { continue; } if (ls[ref]) die(`${ref} 还被 ${basename(r)} 项目的运行 ${ls[ref].run} 占着：先放掉再改`); }
+  let res; try { res = renameAvd(from, to); } catch (e) { die(e.message); }
+  const updated = [];
+  for (const r of roots) {
+    const f = join(r, 'acceptkit.project.json'); let cfg; try { cfg = JSON.parse(readFileSync(f, 'utf8')); } catch { continue; }
+    let hit = 0; for (const a of cfg.gate?.allow || []) if (a.value === ref) { a.value = `avd:${to}`; hit++; }
+    if (hit) { writeFileSync(f, JSON.stringify(cfg, null, 2) + '\n'); updated.push(basename(r)); }
+  }
+  applyDevicePref();
+  const ret = { device: `avd:${to}`, from: ref, dir: res.dir, whitelists: updated };
+  if (!JSON_MODE) console.log(`✓ ${ref} → avd:${to}（AVD 目录没动：${res.dir}）${updated.length ? `；已改白名单：${updated.join('、')}` : ''}。下次开机窗口标题就是新名字`);
+  return ret;
+}
+
 function cmdDevice({ pos, opt }) {
   const sub = pos[0] || 'status';
+  if (sub === 'sweep') return cmdDeviceSweep({ opt });
+  if (sub === 'rename') return cmdDeviceRename({ pos, opt });
+  if (sub === 'verify') return cmdDeviceVerify({ opt });
   if (sub === 'pick') return cmdDevicePick({ opt });
   if (sub === 'acquire') return cmdDeviceAcquire({ opt });
   if (sub === 'reject') return cmdDeviceReject({ pos, opt });
@@ -3061,7 +3491,8 @@ function cmdDevice({ pos, opt }) {
       if (s.uptime_sec != null) console.log(`   已开机 ${fmtAge(s.uptime_sec)}`);
       if (s.running) console.log(`   被测 app 在跑：${s.running}`);
       console.log(l ? `   占用：run=${l.run} · ${l.holder} · since ${l.since}${leaseAgeH(l) > LEASE_STALE_H ? ' ⚠️ 已过期（只解除阻挡，不等于可以直接抢）' : ''}${l.note ? ' · ' + l.note : ''}${lkey !== id ? `\n   ⚠️ 这条租约的键是 ${lkey}（地址，会漂）：release 后重新 claim 可换成身份 ${id}` : ''}`
-                    : `   占用：无登记${s.running ? '  ⚠️ 但被测 app 在跑 —— 可能有人没登记就在用，先问' : ''}`);
+                    : (fl => fl ? `   占用：${foreignWords(fl)} · since ${fl.since}（别的项目登记的，本项目不能用）`
+                      : `   占用：无登记${s.running ? '  ⚠️ 但被测 app 在跑 —— 可能有人没登记就在用，先问' : ''}`)(foreignLease(ref)));
       if (!s.connected && s.state === '未启动') console.log(`   （白名单内但没启动：需要时启动它，不要新建）`);
     }
     return;
@@ -3125,7 +3556,7 @@ function cmdDevice({ pos, opt }) {
     console.log(`⏹  ${lkey}（run ${bootedBy} 选设备时启动的，现在没人占着）${off}`);
     return;
   }
-  die('子命令：status | stop <身份> | acquire --run R [--need k=v] | reject <身份> --run R --why ".." | pick --platform P [--need k=v] [--run R] | claim <身份> --run R --holder H [--note ..] [--take-over "<理由>"] | release <身份> --run R [--shutdown]');
+  die('子命令：status | sweep [--dry-run] | stop <身份> | acquire --run R [--need k=v] | reject <身份> --run R --why ".." | pick --platform P [--need k=v] [--run R] | claim <身份> --run R --holder H [--note ..] [--take-over "<理由>"] | release <身份> --run R [--shutdown]');
 }
 
 
@@ -3389,6 +3820,7 @@ function cmdShot({ pos, opt }) {
 
   // 端口：按 pid 归属选（同机多模拟器时端口会错位）
   let port = opt.port ? String(opt.port) : (PACK.appPortForPid ? (PACK.appPortForPid(pid, udid, HELPERS) || '') : '');
+  if (port) { const bad = portNotOf(port, udid); if (bad) die(`shot: ${bad}`); }
 
   // ① 遮蔽层检查（有效截图规则的核心）
   let obs = { ok: false, unknown: true, reason: '没有 UI 调试端口，无法检查遮蔽层' };
@@ -4442,7 +4874,7 @@ function planAssessGate(plan, by) {
   return { res, refuse };
 }
 
-const coreTable = { assess: cmdAssess, suggest: cmdSuggest, next: cmdNext, context: cmdContext, consult: cmdConsult, read: cmdRead, round: cmdRound, plan: cmdPlan, blockers: cmdBlockers, shot: cmdShot, device: cmdDevice, dup: dupCheck, demands: cmdDemands, cases: cmdCases, new: cmdNew, validate: cmdValidate, coverage: cmdCoverage, run: cmdRun, regress: cmdRegress, record: cmdRecord, report: cmdReport, bug: cmdBug, history: cmdHistory, steps: cmdSteps, gate: cmdGate, probe: cmdProbe, review: cmdReview, reviewq: cmdReviewQ, observe: cmdObserve, platform: cmdPlatform, apparatus: cmdApparatus };
+const coreTable = { assess: cmdAssess, suggest: cmdSuggest, next: cmdNext, context: cmdContext, consult: cmdConsult, read: cmdRead, round: cmdRound, plan: cmdPlan, blockers: cmdBlockers, shot: cmdShot, device: cmdDevice, dup: dupCheck, demands: cmdDemands, cases: cmdCases, new: cmdNew, validate: cmdValidate, coverage: cmdCoverage, run: cmdRun, regress: cmdRegress, record: cmdRecord, report: cmdReport, bug: cmdBug, history: cmdHistory, steps: cmdSteps, gate: cmdGate, probe: cmdProbe, review: cmdReview, reviewq: cmdReviewQ, observe: cmdObserve, platform: cmdPlatform, apparatus: cmdApparatus, refile: cmdRefile, smoke: cmdSmoke, adb: cmdAdb };
 // 领域命令（项目 pack.commands）：签名 (args, HELPERS)。不允许覆盖内核命令。
 const packCommands = Object.fromEntries(Object.entries(PACK.commands || {}).filter(([k]) => !coreTable[k]).map(([k, fn]) => [k, (a) => fn(a, HELPERS)]));
 const table = { ...coreTable, ...packCommands };
@@ -4554,7 +4986,10 @@ function jsonOf(def, { pos, opt }, ret, before) {
   if (def.name === 'blockers') {
     const D = String(pos[0]), now = readBlockers(ROOT, D);
     const one = opt.ack || opt.set || opt.resolve;
-    if (one) return blockerStateCard(D, now.find(b => b.id === String(one)));
+    if (one) {   // --ack B1,B3 这种一次多条：逐条出卡片；找不到的不崩（写已落盘，崩了调用方会当被拒重试）
+      const cards = String(one).split(',').map(s => s.trim()).filter(Boolean).map(id => now.find(b => b.id === id) || { kind: 'blocker', demand: D, blocker: id, status: 'missing', title: `${id}：没找到这条阻塞` }).map(b => b.status === 'missing' ? b : blockerStateCard(D, b));
+      return cards.length === 1 ? cards[0] : { results: cards };
+    }
     const was = new Map((before || []).map(b => [b.id, JSON.stringify(b)]));
     const shown = opt.raise || opt.backfill ? now.filter(b => was.get(b.id) !== JSON.stringify(b)) : now;
     return { results: shown.map(b => blockerStateCard(D, b)), message: HUMAN.join('\n') };

@@ -28,7 +28,12 @@ export const CARD_KINDS = {
   review_due: '有证据还没盲审',
   report_due: '断言都有结论、证据都审过：出报告',
   shot_missing: '结论来自一张 app 截图都没有的运行：开新运行重测、截图',
+  run_misfiled: '运行挂错了需求：改挂回出处需求，或请 owner 把用例加进评审单',
   evidence_gap: '记了 pass / fail 但证据不全（报告列成缺口，看板显示「证据不全」，不算通过）：缺证据不是验不了 —— 照 note 重试，补齐证据',
+  device_changed: '运行占着的设备停了 / 重启过：先 device verify 核对（没开就 acquire 重新起），之前那段的读数可能不在这台',
+  smoke_needed: '这一轮的包还没冒烟：先开冒烟运行，过了才派用例运行',
+  smoke_env: '冒烟运行占上设备了，还没查环境（包是不是被测包、有没有残留覆盖配置和没登记的装包、宿主机负载）',
+  smoke_failed: '这一轮的包冒烟没过：用例运行不开。包的问题出新包开新一轮重冒烟；环境的问题处理掉重查',
   run_needed: '有断言还没测上（没开跑过，或轮次重置了旧结论）：开新运行',
   stalled: '运行很久没动静：先查实际状态',
   // 不进 next 的清单：device acquire / reject 返回的那张
@@ -244,9 +249,42 @@ export function reviewDueCard(run, items) {
     note: `${ak(`reviewq --pack --run ${run}`)}，交给新上下文的子 agent 只看包下结论，结论原样 ${ak(`reviewq --apply <verdicts.jsonl> --by blind`)}`,
     read: `run/${run}` };
 }
-export function shotMissingCard(D, run, name, n) {
-  return { kind: 'shot_missing', demand: D, run, case: name, title: `${name} 的 ${n} 条结论没有一张 app 画面佐证（运行 ${run}）`,
-    detail: ['端上验收要有工具截的 app 画面，证明这轮真在 app 上跑过、停在哪一页；这个运行是规则加上之前记的', '现在补截的图证明不了当时，所以开新运行重测：每一步 shot --step，断言照旧 observe / record'],
+export function runMisfiledCard(D, run, name, origin) {
+  return { kind: 'run_misfiled', demand: D, run, case: name, title: `运行 ${run} 挂错了需求：用例 ${name} 不在 ${D} 的评审单里`,
+    detail: [`用例出处是 ${origin || '（没写）'}；这个运行的结论、阻塞都不算 ${D} 的活，${D} 下也开不了它的新运行`,
+      `改挂到出处需求（原台账上没解决的阻塞会跟过去）；真要算进 ${D}，请 owner 把用例加进 ${D} 的评审单`],
+    note: ak(`refile ${run} --demand ${origin || '<出处需求>'} --why "<为什么挂错了>"`), read: `run/${run}` };
+}
+// ── 冒烟闸（core/smoke.mjs）──
+export function deviceChangedCard(run, key, drift) {
+  return { kind: 'device_changed', run, title: `运行 ${run} 占着的 ${key} ${drift.kind === 'gone' ? '停了' : '重启过'}：先核对再往下做`,
+    detail: [drift.why, '核对之前，acceptkit 动这台设备的命令（observe / shot / adb）都会拒收；核对时发现重启过，那之后记的结论退回待测'],
+    note: drift.kind === 'gone' ? ak(`device acquire --run ${run}`) + ` 重新起同一台，再 ${ak(`device verify --run ${run}`)}` : ak(`device verify --run ${run}`), read: `run/${run}` };
+}
+export function smokeNeededCard(D, p, round) {
+  return { kind: 'smoke_needed', demand: D, platform: p, title: `${round ? `${round} ` : '这一轮'}的包还没冒烟（${p}）：先冒烟，过了才开跑用例`,
+    detail: ['冒烟项是项目声明的几条「包能不能跑」的读数；包没跑通时跑用例，结论全是噪音，后面还要重置重跑'],
+    note: ak(`smoke ${D} --platform ${p}`) };
+}
+export function smokeEnvCard(run, p) {
+  return { kind: 'smoke_env', run, platform: p, title: `冒烟运行 ${run} 还没查环境`,
+    detail: ['查：设备上的包是不是这一轮的被测包、有没有别人留下的覆盖配置、有没有没走 acceptkit 的装包、宿主机 swap 和负载。原始读数落进运行的证据'],
+    note: ak(`smoke env ${run}${p === 'android' ? ' --apk <本地被测包>' : ''}`), read: `run/${run}` };
+}
+export function smokeFailedCard(D, p, st) {
+  const env = st.env.bad.map(c => `环境：${c.title}${c.why ? ` —— ${c.why}` : ''}`);
+  const items = st.failed.map(f => `${f.id} ${f.assert || ''}：${f.status}${f.actual ? ` —— ${f.actual}` : ''}`);
+  return { kind: 'smoke_failed', demand: D, platform: p, run: st.run, title: `这一轮的包冒烟没过（${p}，运行 ${st.run}）：${[...st.failed.map(f => f.id), ...st.env.bad.map(c => c.id)].join(' ')}`,
+    detail: [...items, ...env,
+      st.failed.length ? '包的问题：记 finding 告诉 owner（附冒烟读数），修好出新包后开新一轮（被测代码一变 next 会出 round_stale），再冒烟' : '',
+      env.length ? `环境的问题：处理掉后重查 ${ak(`smoke env ${st.run}`)}；查不清是谁动的设备，先问用户` : ''].filter(Boolean),
+    note: st.failed.length ? ak(`plan finding ${D} --what "<冒烟哪项没过、读数>" --kind … --impact … --why …`) + ` · 新包开新一轮后 ${ak(`smoke ${D} --platform ${p}`)}` : ak(`smoke env ${st.run}`),
+    read: `run/${st.run}` };
+}
+export function shotMissingCard(D, run, name, ids) {
+  return { kind: 'shot_missing', demand: D, run, case: name, expects: ids, title: `${name} 的 ${ids.length} 条结论（${ids.join(' ')}）没有一张 app 画面佐证（运行 ${run}）`,
+    detail: ['端上验收要有工具截的 app 画面，证明真在 app 上跑过、停在哪一页；这个运行一张都没有，而这几条结论现在还出自它',
+      '事后补截的图证明不了当时：开新运行重测这几条，每一步 shot --step 截过程图，断言照旧 observe / record。这不是阻塞，不用登记 blocked'],
     note: ak(`run ${name} --demand ${D}`), read: `run/${run}` };
 }
 /** 记了结论、证据不全：与报告缺口、看板「证据不全」同一份判据（evidence-gate assertionGaps） */

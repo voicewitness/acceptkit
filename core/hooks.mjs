@@ -9,17 +9,18 @@
 // 为什么要有：只写在手册里守不住。实测执行者手动起模拟器、克隆 AVD、删掉 AVD 锁文件再起，acceptkit 的台账完全不知道。
 // 翻译成各家宿主的接法在 host-hooks.mjs（从 skill-refactor 拷来）；出错一律放行 —— 钩子坏了不能把 agent 锁死。
 // 只管验收的东西：不是验收设备、不在 acceptkit 项目里的文件、没绑定验收的会话，一律放行。
-import { existsSync, readFileSync } from 'node:fs';
-import { join, resolve, sep, basename } from 'node:path';
-import { readUserConfig, readConfig } from './project.mjs';
-import { loadLeases, loopBinding, listLoopBindings, unbindLoop, bindLoop } from './store/db.mjs';
+import { existsSync, readFileSync, statSync, appendFileSync, mkdirSync } from 'node:fs';
+import { join, resolve, sep, basename, dirname } from 'node:path';
+import { readUserConfig, readConfig, REPO_ROOT, USER_CONFIG } from './project.mjs';
+import { loadLeases, loopBinding, listLoopBindings, unbindLoop, bindLoop, recordLoopStop } from './store/db.mjs';
 import { nextCards } from './next.mjs';
 import * as ANDROID from '../adapters/android/device.mjs';
 import { runHook, verdictOf, hookProblems, installSnippet, install, configPath, HOST_IDS } from './host-hooks.mjs';
 
 export const HOOKS = [
   { id: 'H1', event: 'before_tool', on: 'shell', run: 'guard_device', mode: 'block', title: '动验收设备只走 acceptkit',
-    match: 'emulator[^|;&]*-avd|avdmanager[^|;&]*\\bcreate|simctl\\s+(boot|shutdown|erase|install|uninstall|clone|create|delete)|adb\\b[^|;&]*\\b(install|uninstall|emu\\s+kill|shell\\s+pm\\s+(clear|uninstall))|\\.avd/[^ ]*\\.lock|cp\\s[^|;&]*\\.avd' },
+    // 所有发往设备的 adb / simctl 命令都过这道（不只装卸包）；命令是跑一个脚本文件的，脚本里的 adb 也算（见 guard_device）
+    match: 'emulator[^|;&]*-avd|avdmanager[^|;&]*\\bcreate|simctl\\s|\\badb\\b|\\.avd/[^ ]*\\.lock|cp\\s[^|;&]*\\.avd|\\b(node|bash|sh|zsh|python3?)\\s+[^|;&]*\\.(mjs|cjs|js|sh|py)\\b|--(serial|device|udid|device-id)[=\\s]|\\bANDROID_SERIAL=' },
   { id: 'H2', event: 'before_tool', on: 'write', run: 'guard_state', mode: 'block', title: '验收记录只由 acceptkit 写',
     match: 'runs/[^/]+/result\\.json$|/state/(plans|blockers|rounds|review)/|acceptkit\\.project\\.json$' },
   { id: 'H3', event: 'stop', on: 'any', run: 'loop_next', mode: 'continue', title: '验收没做完别停' },
@@ -81,6 +82,83 @@ function devicesIn(cmd) {
 // 实测：改一份写着「emulator -avd …」的文档，被当成起模拟器拦下
 const commandsOf = t => String(t).replace(/^(?!\s*(?:\S*\/)?(?:ba|z)?sh\b)([^\n]*?)<<-?\s*(['"]?)(\w+)\2[^\n]*\n[\s\S]*?\n\s*\3\s*(?=\n|$)/gm, '$1');
 const LIFECYCLE = /emulator[^|;&]*\s-avd\b|avdmanager[^|;&]*\bcreate\b|simctl\s+(boot|clone|create)\b|\.avd\/[^ ]*\.lock|cp\s[^|;&]*\.avd/;
+// ── 设备强制管控（11-16 三次事故：没占就在别人那台上装包推 mock；脚本写死 emulator-5554 打到了别的设备；设备停了占用方不知道）──
+// 规则：发往验收设备（白名单里的、正被占着的）的命令，只有「这台被本会话的运行占着」才放行；没人占也要先 device acquire。
+// 地址按调用时现查身份（emulator-NNNN 按启动顺序分配，停一台起一台就指到别的设备上）。只读的身份查询（adb devices、emu avd name）不拦。
+const ADB_IDENT = /\badb\b(?:\s+-s\s+\S+)?\s+(devices|version|start-server|kill-server|get-state|get-serialno|emu\s+avd\s+name)\b/;
+const SIMCTL_READ = /simctl\s+(list|help)\b/;
+const CMD_POS = String.raw`(?:^|[;&|(` + '`' + String.raw`]|\$\()\s*(?:\w+=\S+\s+)*(?:(?:timeout|gtimeout)\s+\S+\s+|sudo\s+)?`;
+// 命令在跑一个脚本文件：读脚本，里面调了 adb / simctl 的照样算（脚本里的 adb 钩子看不见，实测探针脚本写死地址打错设备一路放行）
+function scriptTexts(cmd, cwd) {
+  const out = [];
+  for (const m of cmd.matchAll(/\b(?:node|bash|sh|zsh|python3?)\s+(?:-\S+\s+)*["']?([^\s|;&"']+\.(?:mjs|cjs|js|sh|py))\b/g)) {
+    const f = resolve(cwd || process.cwd(), m[1]);
+    if (f.startsWith(REPO_ROOT + sep)) continue;   // acceptkit 自己：它在里面按占用核对
+    try { if (statSync(f).size > 512 * 1024) continue; const t = readFileSync(f, 'utf8'); if (SCRIPT_CALL.test(t)) out.push({ file: f, text: t }); } catch { /* 不是文件 */ }
+  }
+  return out;
+}
+// 一段命令 / 脚本里发往设备的调用打到了哪些设备。看不出是哪台（地址写成变量、没写 -s）就算连着的全部
+// 脚本里「真的在调用」adb / simctl 的写法（注释、文档里提到这个词不算）：JS / Python 里以字符串传给子进程、acceptkit 的 adbBin()，shell 里一行以 adb 开头
+const SCRIPT_CALL = /(['"`])adb\1|adbBin\(\)|adbPath\(\)|(?:^|[;&|(]\s*|\$\(\s*)adb\s+(?:-s\b|shell|install|push|pull|uninstall|logcat|reverse|forward|root|reboot|emu)\b|(['"`])simctl\2|(?:^|[;&|(]\s*)xcrun\s+simctl\s+(?!list\b|help\b)/m;
+function scriptTargets(t) {
+  if (!SCRIPT_CALL.test(t)) return null;
+  const ids = new Set();
+  for (const m of t.matchAll(/emulator-\d+/g)) { const id = ANDROID.available() ? ANDROID.identityOf(m[0]) : null; if (id) ids.add(id); }
+  for (const m of t.matchAll(/\b([0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12})\b/gi)) ids.add(m[1].toUpperCase());
+  return { ids: [...ids], any: !ids.size };
+}
+/** adb 的全局 -s（子命令之前的那个）；子命令之后的 -s 是子命令自己的参数（例：logcat -s TAG），不是设备 */
+export function adbSerial(call) {
+  const tok = call.trim().split(/\s+/).slice(1).map(x => x.replace(/^["']|["']$/g, ''));
+  for (let i = 0; i < tok.length; i++) {
+    if (!tok[i].startsWith('-')) return null;               // 到子命令了
+    if (tok[i] === '-s') return tok[i + 1] || null;
+    if (['-t', '-H', '-P', '-L'].includes(tok[i])) i++;      // 带值的全局选项
+  }
+  return null;
+}
+export function deviceTargets(t, { script = false } = {}) {
+  if (script) return scriptTargets(t);
+  const ids = new Set(); let any = false;
+  const calls = t.replace(/acceptkit(\.mjs)?\s+adb\b/g, '');   // acceptkit adb 封装：它自己按占用核对
+  // 只认处在命令位置的 adb / xcrun simctl（行首、管道 / 分号之后、$( 里，可带环境变量、timeout、路径前缀）；grep adb、echo 里的字样不算
+  const adbCalls = [...calls.matchAll(new RegExp(CMD_POS + String.raw`(?:[\w.~/-]*/)?(adb\s[^\n|;&]*)`, 'gm'))].map(m => m[1]).filter(c => !ADB_IDENT.test(c));
+  const simCalls = [...calls.matchAll(new RegExp(CMD_POS + String.raw`xcrun\s+(simctl\s+[^\n|;&]*)`, 'gm'))].map(m => m[1]).filter(c => !SIMCTL_READ.test(c));
+  const addAddr = a => { if (/^emulator-\d+$/.test(a)) { const id = ANDROID.available() ? ANDROID.identityOf(a) : null; if (id) ids.add(id); else any = true; } else ids.add(/^[0-9A-F]{8}-/i.test(a) ? a.toUpperCase() : a); };
+  // 别的工具自己调 adb / simctl、只把设备地址当参数传进去（例：某编译工具的 load --serial <地址>）：钩子看不见它里面的 adb，
+  // 按参数认设备 —— 常见写法 --serial / --device / --udid / --device-id / ANDROID_SERIAL=
+  const viaArg = [...calls.matchAll(/(?:--(?:serial|device|udid|device-id)[=\s]+|\bANDROID_SERIAL=)["']?([\w.:-]+)/g)].map(m => m[1]);
+  if (!adbCalls.length && !simCalls.length && !viaArg.length) return null;
+  for (const a of viaArg) addAddr(a);
+  for (const c of adbCalls) {
+    const s = adbSerial(c);
+    if (s) addAddr(s); else any = true;
+  }
+  for (const c of simCalls) { const u = /\b([0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12})\b/i.exec(c); if (u) ids.add(u[1].toUpperCase()); else any = true; }
+  return { ids: [...ids], any };
+}
+const connectedIds = () => { const out = []; try { if (ANDROID.available()) for (const d of ANDROID.listDevices()) { const id = ANDROID.identityOf(d.serial); if (id) out.push(id); } } catch {} return out; };
+function leaseOf(id) {
+  const want = String(id).toUpperCase();
+  for (const root of projects()) { let ls = {}; try { ls = loadLeases(root); } catch { continue; } const l = ls[id] || ls[want]; if (l) return { root, ...l }; }
+  return null;
+}
+function logOp(x) {
+  try { const f = join(dirname(USER_CONFIG), 'device-ops.jsonl'); mkdirSync(dirname(f), { recursive: true }); appendFileSync(f, JSON.stringify({ at: new Date().toISOString(), via: 'hook', ...x }) + '\n'); } catch (e) { process.stderr.write(`acceptkit: 设备操作没记进账本：${e.message}\n`); }
+}
+/** 本会话能不能动这些设备 → null（能）或拒收的话 */
+function holdCheck(ids, session) {
+  for (const id of ids) {
+    const l = leaseOf(id);
+    if (!l) return `${id} 是验收设备，现在没人占着。没人占也不能直接用：先 acceptkit device acquire --run <运行>（占上、记到本会话名下），之后用 acceptkit adb --run <运行> -- <参数>`;
+    if (!session) continue;   // 宿主不给会话号：只能核到「有人占着」
+    if (!l.session) return `${id} 被 ${projName(l.root)} 的运行 ${l.run} 占着，但占用还没绑会话（旧版占的）。是你的运行：acceptkit device acquire --run ${l.run} 重新占一下（同一运行原样返回，并记到本会话名下）；不是你的：别动它`;
+    if (l.session !== session) return `${id} 被另一个会话占着（${projName(l.root)} 的运行 ${l.run}${l.holder ? `，${l.holder}` : ''}，占于 ${l.since}）：别动它 —— 读数会打在别人的验收上，装包 / 推配置会把别人的结论作废。要设备：acceptkit device acquire --run <你的运行>`;
+  }
+  return null;
+}
+
 const DECIDE = {
   guard_device(n) {
     // 起 / 建 / 克隆设备：不管是哪台都只走 acceptkit —— 设备开在谁的屏上、被谁占着、给哪个需求跑，只有 acceptkit 起的才知道
@@ -91,8 +169,20 @@ const DECIDE = {
       + `要设备用 acceptkit device acquire --run <运行>（会按用户偏好开在他指定的显示器上、记进台账）；`
       + `本机没有合适的 AVD：别自己建，把要什么配置（内存 / GPU / 系统版本）告诉用户，请他建好并加进白名单（acceptkit config add gate.allow …）。` };
     const acc = acceptanceDevices();
+    const isAcc = id => acc.has(id) || acc.has(String(id).toUpperCase());
+    // 命令本身 + 它要跑的脚本里，发往设备的调用打到了哪些验收设备
+    const targets = [...cmds.map(t => ({ t, where: '这条命令' })), ...cmds.flatMap(t => scriptTexts(t, n.cwd)).map(x => ({ t: x.text, where: `脚本 ${x.file}`, script: true }))]
+      .map(x => ({ ...x, d: deviceTargets(x.t, { script: x.script }) })).filter(x => x.d);
+    for (const x of targets) {
+      const ids = [...new Set([...x.d.ids, ...(x.d.any ? connectedIds() : [])])].filter(isAcc);
+      if (!ids.length) continue;
+      const why = holdCheck(ids, n.session);
+      if (why) { logOp({ session: n.session, denied: true, devices: ids, cmd: x.t.slice(0, 300), where: x.where }); return { decision: 'deny', reason: `${x.where}要动验收设备 ${ids.join('、')}。${why}${x.script ? '。脚本里别写死 emulator-NNNN：地址按启动顺序分配，会指到别的设备上' : ''}` }; }
+      logOp({ session: n.session, devices: ids, cmd: x.t.slice(0, 300), where: x.where });
+    }
+    // 装卸包、清数据、关机：占着之外还要新鲜的闸（下面原有规则）
     const hit = cmds.flatMap(devicesIn).map(id => [id, acc.get(id) || acc.get(id.toUpperCase())]).find(([, why]) => why);
-    if (!hit) return { decision: 'allow' };
+    if (!hit || !cmds.some(t => /simctl\s+(boot|shutdown|erase|install|uninstall|clone|create|delete)|adb\b[^|;&]*\b(install|uninstall|emu\s+kill|shell\s+pm\s+(clear|uninstall))/.test(t))) return { decision: 'allow' };
     // 卸载 / 清数据只认带理由过的闸（gate 按业务登记的理由评估过，core/destructive.mjs）；装包任何一条新鲜的闸都行
     const kind = cmds.some(t => /adb\b[^|;&]*\buninstall|pm\s+uninstall|simctl\s+uninstall/.test(t)) ? 'uninstall'
       : cmds.some(t => /pm\s+clear|simctl\s+erase/.test(t)) ? 'clear' : null;
@@ -163,7 +253,19 @@ export async function loopCmd({ pos, opt }, P) {
     bindLoop(P.root, key, String(D), resolve(process.cwd()));
     return { kind: 'loop', demand: String(D), key: key.startsWith('cwd:') ? key : '本会话', note: `这个会话在验收 ${D}：没做完宿主不会让你停（装了钩子的话）；做完或要停：acceptkit loop stop` };
   }
-  if (sub === 'stop') return { kind: 'loop', stopped: unbindLoop(P.root, key) };
+  if (sub === 'stop') {
+    // 还有执行者能做的卡片就自己解绑 = 停钩子再也拦不住它，看板上一堆待测却没人在跑（实测：做完用户插进来的一件事就 loop stop，前一天开的三个运行 48 条断言没人管）。
+    // 所以要停得写理由：用户让停就照抄原话；理由和剩下的件数记下来，看板「没人在跑」时摆给 owner
+    const b = loopBinding(P.root, key);
+    if (!b) return { kind: 'loop', stopped: false };
+    const left = nextCards(P.root, b.demand).filter(c => c.kind !== 'attention');
+    const why = String(opt.why || '').trim();
+    if (left.length && why.length < 6) throw new Error(`${b.demand} 还有 ${left.length} 件你能做的事（第一件：${left[0].title}），不能就这么停。`
+      + `\n   接着做：acceptkit next ${b.demand} --json`
+      + `\n   真要停：acceptkit loop stop --why "<为什么停；用户让停就照抄他的原话>" —— 理由会摆在看板上，owner 看得到是谁、为什么、还剩多少`);
+    if (left.length) recordLoopStop(P.root, b.demand, { session: key, why, left: left.length });
+    return { kind: 'loop', stopped: unbindLoop(P.root, key), ...(left.length ? { left: left.length, note: '理由已记到看板' } : {}) };
+  }
   if (sub === 'status' || !sub) return { kind: 'loop', bindings: listLoopBindings(P.root) };
   throw new Error('用法：acceptkit loop start <需求> | stop | status');
 }

@@ -240,3 +240,74 @@ test('用例写 both、run 还没定平台：按需求的平台选机，Android 
   assert.equal(card.device, DROID, 'iOS 机开着且排在前面也不能拿：这是 Android 需求');
   assert.equal(result(dir, run).device.platform, 'android');
 });
+
+test('device sweep：占着却不动的放掉并关机，没人占且 acceptkit 用过的关机；keep_on 和没用过的不动', () => {
+  const { dir, run } = project();
+  writeFileSync(join(dir, 'pack.mjs'), PACK + "export const shutdownDevice = (ref, H) => { const m = read(H); m[ref].state = 'Shutdown'; writeFileSync(f(H), JSON.stringify(m)); return { ok: true }; };\n");
+  const idle = min => { mkdirSync(join(dir, '.config', 'acceptkit'), { recursive: true }); writeFileSync(join(dir, '.config', 'acceptkit', 'config.json'), JSON.stringify({ prefs: { devices: { idle_minutes: min } } })); };
+  const snap = () => JSON.parse(readFileSync(join(dir, 'devices.snapshot.json'), 'utf8'));
+  const row = (out, d) => out.devices.find(x => x.device === d);
+  assert.equal(json(dir, 'device', 'acquire', '--run', run).device, BIG);
+
+  // 刚用过：都留着；SMALL 开着但 acceptkit 从没用过（可能是用户自己开的），不动
+  let out = json(dir, 'device', 'sweep');
+  assert.equal(row(out, BIG).action, 'keep');
+  assert.match(row(out, SMALL).why, /没用过/);
+
+  // 阈值压到几乎为零：占着的 BIG 被放掉并关机，记进运行；--dry-run 只说不动
+  idle(0.0001);
+  out = json(dir, 'device', 'sweep', '--dry-run');
+  assert.equal(row(out, BIG).action, 'reclaim');
+  assert.equal(snap()[BIG].state, 'Booted');
+  out = json(dir, 'device', 'sweep');
+  assert.equal(row(out, BIG).action, 'reclaim');
+  assert.equal(row(out, SMALL).action, 'keep');
+  assert.equal(snap()[BIG].state, 'Shutdown');
+  assert.equal(heldBy(dir, run).length, 0);
+  assert.equal(result(dir, run).device_reclaims.at(-1).by, 'sweep');
+
+  // 运行回来接着做：acquire 重新起同一台
+  idle(60);
+  assert.equal(json(dir, 'device', 'acquire', '--run', run).device, BIG);
+  assert.equal(snap()[BIG].state, 'Booted');
+  ok(dir, 'device', 'release', BIG, '--run', run);
+
+  // 白名单写了 keep_on：常开；去掉之后，没人占、过了阈值就关
+  idle(0.0001);
+  const cfg = JSON.parse(readFileSync(join(dir, 'acceptkit.project.json'), 'utf8'));
+  cfg.gate.allow.find(a => a.value === BIG).keep_on = true;
+  writeFileSync(join(dir, 'acceptkit.project.json'), JSON.stringify(cfg));
+  assert.match(row(json(dir, 'device', 'sweep'), BIG).why, /keep_on/);
+  delete cfg.gate.allow.find(a => a.value === BIG).keep_on;
+  writeFileSync(join(dir, 'acceptkit.project.json'), JSON.stringify(cfg));
+  assert.equal(row(json(dir, 'device', 'sweep'), BIG).action, 'stop');
+  assert.equal(snap()[BIG].state, 'Shutdown');
+});
+
+test('占用跨项目：别的项目占着的机器，本项目不选、不能占、回收不关、状态里写明是谁', () => {
+  const A = project(), B = project();
+  const home = A.dir;   // 同一台机器：两个项目共用一份用户配置
+  const run = (dir, ...args) => spawnSync(process.execPath, [BIN, ...args], { cwd: dir, encoding: 'utf8', env: { ...process.env, ACCEPTKIT_PROJECT: dir, HOME: home } });
+  const okH = (dir, ...args) => { const r = run(dir, ...args); assert.equal(r.status, 0, `${args.join(' ')}\n${r.stdout}\n${r.stderr}`); return r; };
+  mkdirSync(join(home, '.config', 'acceptkit'), { recursive: true });
+  writeFileSync(join(home, '.config', 'acceptkit', 'config.json'), JSON.stringify({ projects: [A.dir, B.dir], prefs: { devices: { idle_minutes: 0.0001 } } }));
+  writeFileSync(join(A.dir, 'pack.mjs'), PACK + "export const shutdownDevice = (ref, H) => { const m = read(H); m[ref].state = 'Shutdown'; writeFileSync(f(H), JSON.stringify(m)); return { ok: true }; };\n");
+
+  okH(B.dir, 'device', 'claim', BIG, '--run', B.run, '--holder', 'B 的执行者');
+  // A 以前用过 BIG（有选机记录），现在没登记 —— 修之前回收会把它当「没人占」关掉
+  const r = JSON.parse(readFileSync(join(A.dir, 'runs', A.run, 'result.json'), 'utf8'));
+  r.device_picks = [{ chosen: BIG, at: '2020-01-01T00:00:00Z' }];
+  writeFileSync(join(A.dir, 'runs', A.run, 'result.json'), JSON.stringify(r));
+  writeFileSync(join(home, '.config', 'acceptkit', 'device-ops.jsonl'), '');   // 账本清空：只靠跨项目占用挡住
+  const sweep = JSON.parse(okH(A.dir, 'device', 'sweep', '--json').stdout);
+  const row = sweep.devices.find(x => x.device === BIG);
+  assert.equal(row.action, 'keep');
+  assert.match(row.why, new RegExp(`${B.run}`));
+  assert.equal(JSON.parse(readFileSync(join(A.dir, 'devices.snapshot.json'), 'utf8'))[BIG].state, 'Booted');
+
+  const c = run(A.dir, 'device', 'claim', BIG, '--run', A.run, '--holder', 'A');
+  assert.notEqual(c.status, 0);
+  assert.match(c.stderr + c.stdout, /跨项目不能抢占/);
+  assert.notEqual(JSON.parse(okH(A.dir, 'device', 'acquire', '--run', A.run, '--json').stdout).device, BIG);
+  assert.match(okH(A.dir, 'device', 'status').stdout, /别的项目登记的/);
+});

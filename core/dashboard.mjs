@@ -14,6 +14,7 @@ import { readFileSync, writeFileSync, readdirSync, existsSync, statSync } from '
 import { consultFor } from './evidence-consult.mjs';
 import { join, dirname, relative } from 'node:path';
 import { loadProject, ownerIdentity } from './project.mjs';
+import { smokeState, smokeSpec } from './smoke.mjs';
 
 const PROJ = await loadProject();
 if (!PROJ.root) { console.error('acceptkit open: 找不到项目（--project / ACCEPTKIT_PROJECT / 项目目录）'); process.exit(1); }
@@ -32,10 +33,11 @@ import { applicability, fmtApplicability, RUNTIME_PLATFORMS, PLATFORM_LABEL, nor
 import { loadDemands, allPlans, planCaseSet, demandsReferencing } from './demand-registry.mjs';
 import { imageKind, appShotsIn, reviewItems, setCardMarkers, assertionGaps, GAP_TEXT, viaOf, VIA_LABEL } from './evidence-gate.mjs';
 import { nextCards, caseStages, STAGES } from './next.mjs';
+import { listLoopBindings, lastLoopStop } from './store/db.mjs';
 import { approvedCases, planDelta } from './plan-gate.mjs';
 import { CARD_KINDS } from './cards.mjs';
 import { findingProblems, FINDING_KINDS } from './finding-quality.mjs';
-import { loadRounds, deriveHistory, demandRecords, resolveState, roundMembers, recordTime } from './rounds.mjs';
+import { loadRounds, deriveHistory, demandRecords, resolveState, roundMembers, recordTime, noShotHolders, shotInRound } from './rounds.mjs';
 const arg = k => { const i = process.argv.indexOf(k); return i > 0 ? process.argv[i + 1] : null; };
 const OUT = process.argv.slice(2).find(a => a.endsWith('.html')) || join(ROOT, 'dashboard.html');
 const ASSET_BASE = arg('--asset-base');
@@ -989,6 +991,14 @@ const demandRounds = [];
   }
   demandRounds.sort((a, b) => b.last - a.last);
 }
+// 运行号 → 它所在那一轮的面板。链接常常直接带运行号（#run=<运行目录名>），而面板是按轮组织的；
+// 不认就会落到第一个需求上，读的人以为链接坏了。没有记录的运行归到它需求的最新一轮
+const RUN2K = {};
+for (const dr of demandRounds) {
+  const latest = `round:${dr.did}:${dr.rf.rounds[dr.rf.rounds.length - 1].id}`;
+  for (const r of runs) if (r.res && (r.res.demand?.id || r.res.demand) === dr.did) RUN2K[r.id] = latest;
+  dr.mem.forEach((m, i) => { for (const run of m.runs) RUN2K[run] = `round:${dr.did}:${dr.rf.rounds[i].id}`; });
+}
 const stTally = st => { const t = { pass: 0, fail: 0, blocked: 0, gap: 0, todo: 0, skip: 0, na: 0 }; for (const v of st.values()) t[v.status] = (t[v.status] || 0) + 1; return t; };
 const aggOf = t => t.fail ? 'fail' : (t.blocked || t.gap || t.todo) ? 'mixed' : 'pass';
 function codeTable(rd) {
@@ -1197,7 +1207,7 @@ function trustOf(st) {
 }
 const KIND_CN = { attention: '等人回答', plan_draft: '评审单待改', finding_unclear: 'finding 待补写', blocker_own: '执行者自己的能力缺口', round_stale: '被测代码变了',
   device_needed: '缺设备', step_todo: '步骤待截图', expect_todo: '断言待判', rejected: '复核驳回待补', review_due: '证据待复核', report_due: '待出报告',
-  run_needed: '待开新运行', shot_missing: '待重测补截图', stalled: '运行停滞' };
+  run_needed: '待开新运行', smoke_needed: '待冒烟', device_changed: '设备变了待核对', smoke_env: '冒烟待查环境', smoke_failed: '冒烟没过', shot_missing: '待重测补截图', run_misfiled: '挂错需求', stalled: '运行停滞' };
 const laneName = t => clipStr(String(t || '').split(/[（(：:；;]/)[0], 42);
 function liveFlow(dr, st, live, waitOwner) {
   const { plan, cards, stages } = live;
@@ -1265,8 +1275,21 @@ function liveFlow(dr, st, live, waitOwner) {
   const board = `<div class="lanes"><div class="ln-row ln-head"><span class="ln-name">这次改了什么 <button class="ln-all">全部展开</button></span>${COLS.map(k => `<span class="ln-c">${COL_LABEL[k]} ${n(k)}</span>`).join('')}<span class="ln-p">完成进度</span></div>${lanes.map(laneRow).join('')}</div>`;
   const line = `<div class="progline"><b>${names.size} 条用例</b>${COLS.map(k => n(k) ? ` · <button class="flt" data-f="o:${k}">${COL_LABEL[k]} ${n(k)}</button>` : '').join('')} · <button class="flt" data-f="">看全部</button></div>`;
   const busy = [n('running') && `${n('running')} 条正在测`, n('todo') && `${n('todo')} 条等执行者开跑${stuck.size ? `（其中 ${stuck.size} 条开了没跑完）` : ''}`, n('blind') && `${n('blind')} 条证据待复核`].filter(Boolean);
-  const them = `<div class="meta">执行者那边：${busy.length ? busy.join(' · ') : '没有要做的'}${n('done') === names.size && !waitOwner ? ' —— 这一轮做完了' : ''}</div>`;
+  const them = `<div class="meta">执行者那边：${busy.length ? busy.join(' · ') : '没有要做的'}${n('done') === names.size && !waitOwner ? ' —— 这一轮做完了' : ''}</div>` + idleLine(dr.did, cards);
   return trust + you + line + board + them + pulledList(dr, cards);
+}
+// 执行者手上还有活、却没有会话绑在这条需求上 = 没人在跑，停钩子也拦不住谁。owner 看到一堆「待测」时最想知道的就是这个：
+// 谁停的、什么时候、为什么、怎么让它接着做（记录来自 acceptkit loop stop --why）
+function idleLine(did, cards) {
+  const left = cards.filter(c => c.kind !== 'attention').length;
+  if (!left) return '';
+  const on = listLoopBindings(ROOT).filter(b => b.demand === did && !b.key.startsWith('told:'));
+  if (on.length) return `<div class="meta">▶ 有执行者在跑这条需求（会话 <code>${esc(on[0].key.replace(/^cwd:/, '').slice(0, 8))}</code>，${esc(shortTime(on[0].at))} 接手）${on.length > 1 ? `，另有 ${on.length - 1} 个会话` : ''}</div>`;
+  const st = lastLoopStop(ROOT, did);
+  return `<div class="idle"><b>⏹ 现在没有执行者在跑这条需求</b>，执行者手上还有 ${left} 件事。`
+    + (st ? `上一个执行者（会话 <code>${esc(String(st.session).slice(0, 8))}</code>）${esc(shortTime(st.at))} 自己停下，当时还剩 ${st.left} 件；它写的理由：「${esc(st.why)}」。`
+      : '没有记下停的理由：执行者没认领（没跑 acceptkit loop start），或者是在「停要写理由」之前停的。')
+    + `<div class="dim">要接着测：在执行会话里说「继续验收 ${esc(did)}」，它会 acceptkit loop start ${esc(did)} 后照 next 往下做。</div></div>`;
 }
 // 这条用例的结论出自哪个运行，那个运行里工具截的 app 画面：读的人一眼看到「真在 app 上跑过、停在哪页」。
 // 一张都没有就直说 —— 以前这里只列断言的文本证据，一个需求跑了两百多个运行，页面上一张能看的图都没有。
@@ -1314,14 +1337,28 @@ function renderRoundPanel(dr, i) {
     .filter(m => !m.at || (m.at >= rd.opened_at && (!nextAt || m.at < nextAt)));
   // 迁移进来的 run（规则定下之前按当时的规矩跑的）不追溯 —— 与 report / record 的 legacyRun 同一口径
   const ruled = mem.runs.filter(r => !runs.find(x => x.id === r)?.res?.demand?.migrated);
-  const noShotRuns = ruled.filter(r => !shots.some(m => m.run === r));
+  // 与 next 的 shot_missing 同一口径（rounds.mjs noShotHolders）：只数本轮结论现在还出自它的运行，被后来的运行覆盖了的不再标红
+  const bareRun = (r, rdId) => { const res = runs.find(x => x.id === r)?.res; return !!res && RUNTIME_PLATFORMS.includes(res.platform || res.device?.platform) && !res.demand?.migrated && !shots.some(m => m.run === r) && !appShotsIn(join(RUNS, r)).some(shotInRound(dr.rf, rdId)); };
+  const noShotRuns = [...noShotHolders(st, bareRun, { here: true }).keys()];
   const shotLine = !mem.records || !ruled.length ? '' : !shots.length
     ? `<div class="rule bad-rule">⚠️ <b>本轮没有一张 app 操作截图</b>（${ruled.length} 个 run 全是文本证据）。违反有效截图规则：验收过程和结果要有真实 app 画面能证明。这一轮的「通过」只有探针日志支撑。</div>`
     : noShotRuns.length ? `<div class="rule bad-rule">⚠️ 本轮 app 操作截图 ${shots.length} 张，但 ${noShotRuns.length} 个 run 一张都没有：${noShotRuns.map(r => `<code>${esc(r)}</code>`).join(' · ')}</div>`
     : `<div class="meta">这一轮新跑的 ${ruled.length} 个运行截了 ${shots.length} 张 app 画面（继承来的结论有没有画面，看上面「能信几成」）</div>`;
+  // 冒烟：这一轮的包过没过冒烟，和用例本身的失败分开说（包没跑通时，用例的 fail 多半是包的问题）
+  const smokeLine = Object.keys(PROJ.config.smoke || {}).map(p => {
+    const sr = mem.runs.map(r => ({ id: r, r: resById(r) })).filter(x => x.r?.case === `smoke-${p}`)
+      .sort((a, b) => (a.r.run_seq || 0) - (b.r.run_seq || 0));
+    const sm = smokeState(sr, smokeSpec(PROJ.config, p));
+    if (sm.state === 'none') return i === dr.rf.rounds.length - 1 ? `<div class="rule bad-rule">🚬 本轮（${esc(p)}）还没冒烟：冒烟过了才开跑用例</div>` : '';
+    const what = [...sm.failed.map(f => `${esc(f.id)} ${esc(f.assert || '')}：${esc(f.actual || f.status)}`), ...sm.env.bad.map(c => `环境 ${esc(c.title || c.id)}${c.why ? `：${esc(c.why)}` : ''}`)];
+    return sm.state === 'pass' ? `<div class="meta">🚬 本轮的包冒烟通过（${esc(p)}，运行 <code>${esc(sm.run)}</code>）</div>`
+      : sm.state === 'fail' ? `<div class="rule bad-rule">🚬 <b>本轮的包冒烟没过</b>（${esc(p)}，运行 <code>${esc(sm.run)}</code>）：${what.join('；')}。这一轮用例的失败可能是包的问题，不一定是用例本身</div>`
+      : `<div class="meta">🚬 本轮冒烟进行中（${esc(p)}，运行 <code>${esc(sm.run)}</code>${sm.todo.length ? `，还没读：${sm.todo.map(esc).join(' ')}` : ''}${sm.env.done ? '' : '，环境还没查'}）</div>`;
+  }).join('');
   return `<section class="panel" data-k="${esc(k)}" hidden>
     <div class="phead"><h1>${esc(dr.demand.title)} · 第 ${rd.seq} 轮（共 ${dr.rf.rounds.length} 轮）</h1><button class="copylink" data-k="${esc(k)}">🔗 复制链接</button></div>
     ${roundFlow(dr, i, st, mem)}
+    ${smokeLine}
     <div class="whole"><b>按断言数</b> ${tallyBadges(t)}
       <span class="dim">共 ${st.size} 条断言 · 本轮测 ${src.here || 0} · 继承 ${src.inherited || 0} · 重置待测 ${src.reset || 0} · 从没测过 ${src.never || 0}</span></div>
     ${shotLine}
@@ -1442,7 +1479,7 @@ const navDemands = demandRounds.map((dr, di) => {
       <small><b>有结论 ${tested} / 共 ${total} 条</b>${i === dr.rf.rounds.length - 1 && liveOf(dr, i) ? (() => { const tt = trustOf(dr.states[i]); return tt.noshot || tt.gap || tt.cant ? ` · <span class="t-bad">${[tt.noshot && `${tt.noshot} 无画面`, tt.gap && `${tt.gap} 证据不全`, tt.cant && `${tt.cant} 验不了`].filter(Boolean).join(' · ')}</span>` : ''; })() : ''}</small></span></button>`;
   }).join('');
   const latestK = `round:${dr.did}:${dr.rf.rounds[dr.rf.rounds.length - 1].id}`;
-  return `<details class="dgrp"${di === 0 ? ' open' : ''} data-did="${esc(dr.did)}" data-latest="${esc(latestK)}"><summary><span class="dot ${statusClass(aggOf(t))}"></span><span class="nt"><b>${esc(dr.demand.title)}</b>
+  return `<details class="dgrp"${di === 0 ? ' open' : ''} data-did="${esc(dr.did)}" data-latest="${esc(latestK)}"><summary><span class="dg-tw" title="收起 / 展开这条需求的轮次"></span><span class="dot ${statusClass(aggOf(t))}"></span><span class="nt"><b>${esc(dr.demand.title)}</b>
     <small>${esc(dr.did)} · 测了 ${dr.rf.rounds.length} 轮 · ${dr.runCount} 个 run · 最近 ${esc(shortTime(new Date(dr.last).toISOString()).slice(0, 10))}</small>
     <span class="navtally">${tallyBadges(t)}</span></span></summary>${items}</details>`;
 }).join('');
@@ -1485,7 +1522,7 @@ const STYLE = `
 .plat{display:inline-block;font-size:11px;padding:1px 6px;border-radius:9px;margin-right:3px;border:1px solid var(--line2)}.plat.ok{color:var(--pass);border-color:var(--pass)}.plat.bad{color:var(--fail);border-color:var(--fail)}.plat.na{color:var(--muted)}
 .gcell.k-process img,.gcell.k-unverified img{opacity:.75}
 .ctree.stub{padding:4px 8px;font-size:13px}
-.nav-d{margin-top:6px}
+.nav-d{margin-top:6px}.dg-tw{flex:none;width:14px;color:var(--muted);cursor:pointer;text-align:center}.dg-tw:before{content:'▸'}details.dgrp[open]>summary .dg-tw:before{content:'▾'}.dg-tw:hover{color:inherit}.idle{margin:8px 0;padding:8px 10px;border-left:3px solid #d08700;background:var(--line2);border-radius:6px;font-size:13px;line-height:1.6}
 .backbtn{margin-right:12px;padding:3px 10px;border-radius:7px;border:1px solid rgba(255,255,255,.35);background:transparent;color:inherit;cursor:pointer;font-size:13px}.backbtn:hover{background:rgba(255,255,255,.12)}
 .bs.self{background:#e7f0ff;color:#0a5fbf;padding:1px 6px;border-radius:9px;font-size:11px}.bs.wait{padding:1px 6px;border-radius:9px;font-size:11px}
 details.dgrp{margin:6px 0}details.dgrp>summary{list-style:none;cursor:pointer;display:flex;gap:6px;padding:6px 8px;border-radius:8px}details.dgrp>summary::-webkit-details-marker{display:none}details.dgrp>summary:hover{background:var(--line2)}details.dgrp.cur>summary{background:var(--line2)}.nav-r{margin:2px 0 2px 16px;width:calc(100% - 16px)}pre.flist{max-height:280px;overflow:auto;font-size:11px;background:var(--line2);padding:6px 8px;border-radius:6px}details.rcase{margin:4px 0;border-bottom:1px solid var(--line)}details.rcase>summary{cursor:pointer;padding:4px 0}.whole{margin:8px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
@@ -1791,13 +1828,15 @@ function sel(k,fromBack){if(curK&&curK!==k&&!fromBack){backStack.push(curK);if(b
  const on=navs.find(n=>n.dataset.k===k);
  const grp=on?(on.closest('details.dgrp')||(on.dataset.did&&document.querySelector('details.dgrp[data-did="'+CSS.escape(on.dataset.did)+'"]'))):null;
  document.querySelectorAll('details.dgrp').forEach(g=>g.classList.toggle('cur',g===grp));
- if(grp){grp.open=true;}
+ if(grp){grp.open=true;document.querySelectorAll('details.dgrp').forEach(g=>{if(g!==grp)g.open=false;});}
  const vis=on&&on.offsetParent?on:(grp?grp.querySelector('summary'):null);
  if(vis&&!fromBack)try{vis.scrollIntoView({block:'nearest'})}catch(e){}
  pans.forEach(p=>p.hidden=p.dataset.k!==k);
  const cur=pans.find(p=>p.dataset.k===k);if(cur&&cur.dataset.lazy!==undefined)loadPanel(cur);
  if(!fromBack&&!location.hash.endsWith(encodeURIComponent(k)))try{history.replaceState({k},'','#run='+encodeURIComponent(k))}catch(e){location.hash='run='+encodeURIComponent(k)}
+ try{localStorage.setItem(${JSON.stringify(HOST_MSG + ':last:' + ROOT.split('/').pop())},k)}catch(e){}
  try{parent.postMessage({type:'${HOST_MSG}-run',run:k},'*')}catch(e){}}
+window.addEventListener('hashchange',()=>{const m=/run=([^&]+)/.exec(location.hash);if(!m)return;const k=decodeURIComponent(m[1]);if(k!==curK&&pans.some(p=>p.dataset.k===k)){sel(k);window.scrollTo(0,0);}});
 function goBack(){const k=backStack.pop();if(k){sel(k,true);window.scrollTo(0,0);}syncBack();}
 if(backBtn)backBtn.onclick=goBack;
 window.addEventListener('popstate',()=>{if(backStack.length)goBack();});
@@ -1805,6 +1844,7 @@ navs.forEach(n=>n.onclick=()=>sel(n.dataset.k));
 // 点需求那一行 = 看这条需求（最新一轮）。只折叠/展开轮次列表的话，第一条需求默认是展开的，
 // 一点反而把它收起来，右侧什么都不变 —— 像是点了没反应。正在看这条需求时再点，才是收起。
 document.querySelectorAll('details.dgrp>summary').forEach(s=>s.addEventListener('click',e=>{
+ if(e.target.closest('.dg-tw'))return;   // 箭头：原生折叠，不切面板
  const g=s.parentElement,mine=curK&&[...g.querySelectorAll('.nav')].some(n=>n.dataset.k===curK);
  if(g.open&&mine)return;e.preventDefault();g.open=true;sel(g.dataset.latest);window.scrollTo(0,0);}));
 // 清单 → 详情：详情面板没有对应的侧栏按钮，所以 sel 之后侧栏保持「用例集合」高亮
@@ -1854,11 +1894,15 @@ document.addEventListener('click',e=>{const a=e.target.closest('.opref');if(!a)r
 })();
 // 裁定页的条目链接 #run=decide&f=<Fxx>：切到裁定页，展开那一条并滚过去
 function focusFinding(id){const d=document.querySelector('details.dz[data-f="'+id+'"]');if(!d)return;d.open=true;d.scrollIntoView({block:'center'});d.classList.add('flash');setTimeout(()=>d.classList.remove('flash'),1600);}
-document.addEventListener('click',e=>{const a=e.target.closest('.needyou a[href^="#run=decide"]');if(!a)return;e.preventDefault();
+// 任何位置的「去裁定」都认（以前只认顶栏那条，轮次面板「等你」框里的同一个链接点了只改地址栏、页面不动）
+document.addEventListener('click',e=>{const a=e.target.closest('a[href^="#run=decide"]');if(!a)return;e.preventDefault();
  const f=/[&]f=([^&]+)/.exec(a.getAttribute('href'));sel('decide');if(f)focusFinding(decodeURIComponent(f[1]));else window.scrollTo(0,0);});
-(function(){const h=location.hash==='#decide'?'#run=decide':(location.hash||'');const m=/run=([^&]+)/.exec(h);const want=m?decodeURIComponent(m[1]):'';
+(function(){const h=location.hash==='#decide'?'#run=decide':(location.hash||'');const m=/run=([^&]+)/.exec(h);let want=m?decodeURIComponent(m[1]):'';
  const ff=/[&]f=([^&]+)/.exec(h);if(ff)setTimeout(()=>focusFinding(decodeURIComponent(ff[1])),0);
- const known=want&&pans.some(p=>p.dataset.k===want);
+ const RUN2K=${JSON.stringify(RUN2K).replace(/</g, '\\u003c')};
+ const has=k=>k&&pans.some(p=>p.dataset.k===k);
+ if(!want)try{want=localStorage.getItem(${JSON.stringify(HOST_MSG + ':last:' + ROOT.split('/').pop())})||''}catch(e){}
+ const known=has(want)||has(RUN2K[want]);if(!has(want)&&has(RUN2K[want]))want=RUN2K[want];
  // 没指定就落到第一个需求的最新一轮（需求执行记录是主视图）
  const firstRound=document.querySelector('.nav-r');
  sel(known?want:(firstRound?firstRound.dataset.k:(navs[0]&&navs[0].dataset.k)));})();

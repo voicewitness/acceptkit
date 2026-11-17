@@ -11,13 +11,15 @@ import { join } from 'node:path';
 import { loadPlan, planCases, approvedCases, planDelta, checkPlan, readBlockers, returnedPending } from './plan-gate.mjs';
 import { loadDemands } from './demand-registry.mjs';
 import { loadOps, doableOn } from './ops.mjs';
-import { loadRounds, repoSnapshot, demandRecords, resolveState } from './rounds.mjs';
+import { loadRounds, repoSnapshot, demandRecords, resolveState, noShotHolders, shotInRound } from './rounds.mjs';
 import { reviewItems, isImage, appShotsIn, assertionGaps, nonUiRead } from './evidence-gate.mjs';
 import { hostOfCase } from './hosts.mjs';
 import { findingProblems, blockerAskProblems } from './finding-quality.mjs';
 import { normalizePlatforms, RUNTIME_PLATFORMS } from './platform.mjs';
 import { readConfig } from './project.mjs';
 import * as C from './cards.mjs';
+import * as ANDROID from '../adapters/android/device.mjs';
+import { smokeSpec, smokeState, smokeCaseId } from './smoke.mjs';
 
 export const STALL_HOURS = 2;
 // 和报告的节点证据闸同口径（engine.mjs isUINode）：只有 UI 载体的节点要过程截图，其余节点认机器证据
@@ -116,13 +118,17 @@ function untested(root, D, plan) {
   // 没有轮次文件：当作只有一轮，没有重置
   const rf = loadRounds(root, D)?.rounds?.length ? loadRounds(root, D) : { rounds: [{ id: 'R1', opened_at: new Date(0).toISOString() }] };
   const carried = new Map();
-  for (const [k, v] of resolveState(rf, rf.rounds.length - 1, recs, keys)) {
+  const state = resolveState(rf, rf.rounds.length - 1, recs, keys);
+  // 有效截图规则：受规则管（端上平台、不是迁移来的）却一张 app 画面都没有的运行
+  const bare = (id, rd) => { const r = byId.get(id); return !!r && RUNTIME_PLATFORMS.includes(r.platform || r.device?.platform) && !r.demand?.migrated && !appShotsIn(join(dir, id)).some(shotInRound(rf, rd)); };
+  const noShot = noShotHolders(state, bare);
+  for (const [k, v] of state) {
     const i = k.indexOf('::'), n = k.slice(0, i);
     if (v.source === 'inherited') (carried.get(n) || carried.set(n, new Set()).get(n)).add(k.slice(i + 2));
     if (v.status !== 'todo') continue;
     (out.get(n) || out.set(n, []).get(n)).push({ id: k.slice(i + 2), source: v.source, round: v.round || null, why: v.reason || '' });
   }
-  return { todo: out, carried };
+  return { todo: out, carried, noShot, caseOfRun: id => byId.get(id)?.case };
 }
 
 /** 这条用例里结论继承自更早一轮的断言 id —— next（不出 expect_todo）和 report（不当 todo 拦）共用，两边口径必须一致 */
@@ -130,6 +136,18 @@ export const carriedExpects = (root, D, caseName) => untested(root, D, null).car
 
 /** 一个运行里的卡片（device_needed → step_todo → expect_todo → rejected → review_due → report_due）+ 是否停滞。
  *  carried：这条用例里结论继承自更早一轮的断言 id（untested 的 carried） */
+function deviceDrift(r) {
+  const key = r.device?.key;
+  if (!key || !r.device.boot_id || !/^avd:/.test(key)) return null;
+  try {
+    if (!ANDROID.available()) return null;
+    const addr = ANDROID.addressOf(key);
+    if (!addr) return { kind: 'gone', why: `${key} 现在没开（停了 / 被关了），之前的地址 ${r.device.address || '?'} 可能已经指向别的设备` };
+    const b = ANDROID.bootId(addr);
+    if (b && b !== r.device.boot_id) return { kind: 'rebooted', why: `${key} 在占用之后重启过（开机号变了），期间谁动过它不知道` };
+  } catch { /* 查不了就不报，动设备时 engine 还会再核 */ }
+  return null;
+}
 function runCards(root, cfg, D, { id, dir, r }, blockers, allBlockers, carried = new Set()) {
   const c = caseOf(root, r.case_ref) || caseOf(root, r.case);
   const out = [];
@@ -181,6 +199,9 @@ function runCards(root, cfg, D, { id, dir, r }, blockers, allBlockers, carried =
     if (current && last.decision === 'create' && last.ask) attention.push(C.deviceAttentionCard(id, last.ask, last.ask_detail || []));
     else out.push(C.deviceNeededCard(id, current && last.decision !== 'reuse' ? last.how || null : null));
   }
+  // 占着的设备停了 / 重启过：通知占用它的运行，先核对再往下做（engine liveAddress 同一口径；只核对记过开机号的占用）
+  const drift = left && deviceDrift(r);
+  if (drift) out.push(C.deviceChangedCard(id, r.device.key, drift));
   for (const n of stepTodo) out.push(C.stepTodoCard(id, n, web));
   for (const e of todo) out.push(C.expectTodoCard(id, e, answered.get(e.id) || null));
   // 记了结论、证据不全：同一份判据（assertionGaps）—— 报告列缺口、看板不算通过、这里让执行者先补齐再送盲审
@@ -206,7 +227,6 @@ function runCards(root, cfg, D, { id, dir, r }, blockers, allBlockers, carried =
   //（规则定下之前迁移进来的运行不追溯，与 record / report 的 legacyRun 同口径）
   const concluded = exps.filter(e => ['pass', 'fail'].includes(results[e.id]?.status)).length;
   const noShot = concluded && RUNTIME_PLATFORMS.includes(platform) && !r.demand?.migrated && !appShotsIn(dir).length;
-  if (noShot) out.push(C.shotMissingCard(D, id, r.case, concluded));
   if (!noShot && !gapIds.length && !left && !rejected.length && !pending.length && !unreported && !unlogged.length) {
     // 报告写完后 run.md 比 result.json 新；之后又有记录改动，就要重出
     const md = join(dir, 'run.md'), res = join(dir, 'result.json');
@@ -252,7 +272,15 @@ export function nextCards(root, D, opts = {}) {
     if (bad.length) own.push(C.findingUnclearCard(D, f, bad)); else attention.push(C.findingCard(D, f));
   }
 
-  const runs = latestRuns(root, D);
+  const runs0 = latestRuns(root, D);
+  // 挂错需求的运行：用例不在本需求的评审单里、不是调查型、出处也不是本需求（典型：--skip-plan-gate 开在了别的需求名下）。
+  // 它的卡片不是本需求的活：只出一张「改挂」卡，不派重跑（本需求下也开不了跑）。不改挂这张卡就一直在，问题藏不掉。
+  const planned = planCases(plan);
+  const misfiled = new Set(runs0.filter(x => { const c = caseOf(root, x.r.case_ref || x.r.case);
+    return c && !planned.has(x.r.case) && !['probe', 'smoke'].includes(c.kind || 'acceptance') && c.origin?.id !== D; }).map(x => x.id));
+  const misCase = new Set(runs0.filter(x => misfiled.has(x.id)).map(x => x.r.case));
+  for (const x of runs0.filter(y => misfiled.has(y.id))) own.push(C.runMisfiledCard(D, x.id, x.r.case, caseOf(root, x.r.case_ref || x.r.case)?.origin?.id || null));
+  const runs = runs0.filter(x => !misfiled.has(x.id));
   const statusNow = new Map(runs.map(x => [x.r.case, x.r]));
   // 阻塞项按它所在运行里那条断言现在的状态分流：还是 blocked 才可能要问人
   const allBlockers = readBlockers(root, D);
@@ -262,6 +290,7 @@ export function nextCards(root, D, opts = {}) {
   const unaskedSeen = new Set();
   const askedGroups = new Map();
   for (const b of blockers) {
+    if (misCase.has(b.case)) continue;   // 挂错需求的运行上的阻塞随「改挂」卡走
     const newer = statusNow.get(b.case);
     if (newer && newer.run !== b.run) continue;   // 这条用例已经重跑：以新运行里的阻塞为准，旧运行不再出报告
     const st = readJSON(join(root, 'runs', b.run, 'result.json'))?.results?.[b.expect]?.status || 'blocked';
@@ -296,7 +325,7 @@ export function nextCards(root, D, opts = {}) {
 
   // 运行按评审单里的用例顺序，评审单外的（调查型）排后面
   const order = [...planCases(plan)];
-  const { todo: untestedBy, carried } = untested(root, D, plan);
+  const { todo: untestedBy, carried, noShot, caseOfRun } = untested(root, D, plan);
   runs.sort((a, b) => ((order.indexOf(a.r.case) + 1) || 1e9) - ((order.indexOf(b.r.case) + 1) || 1e9) || a.id.localeCompare(b.id));
   for (const x of runs) {
     const rc = runCards(root, cfg, D, x, blockers, allBlockers, carried.get(x.r.case));
@@ -304,6 +333,8 @@ export function nextCards(root, D, opts = {}) {
     rest.push(...rc.cards);
     if (rc.stalled) stalled.push(C.stalledCard(x.id, rc.stalled));
   }
+  // 结论还靠没截图的运行撑着：按当前状态出（与看板红条同一份 noShotHolders），被后来的运行覆盖了的不出
+  for (const [run, ks] of noShot) if (!misfiled.has(run)) rest.push(C.shotMissingCard(D, run, caseOfRun(run), ks.map(k => k.slice(k.indexOf('::') + 2))));
 
   // 还没测上、最新运行里也不开着的断言（开着的上面已出 expect_todo / 阻塞卡片）：要开新运行。先把已开的跑完，再开新的。
   // 没批的用例开不了（调查型除外），挂到批准 / 草稿卡片上 —— 问的人要知道批了才能接着测哪些。
@@ -312,6 +343,7 @@ export function nextCards(root, D, opts = {}) {
   const inPlan = new Set(order);
   const held = [];
   for (const [name, es] of untestedBy) {
+    if (misCase.has(name)) continue;   // 挂错需求的用例：本需求下开不了跑，由「改挂」卡处理
     const cur = statusNow.get(name);
     const left = es && es.filter(e => DONE.has(cur?.results?.[e.id]?.status || 'todo') || !cur);
     if (es && !left.length) continue;
@@ -321,6 +353,23 @@ export function nextCards(root, D, opts = {}) {
   }
   const gate = held.length && [...attention, ...draft].find(c => c.subject === 'plan_approval' || c.kind === 'plan_draft');
   if (gate) Object.assign(gate, C.heldByPlan(gate, held));
+  // 冒烟闸：项目声明了冒烟项、评审单批过了，这一轮的冒烟没过就不派用例运行（run_needed 收进冒烟卡片里，看得见被挡了什么）
+  if (plan.approved_at) {
+    const curRound = loadRounds(root, D)?.rounds?.at(-1)?.id;
+    for (const p of normalizePlatforms(plan).filter(x => DEVICE_PLATFORMS.has(x))) {
+      const spec = smokeSpec(cfg, p); if (!spec) continue;
+      if (Array.isArray(spec.demands) && !spec.demands.includes(D)) continue;   // 试用：只闸列出的需求，别的需求照旧
+      const sr = runs.filter(x => x.r.case === smokeCaseId(p) && (!curRound || x.r.round === curRound));
+      const st = smokeState(sr, spec);
+      if (st.state === 'pass') continue;
+      const blocked = rest.filter(c => c.kind === 'run_needed');
+      for (const c of blocked) rest.splice(rest.indexOf(c), 1);
+      const card = st.state === 'none' ? C.smokeNeededCard(D, p, curRound)
+        : st.state === 'fail' ? C.smokeFailedCard(D, p, st)
+        : !st.env.done && sr.at(-1).r.device ? C.smokeEnvCard(st.run, p) : null;
+      if (card) rest.unshift(Object.assign(card, blocked.length ? { held: blocked.map(c => ({ case: c.case, expects: c.expects || [] })), detail: [...(card.detail || []), `冒烟过了才开跑：${blocked.length} 条用例（${blocked.map(c => c.case).slice(0, 6).join('、')}${blocked.length > 6 ? ' 等' : ''}）`] } : {}));
+    }
+  }
   return [...attention, ...draft, ...own, ...rest, ...stalled];
 }
 
@@ -332,8 +381,8 @@ export const STAGES = [
   // 出报告不是一个阶段：工具在最后一条结论 / 复核落下时自动出（engine autoReport）。还没出的（规则之前留下的）算完成，卡片照旧提醒执行者
   ['review', '用例评审'], ['exec', '执行'], ['blind', '盲审'], ['done', '完成'],
 ];
-const STAGE_OF_KIND = { run_needed: 'exec', device_needed: 'exec', step_todo: 'exec', expect_todo: 'exec', rejected: 'exec',
-  blocker_own: 'exec', blocker_unasked: 'exec', stalled: 'exec', shot_missing: 'exec', evidence_gap: 'exec', review_due: 'blind', report_due: 'done' };
+const STAGE_OF_KIND = { run_needed: 'exec', smoke_env: 'exec', device_changed: 'exec', device_needed: 'exec', step_todo: 'exec', expect_todo: 'exec', rejected: 'exec',
+  blocker_own: 'exec', blocker_unasked: 'exec', stalled: 'exec', shot_missing: 'exec', run_misfiled: 'exec', evidence_gap: 'exec', review_due: 'blind', report_due: 'done' };
 /** caseStages(root, cards) → Map<用例, {stage, ask}>：用例最靠前的那张卡片定它在哪一步；没有卡片的不在表里（= 完成）。
  *  ask：这条用例上已经问了、等人回答的事（阻塞答复、设备放行）。需求级的卡片（finding、round_stale）不属于哪条用例，不在这里。 */
 export function caseStages(root, cards) {
@@ -354,7 +403,7 @@ export function caseStages(root, cards) {
     out.set(name, cur);
   };
   for (const c of cards) {
-    for (const h of c.held || []) put(h.case, 'review');
+    for (const h of c.held || []) put(h.case, /^smoke_/.test(c.kind) ? 'exec' : 'review');   // 被冒烟挡住的已过评审，停在执行前
     // 还没提给用户的阻塞（没有 question）是执行者要先提的，不算「等你答复」
     if (c.kind === 'attention' && (c.subject === 'blocker' || c.subject === 'device')) put(caseFor(c), 'exec', c.question ? 1 : 0);
     else if (STAGE_OF_KIND[c.kind]) put(caseFor(c), STAGE_OF_KIND[c.kind]);

@@ -211,6 +211,14 @@ export function bindLoop(root, key, demand, cwd = null) {
 }
 export const unbindLoop = (root, key) => openDb(root).prepare('DELETE FROM loop_bindings WHERE key = ?').run(key).changes > 0;
 export const loopBinding = (root, key) => openDb(root).prepare('SELECT * FROM loop_bindings WHERE key = ?').get(key) || null;
+// 执行者还有活却自己 loop stop：记下谁、何时、为什么、还剩几件。看板上「没人在跑」时把这条摆出来，owner 才知道是谁停的、为什么停
+export function recordLoopStop(root, demand, rec) {
+  openDb(root).prepare('INSERT OR REPLACE INTO meta(k, v) VALUES (?, ?)').run(`loop_stop:${demand}`, JSON.stringify({ ...rec, at: new Date().toISOString() }));
+}
+export function lastLoopStop(root, demand) {
+  const v = openDb(root).prepare('SELECT v FROM meta WHERE k = ?').get(`loop_stop:${demand}`)?.v;
+  try { return v ? JSON.parse(v) : null; } catch { return null; }
+}
 export const listLoopBindings = root => openDb(root).prepare('SELECT * FROM loop_bindings ORDER BY at DESC').all();
 
 // ---------- 用例质量基线 ----------

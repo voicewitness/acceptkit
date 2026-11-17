@@ -73,7 +73,8 @@ export const RULES = [
   { id: 'Q21', level: 'block', since: '2026-11-06', title: '界面上验的断言要用界面通道读',
     why: '只有界面通道（exec=ui / web 的配方）会在读到值的那一刻截图；用诊断 / 日志配方读，observe 重跑多少次都补不上那张图，结论一直是「证据不全」',
     fix: 'observe.op 换成在 app 页面上读值的配方（ops set 时写清进到哪一页、读画面上哪几个字；app 自带的调试页也算界面）；界面上确实看不到，才写 via + why_not_ui',
-    check: ({ c, ops }) => !ops || c.kind === 'probe' ? [] : expects(c).flatMap(({ e }) => normalizePlatforms(c).flatMap(p => {
+    // 冒烟项读的多是装配结果、决策计数这类运行时值，本来就不在界面上，不套这条
+    check: ({ c, ops }) => !ops || c.kind === 'probe' || c.kind === 'smoke' ? [] : expects(c).flatMap(({ e }) => normalizePlatforms(c).flatMap(p => {
       const x = nonUiRead(e, p, ops, hostOfCase(c, p));
       return x ? [{ at: e.id, msg: `${p} 上用 ${x.op} 读（exec=${x.exec}），不是界面通道，截不到读到值那一刻的图` }] : [];
     })) },

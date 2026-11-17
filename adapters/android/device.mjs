@@ -71,6 +71,8 @@ export function addressOf(ref) {
 }
 
 export const bootCompleted = (serial) => run(adbBin(), ['-s', serial, 'shell', 'getprop', 'sys.boot_completed']).out === '1';
+/** 这一次开机的编号：重启就变。占用时记下，之后每次动设备都核对 —— 同一个身份、换了一次开机，期间谁动过它都不知道 */
+export const bootId = (serial) => { const r = run(adbBin(), ['-s', serial, 'shell', 'cat', '/proc/sys/kernel/random/boot_id']); return r.ok ? r.out.trim() || null : null; };
 export const uptimeSec = (serial) => { const r = run(adbBin(), ['-s', serial, 'shell', 'cat', '/proc/uptime']); return r.ok ? Math.round(parseFloat(r.out.split(/\s+/)[0]) || 0) : null; };
 export const pidOf = (serial, pkg) => { if (!pkg) return ''; const r = run(adbBin(), ['-s', serial, 'shell', 'pidof', pkg]); return r.ok ? (r.out.split(/\s+/)[0] || '') : ''; };
 /** 已装被测包的版本（versionName）；没装或读不到返回 null */

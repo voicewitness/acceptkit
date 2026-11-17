@@ -23,3 +23,13 @@ test('别的遮蔽层不受影响', () => {
   const feed = [node('a'), node('b'), node('c')];
   assert.deepEqual(dropSplashIfPageIsUp([splash, other], feed, PKG), [other]);
 });
+
+test('Feed 底栏外层框可点、字在里面不可点：被测包 5 条以上不同的字也算页面起来了', () => {
+  const feed = [node('Home', false), node('Friends', false), node('Inbox', false), node('Profile', false), node('#bmw 不是用来上路的…', false)];
+  assert.deepEqual(dropSplashIfPageIsUp([splash], feed, PKG), []);
+});
+
+test('启动页上的广告寥寥几个字（跳过 / 广告 / 品牌名），重复的字不凑数：照样拒', () => {
+  const ad = [node('跳过', false), node('广告', false), node('Brand', false), node('跳过', false), node('广告', false), node('Brand', false)];
+  assert.deepEqual(dropSplashIfPageIsUp([splash], ad, PKG), [splash]);
+});

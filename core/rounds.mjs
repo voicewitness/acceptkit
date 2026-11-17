@@ -200,3 +200,27 @@ export function roundMembers(rf, recs) {
   for (const r of recs) { const i = roundIndexAt(rf, r.t); m[i].runs.add(r.run); m[i].sessions.add(r.session); m[i].n++; }
   return m.map(x => ({ runs: [...x.runs], sessions: [...x.sessions], records: x.n }));
 }
+
+// 结论还靠「一张 app 画面都没有的运行」撑着的断言 → Map<run, ["case::E"]>。
+// 看板的红条和 next 的 shot_missing 卡片同一口径（以前看板按「本轮有记录的运行」数、next 只看每条用例的最新运行，
+// 两边对不上：看板标红的运行 next 一张卡都不出，执行者靠 next 干活就永远补不上）。
+// 只看当前状态里 pass / fail / gap 的那条记录出自哪个运行：被后来的运行覆盖了的结论不再算它的。
+// bare(run, round)：这个运行受有效截图规则管（端上平台、不是迁移来的），且在这条结论所在的那一轮里一张 app 截图都没有
+//（截图按截图时刻归轮，用 shotInRound 判：早几轮截的图证明的是旧版本，撑不起这一轮记的结论）。here：只算本轮记的。
+export function noShotHolders(state, bare, { here = false } = {}) {
+  const out = new Map();
+  for (const [k, v] of state) {
+    if (!v.run || !['pass', 'fail', 'gap'].includes(v.status)) continue;
+    if (here && v.source !== 'here') continue;
+    if (!bare(v.run, v.round)) continue;
+    (out.get(v.run) || out.set(v.run, []).get(v.run)).push(k);
+  }
+  return out;
+}
+
+// 截图是否落在某一轮之内（按截图时刻；没有时刻的老截图不排除）。看板红条与 next 共用
+export function shotInRound(rf, roundId) {
+  const i = rf.rounds.findIndex(x => x.id === roundId);
+  const from = rf.rounds[i]?.opened_at, to = rf.rounds[i + 1]?.opened_at;
+  return m => !m.at || ((!from || m.at >= from) && (!to || m.at < to));
+}

@@ -85,7 +85,7 @@ acceptkit know profile                         # ⑧ 环境画像 + 缺口清单
 ```
 0. 用户刚说了话：对照上一轮交给他的 attention 卡片，他回答了哪几张，就照那几张的 on_reply 先记下原话
    （命令已经填好，只换 <他> <原话> 这几个空）；记完再往下。他说的是新要求、不是回答：照「循环之外」处理
-   开工第一次：acceptkit loop start <需求>   # 告诉宿主这个会话在验收它：没做完宿主不让你停；做完或要停：acceptkit loop stop
+   开工第一次：acceptkit loop start <需求>   # 告诉宿主这个会话在验收它：没做完宿主不让你停；做完自动解绑；还有活要停：acceptkit loop stop --why "<为什么；用户让停就抄原话>"（理由摆在看板上）
 1. acceptkit next <需求> --json          # 工具从记录推出还剩什么，列成卡片（顺序已排好）
 2. 取第一张你能做的卡片，照它的 note 做；
    这一步不熟、或上次在这一步栽过：acceptkit context <运行> --node <节点> --json
@@ -109,8 +109,10 @@ acceptkit know profile                         # ⑧ 环境画像 + 缺口清单
 | `plan_draft` / `finding_unclear` | 评审单没写完 / finding 写得 owner 定不了：照 detail 补，`plan check` |
 | `blocker_own` | 自己的能力缺口：补上后 `blockers --resolve`，或按 note 补登记、补上报。不知道输入从哪来、结果在哪看：先 `consult <运行> --expect E` |
 | `blocker_unasked` | 要用户答的阻塞，先写成他能拍板的问题再提：`blockers <D> --set B1,B2 --ask "<问句？>" --why-you "<你为什么解决不了>" --option "做法 => 后果" --option "…" --recommend "<选哪个、为什么>"`。解锁条件（下发侧要做什么、判据是什么）是给你自己看的，不是问题；同一件事卡住几条就一次写一组 |
+| `smoke_needed` / `smoke_env` / `smoke_failed` | 冒烟闸（项目在 `acceptkit.project.json` 声明了 `smoke.<平台>.items` 才有）：这一轮的包冒烟没过，用例运行不开。`smoke <D> --platform p` 开冒烟运行 → `device acquire` → 装好这一轮的被测包（过 `gate`）→ `smoke env <run> --apk <本地包>` 查环境 → `observe <run> <冒烟项>` 逐项读数。包的问题记 finding 告诉 owner，出新包开新一轮再冒烟；环境的问题（残留覆盖配置、没登记的装包、swap 打满）处理掉重查。读不到也算没过 |
 | `run_needed` | 评审单点名的用例还没开跑：`run <case> --demand <D>` |
-| `device_needed` | `device acquire --run R`：工具按复用 → 启动选一台并占上，返回设备卡片；你只核对账号、页面这些工具看不出的，不对就 `device reject <身份> --run R --why "…"`，工具换下一台 |
+| `device_changed` | 运行占着的设备停了 / 重启过：没开就 `device acquire --run R` 重新起同一台，再 `device verify --run R` 核对（重启之后记的结论会退回待测）。核对之前动这台设备的命令都会被拒 |
+| `device_needed` | `device acquire --run R`：工具按复用 → 启动选一台并占上（记到本会话名下：只有本会话能动它，之后的 adb 用 `acceptkit adb --run R -- …`，别写死 emulator-NNNN），返回设备卡片；你只核对账号、页面这些工具看不出的，不对就 `device reject <身份> --run R --why "…"`，工具换下一台 |
 | `evidence_gap` | 记了结论但证据不全（铁律 8c）：**重试，不是验不了**。界面上的断言重跑 `observe` 走 UI 通道，在能看到结论的页面读值并截图；命令行断言把采集命令登记成配方、由 observe 去跑。别改记 blocked。不知道去哪看：`consult <运行> --expect E` 按判据面给常见取证入口、要问清的业务问题和问 owner 的草稿；查到的业务事实 `know add --heading 取证` |
 | `step_todo` | 做这一步，`shot <run> --step nN` 留过程截图（截图当场检测见铁律 8a）；会改状态的动作先 `gate` |
 | `expect_todo` | `observe`；observe 做不了的才 `record --quote` 手记。判不了就 `record --status blocked --blocked-kind capability\|dependency --actual "…" --unlock "…"`，再 `blockers <D> --raise`，把 message 原样交给用户 |

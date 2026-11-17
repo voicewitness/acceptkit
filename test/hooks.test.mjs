@@ -22,7 +22,7 @@ function setup() {
   const env = { ...process.env, HOME: home, ACCEPTKIT_PROJECT: dir, PATH: '/usr/bin:/bin', CLAUDE_CODE_SESSION_ID: 'sess-1' };
   const ak = (args, input) => spawnSync(process.execPath, [BIN, ...args], { cwd: dir, encoding: 'utf8', env, input });
   const hook = (id, raw, host = 'claude-code') => { const r = ak(['hook', 'run', '--host', host, '--id', id], JSON.stringify(raw)); assert.equal(r.status, 0, r.stderr); return r.stdout.trim() ? JSON.parse(r.stdout) : null; };
-  return { dir, ak, hook };
+  return { dir, ak, hook, home };
 }
 const bash = command => ({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command }, cwd: '/tmp', session_id: 'sess-1' });
 
@@ -54,7 +54,7 @@ test('H1：刚过闸的设备放行；闸按身份认（--sim 给 serial 时 gat
   const now = new Date().toISOString();
   const U = ['0A1B2C3D', '0000', '4000', '8000', '00000000AAAA'].join('-'); // 拼出来，免得被泄漏扫描当成真设备号
   // 测试不碰 adb：用 iOS UDID 当身份，--sim 给的是别名（Android 上是 serial），gate 记下反解出的身份
-  saveLeases(dir, { [U]: { run: 'R1', holder: 't', platform: 'android', since: now, heartbeat: now } });
+  saveLeases(dir, { [U]: { run: 'R1', holder: 't', platform: 'android', since: now, heartbeat: now, session: 'sess-1' } });
   mkdirSync(join(dir, 'runs', 'R1'), { recursive: true });
   const gate = checked => writeFileSync(join(dir, 'runs', 'R1', 'result.json'), JSON.stringify({ case: 'c1', platform: 'android',
     gates: [{ action: '装包', verdict: 'pass', at: now, checked: [{ key: '--sim', where: 'flag', ...checked }] }] }));
@@ -65,6 +65,33 @@ test('H1：刚过闸的设备放行；闸按身份认（--sim 给 serial 时 gat
   const r = hook('H1', cmd).hookSpecificOutput;
   assert.equal(r.permissionDecision, 'deny');
   assert.match(r.permissionDecisionReason, new RegExp(`有闸但不算.*emulator-5554.*不是 ${U}`));
+});
+
+test('H1 强制管控：验收设备只有本会话占着才能动（没人占也拦、别的会话占着拦、旧占用要重新占）；脚本里的调用也算；字样不算', () => {
+  const { dir, hook } = setup();
+  const U = ['0A1B2C3D', '0000', '4000', '8000', '00000000BBBB'].join('-');
+  const cfg = JSON.parse(readFileSync(join(dir, 'acceptkit.project.json'), 'utf8')); cfg.gate.allow.push({ value: U, kind: 'device' });
+  writeFileSync(join(dir, 'acceptkit.project.json'), JSON.stringify(cfg));
+  const now = new Date().toISOString();
+  const deny = (c, re, why) => { const r = hook('H1', bash(c)); assert.equal(r?.hookSpecificOutput?.permissionDecision, 'deny', why); assert.match(r.hookSpecificOutput.permissionDecisionReason, re, why); };
+  const launch = `xcrun simctl launch ${U} com.x`;
+  deny(launch, /没人占着.*device acquire/, '没人占：不再默认放行');
+  saveLeases(dir, { [U]: { run: 'R9', holder: '别的需求', platform: 'ios', since: now, heartbeat: now, session: 'sess-2' } });
+  deny(launch, /另一个会话占着.*R9/, '别的会话占着');
+  saveLeases(dir, { [U]: { run: 'R9', holder: 'x', platform: 'ios', since: now, heartbeat: now } });
+  deny(launch, /还没绑会话.*device acquire --run R9/, '旧占用没有会话');
+  saveLeases(dir, { [U]: { run: 'R1', holder: 'x', platform: 'ios', since: now, heartbeat: now, session: 'sess-1' } });
+  assert.equal(hook('H1', bash(launch)), null, '本会话占着：放行');
+  // 脚本：跑一个脚本文件，脚本里调 simctl 打这台 —— 别的会话占着时拦
+  saveLeases(dir, { [U]: { run: 'R9', holder: 'x', platform: 'ios', since: now, heartbeat: now, session: 'sess-2' } });
+  const f = join(dir, 'probe.mjs');
+  writeFileSync(f, `import { spawnSync } from 'node:child_process';\nspawnSync('xcrun', ['simctl', 'launch', '${U}', 'com.x']);\n`);
+  deny(`node ${f}`, /脚本 .*probe\.mjs.*另一个会话/, '脚本里的调用也算');
+  // 只是提到这个词：不算
+  writeFileSync(f, `// 先用 simctl 和 adb 看一下设备（${U}）\nconsole.log(1)\n`);
+  assert.equal(hook('H1', bash(`node ${f}`)), null, '注释里提到不算调用');
+  assert.equal(hook('H1', bash('grep -n adb notes.md')), null, 'grep 的字样不算');
+  assert.equal(hook('H1', bash('xcrun simctl list devices')), null, '只读列表不拦');
 });
 
 test('H2：手改验收记录被拦；项目外的同名文件放行', () => {
@@ -110,3 +137,49 @@ test('hook install --print：生成各家配置片段，命令指向本仓库的
   assert.match(JSON.stringify(j.snippet), /acceptkit\.mjs\\" hook run --host claude-code --id H1/);
   void readFileSync;
 });
+
+test('H1 认「调用」不认字样：只有处在命令位置的 adb / xcrun simctl 算发往设备', async () => {
+  const { deviceTargets } = await import('../core/hooks.mjs');
+  for (const c of ['grep -c "adb" devices.md', 'echo use adb later', 'cat notes/adb.md', 'rg simctl docs/'])
+    assert.equal(deviceTargets(c), null, c);
+  assert.deepEqual(deviceTargets('adb -s R58N1234 shell ls').ids, ['R58N1234']);
+  assert.equal(deviceTargets('X=1 timeout 5 /opt/sdk/platform-tools/adb shell ls').any, true, '没写 -s：连着的全算');
+  assert.equal(deviceTargets('ls && adb devices'), null, '只读的身份查询不算');
+  assert.equal(deviceTargets('acceptkit adb --run R -- shell ls'), null, '走封装：封装自己核对');
+  // 子命令之后的 -s 是子命令自己的（logcat 过滤），不是设备：没写全局 -s 就算连着的全部
+  const lc = deviceTargets('adb logcat -d -s MyTag:*');
+  assert.deepEqual(lc.ids, []); assert.equal(lc.any, true);
+  assert.deepEqual(deviceTargets('adb -s R58N1234 logcat -d -s TAG:*').ids, ['R58N1234']);
+  // 别的工具自己调 adb、只把地址当参数：按参数认设备
+  assert.deepEqual(deviceTargets('some-tool load --serial R58N1234 x.dex').ids, ['R58N1234']);
+  assert.deepEqual(deviceTargets('ANDROID_SERIAL=R58N1234 ./run.sh').ids, ['R58N1234']);
+});
+
+test('H1 触发条件包含 --serial 这类参数：别的工具带着验收设备地址也过钩子', () => {
+  const { dir, hook, home } = setup();
+  const U = ['0A1B2C3D', '0000', '4000', '8000', '00000000CCCC'].join('-');
+  const cfg = JSON.parse(readFileSync(join(dir, 'acceptkit.project.json'), 'utf8')); cfg.gate.allow.push({ value: U, kind: 'device' });
+  writeFileSync(join(dir, 'acceptkit.project.json'), JSON.stringify(cfg));
+  const r = hook('H1', bash(`some-tool load --udid ${U} probe.dex`));
+  assert.equal(r?.hookSpecificOutput?.permissionDecision, 'deny');
+  assert.match(r.hookSpecificOutput.permissionDecisionReason, /没人占着/);
+  // 拦下的也记账：选设备靠账本认出谁刚动过哪台
+  const ops = readFileSync(join(home, ".config", "acceptkit", "device-ops.jsonl"), "utf8").trim().split("\n").map(l => JSON.parse(l));
+  assert.equal(ops.at(-1).via, "hook"); assert.equal(ops.at(-1).denied, true); assert.deepEqual(ops.at(-1).devices, [U]);
+});
+
+test('loop stop：还有能做的事就要写理由；理由和剩下的件数记下来，看板摆给 owner', async () => {
+  const { dir, ak, hook } = setup();
+  assert.equal(ak(['plan', 'new', 'D1', '--title', '首页问候', '--platform', 'web']).status, 0);
+  assert.equal(ak(['loop', 'start', 'D1']).status, 0);
+  const bare = ak(['loop', 'stop']);
+  assert.notEqual(bare.status, 0);
+  assert.match(bare.stderr, /还有 \d+ 件你能做的事[\s\S]*--why/);
+  assert.equal(hook('H3', { hook_event_name: 'Stop', session_id: 'sess-1', cwd: '/tmp', stop_hook_active: false }).decision, 'block', '没停成：照样拦');
+  const ok = ak(['loop', 'stop', '--why', '用户说先停：「今天先到这」']);
+  assert.equal(ok.status, 0, ok.stderr);
+  const { lastLoopStop } = await import('../core/store/db.mjs');
+  const st = lastLoopStop(dir, 'D1');
+  assert.equal(st.session, 'sess-1'); assert.match(st.why, /今天先到这/); assert.ok(st.left > 0);
+});
+

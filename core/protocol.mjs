@@ -47,6 +47,54 @@ export const COMMANDS = [
     argv: 'acceptkit device reject {device} --run {run} --why {why} --json',
     returns: '和 device_acquire 一样：再选一台的结果' },
 
+  { name: 'device_sweep',
+    description: '回收空闲设备：占着却超过空闲阈值（缺省 60 分钟，用户配置 devices.idle_minutes）没续期的，放掉占用并关机；没人占、acceptkit 用过且超过阈值没碰的，关机。'
+      + '白名单条目写了 keep_on 的、不在白名单的、acceptkit 从没用过的不动。关机不丢数据，下一轮 acquire 重新起同一台。看板服务每 10 分钟自动跑一次。',
+    input_schema: obj([], { 'dry-run': flag('只说会怎么做，不放不关') }),
+    argv: 'acceptkit device sweep [--dry-run] --json',
+    returns: '{ idle_minutes, dry_run, devices: [{ device, action: keep|reclaim|stop, why, run?, shutdown? }] }' },
+
+  { name: 'device_verify',
+    description: '重新核对运行占着的设备：身份对得上、占用在本运行、记下这一次开机的编号。设备停过 / 重启过之后，acceptkit 动这台设备的命令（observe / shot / adb）一律拒收，直到核对过；'
+      + '核对时发现上次核对之后重启过，那之后记的结论退回待测（读数可能不在这台、或期间被人动过）。',
+    input_schema: obj(['run'], { run: str('运行') }),
+    argv: 'acceptkit device verify --run {run} --json',
+    returns: '{ kind: "device_verified", run, device, address, rebooted, voided: [断言] }' },
+
+  { name: 'adb',
+    description: '对运行占着的 Android 设备执行 adb：每次按设备身份现查地址（不要在脚本里写死 emulator-NNNN）、核对开机号、占用在本运行且在本会话名下；装 / 卸 / 清数据还要新鲜的 gate。每次调用记进 ~/.config/acceptkit/device-ops.jsonl。',
+    input_schema: obj(['run', 'args'], { run: str('运行'), args: { type: 'array', items: { type: 'string' }, description: '-- 之后的 adb 参数（不要带 -s）' } }),
+    argv: 'acceptkit adb --run {run} -- {args}',
+    returns: 'adb 的输出原样透传，退出码同 adb' },
+
+  { name: 'device_rename',
+    description: '给设备起个看得懂的名字（模拟器窗口标题就是设备名）。iOS 开着也能改，切到 Simulator 时标题刷新；被需求占着时 acceptkit 自动在名字后面加「 ▸ <需求号> <标题>」、放掉时去掉。'
+      + 'Android 的标题是 AVD 名，只能关机且没人占时改，改完把所有登记项目白名单里的 avd:<旧名> 一起换掉；AVD 名只能用英文字母、数字和 . _ -。',
+    input_schema: obj(['device', 'to'], { device: str('UDID 或 avd:<AVD 名>'), to: str('新名字') }),
+    argv: 'acceptkit device rename {device} --to {to} --json',
+    returns: '{ device, name? | from, dir, whitelists }' },
+
+  { name: 'smoke',
+    description: '冒烟闸：按项目声明（acceptkit.project.json 的 smoke.<平台>.items，每项 { id, assert, observe }）生成冒烟用例，为需求开一次冒烟运行（不过评审闸，要过轮次闸）。'
+      + '评审单批过后，这一轮的冒烟没过，next 不出 run_needed，只出冒烟卡片。冒烟项的读数用 observe 取、原文落盘、照样盲审。',
+    input_schema: obj(['demand'], { demand: str('需求'), platform: str('ios | android；评审单只有一个端时可省') }),
+    argv: 'acceptkit smoke {demand} [--platform {platform}] --json',
+    returns: '{ kind: "smoke", demand, platform, run, items, note }' },
+
+  { name: 'smoke_env',
+    description: '冒烟前查环境，结果记进运行（smoke_env），原始读数落 evidence/smoke-env.json：宿主机 swap / 负载；Android 再查设备上的包是不是被测包（--apk 本地包的 sha256 对设备 base.apk）、'
+      + '项目声明的覆盖配置文件（smoke.<平台>.env.override_files）有没有残留、包的 lastUpdateTime 是否晚于 acceptkit 登记过的最后一次装包（过了目标闸的装包），并写明这台设备上一次被哪个运行占着。读不到也算没过。',
+    input_schema: obj(['run'], { run: str('冒烟运行'), apk: str('本地被测包路径（Android）') }),
+    argv: 'acceptkit smoke env {run} [--apk {apk}] --json',
+    returns: '{ kind: "smoke_env", run, ok, checks: [{ id, title, ok, reading, why? }], evidence }' },
+
+  { name: 'browser_sweep',
+    description: '回收空闲浏览器：acceptkit 起的调试 Chrome（台账在 ~/.config/acceptkit/browsers）超过空闲阈值（缺省 60 分钟，用户配置 browsers.idle_minutes）没用就关；'
+      + '用户目录在登记过的项目下、但没登记的先收进台账。用户自己的 Chrome、别的工具起的不动。只关窗口，用户目录（登录态）留着。看板服务每 10 分钟自动跑一次。browser list 只看不动。',
+    input_schema: obj([], { 'dry-run': flag('只说会怎么做，不关') }),
+    argv: 'acceptkit browser sweep [--dry-run] --json',
+    returns: '{ idle_minutes, dry_run, browsers: [{ port, profile, action: keep|close|gone|adopt|foreign, why, result? }] }' },
+
   { name: 'shot',
     description: '过程截图：证明 app 在跑、停在哪页。截之前查遮蔽层（被挡住拒截并给出关法），截完查纯色画面、和上一张是否一样、节点 shows 的字。'
       + '做完一个操作节点就截并挂上 --step。过程截图不挂断言：断言的图由 observe 产出。',
@@ -81,6 +129,13 @@ export const COMMANDS = [
     }),
     argv: 'acceptkit observe {run} [--expect {expect}...] [--todo] [--from-file {from-file}] [--set {set}...] [--dry-run] [--try] [--record-channel-failure] --json',
     returns: '{results:[expect 卡片 | {expect, refused} | {expect, tried}]}' },
+
+  { name: 'refile',
+    description: '运行挂错了需求时改挂回去（例：用 --skip-plan-gate 开在了别的需求名下）。用例在原需求评审单里的不能挪；目标需求要认这条用例（出处是它或它的评审单里有）；'
+      + '必须写理由，改挂记录留在运行里，原需求台账上没解决的阻塞转到目标需求。',
+    input_schema: obj(['run', 'demand', 'why'], { run: RUN, demand: str('目标需求 id'), why: str('为什么挂错了，一句话') }),
+    argv: 'acceptkit refile {run} --demand {demand} --why {why} --json',
+    returns: '{ run, from, to, why, blockers: ["B旧→B新"] }' },
 
   { name: 'record',
     description: '手记一条断言的结论。只用于没有观测规格、observe 做不了的断言。pass/fail 要带证据；--quote 的原文必须能在证据里逐字找到，找不到就拒收。'

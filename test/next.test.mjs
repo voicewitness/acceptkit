@@ -28,7 +28,7 @@ const runId = dir => readdirSync(join(dir, 'runs'))[0];
 function fakeShot(dir, run) {
   mkdirSync(join(dir, 'runs', run, 'shots'), { recursive: true });
   writeFileSync(join(dir, 'runs', run, 'shots', 'app-01-home.png'), Buffer.alloc(512, 1));
-  writeFileSync(join(dir, 'runs', run, 'shots', 'app-01-home.json'), JSON.stringify({ kind: 'process_shot', platform: 'web', at: '2026-01-01T00:00:00Z' }));
+  writeFileSync(join(dir, 'runs', run, 'shots', 'app-01-home.json'), JSON.stringify({ kind: 'process_shot', platform: 'web', at: new Date().toISOString() }));
   ok(dir, 'record', run, '--step', 'n1', '--evidence', 'shots/app-01-home.png');
 }
 function applyVerdicts(dir, run, verdict) {
@@ -111,7 +111,7 @@ test('一个需求从评审单到报告，每一步的卡片种类和顺序（�
   assert.equal(cs[0].kind, 'evidence_gap');
   assert.match(cs[0].title, /E1/);
   writeFileSync(join(dir, 'runs', run, 'shots', 'E1-read.png'), Buffer.alloc(512, 2));
-  writeFileSync(join(dir, 'runs', run, 'shots', 'E1-read.png.json'), JSON.stringify({ kind: 'ui_observe', platform: 'web', at: '2026-01-01T00:00:01Z' }));
+  writeFileSync(join(dir, 'runs', run, 'shots', 'E1-read.png.json'), JSON.stringify({ kind: 'ui_observe', platform: 'web', at: new Date().toISOString() }));
   ok(dir, 'record', run, '--expect', 'E1', '--status', 'pass', '--evidence', 'evidence/page.txt', '--evidence', 'shots/E1-read.png', '--quote', '你好');
   cs = cards(dir);
   assert.deepEqual(cs.map(c => c.kind), ['review_due']);
@@ -392,6 +392,8 @@ test('看板最新一轮能完整生成：能信几成、等你（待批的用�
   assert.equal(r.status, 0, r.stderr);
   const html = readFileSync(out, 'utf8');
   assert.match(html, /条断言能信几成/);
+  // 链接直接带运行号（#run=r1）也要落到它那一轮，不能掉到第一个需求上
+  assert.match(html, /const RUN2K=\{"r1":"round:D1:[^"]+"/);
   assert.match(html, /同不同意把 1 条用例加进这次验收/);
   // 只有解锁条件、没写成问题的阻塞不摆给 owner，只说一声
   assert.match(html, /另有 1 个阻塞（卡住 1 条断言）执行者还在写成你能拍板的问题/);
@@ -409,4 +411,87 @@ test('看板最新一轮能完整生成：能信几成、等你（待批的用�
   ok(dir, 'blockers', 'D1', '--ack', 'B1', '--answer', '账号在知识库里', '--by', 'owner');
   const db = spawnSync(process.execPath, ['-e', `import('${join(dirname(BIN), '..', 'core', 'store', 'db.mjs')}').then(m => console.log(JSON.stringify(m.listApprovals(process.argv[1], 'D1').map(a => [a.kind, a.by, a.quote]))))`, dir], { encoding: 'utf8' });
   assert.deepEqual(JSON.parse(db.stdout.trim().split('\n').pop()).at(-1), ['blocker_answer', 'owner', '账号在知识库里']);
+});
+
+test('shot_missing 与看板红条同一口径：按当前结论出自哪个运行；被后来运行覆盖的不出；早几轮截的图不算本轮的', async () => {
+  const dir = project('android');
+  writeFileSync(join(dir, 'cases', 'c2.case.json'), JSON.stringify({ case: 'c2', title: '设置页', platform: 'android',
+    classifications: { carrier: ['page'] }, tree: [{ op: '打开设置', tags: { carrier: 'page' }, expect: [{ id: 'E1', assert: '设置页有开关' }, { id: 'E2', assert: '开关默认关' }] }] }));
+  ok(dir, 'plan', 'new', 'D1', '--title', '问候与设置', '--platform', 'android');
+  ok(dir, 'plan', 'add-case', 'D1', '--surface', 'S1', '--change', '首页加了问候语', '--reuse', 'c1', '--risk', '看不到问候', '--uncovered', '其他页');
+  ok(dir, 'plan', 'add-case', 'D1', '--surface', 'S2', '--change', '设置页加了开关', '--reuse', 'c2', '--risk', '开关不对', '--uncovered', '其他页');
+  ok(dir, 'plan', 'approve', 'D1', '--by', 'owner', '--quote', '可以');
+  mkdirSync(join(dir, 'state/rounds'), { recursive: true });
+  writeFileSync(join(dir, 'state/rounds/D1.json'), JSON.stringify({ demand: 'D1', repos: [], rounds: [
+    { id: 'R1', seq: 1, opened_at: '2025-12-01T00:00:00Z' }, { id: 'R2', seq: 2, opened_at: '2026-02-01T00:00:00Z' }] }));
+  // 写一个运行：results 的证据文件时刻决定结论归哪一轮、谁覆盖谁；shotAt 给了就放一张那个时刻的 app 截图
+  const mk = (run, cs, seq, results, at, shotAt) => {
+    const rd = join(dir, 'runs', run); mkdirSync(join(rd, 'evidence'), { recursive: true });
+    writeFileSync(join(rd, 'evidence', 'page.txt'), 'x'); utimesSync(join(rd, 'evidence', 'page.txt'), at, at);
+    if (shotAt) { mkdirSync(join(rd, 'shots'), { recursive: true }); writeFileSync(join(rd, 'shots', 'app-01-x.json'), JSON.stringify({ kind: 'process_shot', platform: 'android', at: shotAt })); }
+    writeFileSync(join(rd, 'result.json'), JSON.stringify({ run, case: cs, run_seq: seq, demand: { id: 'D1' }, platform: 'android', device: { udid: 'x' },
+      results: Object.fromEntries(Object.entries(results).map(([e, s]) => [e, { status: s, evidence: s === 'todo' ? [] : ['evidence/page.txt'] }])) }));
+  };
+  const t = s => new Date(s);
+  // c1：r1 没截图的 pass，后来 r2 带本轮截图重测覆盖了 → r1 不出卡
+  mk('r1', 'c1', 1, { E1: 'pass' }, t('2026-03-01'), null);
+  mk('r2', 'c1', 2, { E1: 'pass' }, t('2026-03-02'), '2026-03-02T00:00:00Z');
+  // c2：r3 的 E1、E2 记在 R2，图却是 R1 截的；最新的 r4 只重测了 E2 → E1 还出自 r3，出卡只列 E1
+  mk('r3', 'c2', 1, { E1: 'pass', E2: 'pass' }, t('2026-03-01'), '2025-12-15T00:00:00Z');
+  mk('r4', 'c2', 2, { E1: 'todo', E2: 'pass' }, t('2026-03-02'), '2026-03-02T00:00:00Z');
+  const sm = cards(dir).filter(c => c.kind === 'shot_missing');
+  assert.deepEqual(sm.map(c => c.run), ['r3'], JSON.stringify(sm));
+  assert.deepEqual(sm[0].expects, ['E1']);
+  assert.equal(sm[0].note, 'acceptkit run c2 --demand D1');
+  assert.doesNotMatch(JSON.stringify(sm[0]), /blockers --raise|标 blocked/);
+  // 看板红条数的是同一批运行
+  ok(dir, 'open', '--file', '--no-open');
+  const html = readFileSync(join(dir, 'dashboard.html'), 'utf8');
+  const line = html.match(/个 run 一张都没有：[^<]*(?:<code>[^<]*<\/code>[^<]*)*/)?.[0] || '';
+  assert.match(line, /<code>r3<\/code>/);
+  assert.doesNotMatch(line, /<code>r1<\/code>/);
+});
+
+test('挂错需求的运行：next 只出改挂卡；refile 有护栏（评审单里的不能挪、目标要认这条用例、要理由），阻塞跟着转过去', () => {
+  const dir = project('web');
+  writeFileSync(join(dir, 'cases', 'c9.case.json'), JSON.stringify({ case: 'c9', title: '别的需求的用例', platform: 'web', origin: { id: 'D2' },
+    classifications: { carrier: ['page'] }, tree: [{ op: '打开', tags: { carrier: 'page' }, expect: [{ id: 'E1', assert: '页面打开' }] }] }));
+  ok(dir, 'plan', 'new', 'D1', '--title', '首页问候', '--platform', 'web');
+  ok(dir, 'plan', 'add-case', 'D1', '--surface', 'S1', '--change', '首页加了问候语', '--reuse', 'c1', '--risk', '看不到问候', '--uncovered', '其他页');
+  ok(dir, 'plan', 'approve', 'D1', '--by', 'owner', '--quote', '可以');
+  ok(dir, 'plan', 'new', 'D2', '--title', '别的需求', '--platform', 'web');
+  ok(dir, 'plan', 'new', 'D3', '--title', '不相干的需求', '--platform', 'web');
+  ok(dir, 'run', 'c1', '--demand', 'D1');
+  const r1 = runId(dir);
+  // 当初绕过评审闸开在 D1 名下的 c9 运行，上面挂着一条阻塞
+  mkdirSync(join(dir, 'runs', 'r9'), { recursive: true });
+  writeFileSync(join(dir, 'runs', 'r9', 'result.json'), JSON.stringify({ run: 'r9', case: 'c9', run_seq: 1, session: '2026-01-01-D1', demand: { id: 'D1' }, platform: 'web',
+    results: { E1: { status: 'blocked', actual: '装置坏了', evidence: [] } } }));
+  mkdirSync(join(dir, 'state', 'blockers'), { recursive: true });
+  writeFileSync(join(dir, 'state', 'blockers', 'D1.jsonl'), JSON.stringify({ id: 'B1', run: 'r9', case: 'c9', expect: 'E1', kind: 'capability', text: '装置坏了', unlock: '修装置', reported: false }) + '\n');
+
+  let cs = cards(dir);
+  const mis = cs.filter(c => c.kind === 'run_misfiled');
+  assert.deepEqual(mis.map(c => c.run), ['r9']);
+  assert.match(mis[0].note, /refile r9 --demand D2/);
+  assert.ok(!cs.some(c => c.run === 'r9' && c.kind !== 'run_misfiled'), JSON.stringify(cs.map(c => [c.kind, c.run])));
+  assert.ok(!cs.some(c => JSON.stringify(c).includes('B1') && c.kind !== 'run_misfiled'));
+
+  // 护栏
+  assert.match(ak(dir, 'refile', 'r9', '--demand', 'D2').stderr, /--why/);
+  assert.match(ak(dir, 'refile', r1, '--demand', 'D2', '--why', 'x').stderr, /在 D1 的评审单里/);
+  assert.match(ak(dir, 'refile', 'r9', '--demand', 'D3', '--why', 'x').stderr, /D3 不认用例 c9/);
+  assert.notEqual(ak(dir, 'refile', 'r9', '--demand', 'D9', '--why', 'x').status, 0);
+
+  ok(dir, 'refile', 'r9', '--demand', 'D2', '--why', '当初用 --skip-plan-gate 开错了需求');
+  const r = JSON.parse(readFileSync(join(dir, 'runs', 'r9', 'result.json'), 'utf8'));
+  assert.equal(r.demand.id, 'D2');
+  assert.equal(r.session, '2026-01-01-D2');
+  assert.equal(r.refiled.at(-1).from, 'D1');
+  const d1 = readFileSync(join(dir, 'state', 'blockers', 'D1.jsonl'), 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
+  assert.equal(d1[0].resolved, true);
+  assert.match(d1[0].resolved_how, /改挂到 D2/);
+  const d2 = readFileSync(join(dir, 'state', 'blockers', 'D2.jsonl'), 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
+  assert.deepEqual(d2.map(b => [b.run, b.expect, !!b.resolved]), [['r9', 'E1', false]]);
+  assert.ok(!cards(dir).some(c => c.kind === 'run_misfiled'));
 });
