@@ -8,6 +8,7 @@
 // 这里只构造卡片，不读文件、不判断该不该出（那是 next.mjs 的事），所以每个函数都是纯的。
 
 import { blockerAskProblems } from './finding-quality.mjs';
+import { RESEARCH_STEPS } from './claims.mjs';
 
 const ak = s => `acceptkit ${s}`;
 const reply = (command, argv) => ({ command, argv: ak(argv) });
@@ -83,6 +84,18 @@ export function planApprovalCard(D, plan, delta = null, approvedN = 0, via = nul
     on_reply: reply('plan_approve', `plan approve ${D} --by <他> --quote "<原话>" --json`),
     // 他不同意、要改：plan return 记下他的意见，执行者照着改
     on_reject: reply('plan_return', `plan return ${D} --by <他> --quote "<他的意见>" --json`),
+    read: `plan/${D}` };
+}
+
+/** 批准后改了会影响结论 / 范围的用例内容：owner 认了才跑（plan-gate classifyCaseEdit） */
+export function caseEditCard(D, edits) {
+  const lines = edits.map(x => `${x.case}：${x.changes.filter(c => c.tier === 'ack').map(c => c.what).join('；')}`);
+  return { kind: 'attention', subject: 'case_edit', demand: D, cases: edits.map(x => x.case),
+    title: `${edits.length} 条用例批准后改了会影响结论的内容，等 owner 认（${edits.map(x => x.case).slice(0, 4).join('、')}）`,
+    detail: lines,
+    question: `需求 ${D} 有 ${edits.length} 条用例在批准后改了会影响结论或范围的地方：${clip(lines.join('；'), 400)}。这些改动你认不认？认的话回一句同意的话；不认的话执行者把它们改回去。`,
+    note: `先把每条改动为什么要改讲清楚（${ak(`plan show ${D}`)} 里有逐条清单），交给 owner。他认了先跑 on_reply 记原话；不认就把改动改回去。只加判据、换观测这类只加不删的改动不用等他，${ak(`plan recheck ${D} --why "…"`)} 直接记下`,
+    on_reply: reply('plan_recheck', `plan recheck ${D} --case ${edits.map(x => x.case).join(',')} --by <他> --quote "<原话>" --why "<为什么改>" --json`),
     read: `plan/${D}` };
 }
 
@@ -291,13 +304,14 @@ export function shotMissingCard(D, run, name, ids) {
 export function evidenceGapCard(run, ids, gaps, nonUi = {}) {
   const of = k => ids.filter(id => gaps[id].includes(k));
   const shot = of('no_ui_shot').filter(id => !nonUi[id]), reroute = of('no_ui_shot').filter(id => nonUi[id]);
-  const none = of('no_evidence'), file = of('not_tool_collected');
+  const none = of('no_evidence'), file = of('not_tool_collected'), wide = of('claims_uncovered');
   return { kind: 'evidence_gap', run, expect: ids[0], title: `运行 ${run} 有 ${ids.length} 条记了结论、证据不全（${ids.join(' ')}）：缺证据，重试补齐`,
     detail: [
       ...(shot.length ? [`${shot.join(' ')} 是界面上的断言，缺读到结论那一刻的 app 截图：先把画面清干净（登录页、弹窗、Loading 关掉），重跑 observe，它会进到能看到结论的页面、读到判据的同一刻截图`] : []),
       ...reroute.map(id => `${id} 是界面上的断言，可它的读法 ${nonUi[id].op} 走的是 ${nonUi[id].exec} 通道，不截图 —— 重跑也补不上。给它登记一个在 app 页面上读值的配方（ops set，写清进哪一页、读画面上哪几个字；app 自带的调试页也算），把用例的 observe.op 换过去再 observe`),
       ...(file.length ? [`${file.join(' ')} 声明了命令行验证，证据却是你交来的文件：把采集命令（日志命令、调试器脚本）登记成操作库配方（ops set … --platform P --how …），由 observe 亲自去跑`] : []),
       ...(none.length ? [`${none.join(' ')} 一份证据都没有：重跑 observe`] : []),
+      ...(wide.length ? [`${wide.join(' ')} 的断言说了弹窗 / 拦截 / 上报这类效果，观测只读到了更浅的一层（例：判定里的动作名），也没经盲审逐条核过：三选一 —— 收窄断言，只说观测读到的那一层（改了断言原文，要 owner 认）；或补一条读那一层的观测（ops set <op> --observes ui|network|report …，只加观测是事后通知）；这个词在断言里讲的是某个部件（「上报环里的记录」）不是效果，在断言上写 claims_off: [{ word, why }]（要 owner 认）。项目里还没有读这一层的操作时，别卡着等人：${RESEARCH_STEPS.map((x, i) => `${'①②③④'[i]} ${x}`).join(' ')}。只是补盲审：${ak('reviewq --pack')}，审核人逐条写出每条主张在证据哪里`] : []),
       `不知道去哪看、找不到能看到结论的入口：${ak(`consult ${run} --expect ${ids[0]}`)} 按判据面给出常见取证入口和要问清的业务问题，先照着查，查不到再拿它的问题草稿问人`,
       '缺证据不是验不了：不要改记 blocked。截图 / 采集本身失败是取证手段的问题，记 apparatus 再重试；同一条连续 3 次还补不上，才 blockers --raise 问用户',
       ...(shot.length || reroute.length ? ['界面上确实看不到（找过 app 自带的调试页也没有）：改用例，给它写 via 和 why_not_ui，下一版评审单会让用户过目'] : [])],

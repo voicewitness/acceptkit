@@ -494,7 +494,8 @@ async function configCmd({ pos, opt }) {
 // 操作库的读写（core/ops.mjs）。新发现的平台做法从这里写回去，写入时校验；手改的文件用 ops check 查。
 const OPS_USAGE = `用法：
   acceptkit ops [<id>]                          列表 / 看某条
-  acceptkit ops set <id> --platform P [--title … --why … --kind observe|act]
+  acceptkit ops set <id> --platform P [--title … --why … --kind observe|act] [--observes <层>[,<层>]]
+        --observes   观测读的是哪一层：decision / diag / ui / network / report / crash / state / log / source / perf
         [--host H]   只在宿主 H 上成立的做法（不带 = 该平台所有宿主通用）
         [--how … --entry … --evidence … --exec … --switches … --steps … --caveats … --pitfalls …]
         [--json '<配方 JSON>'] [--replace] [--guess | --verified "<实测记录>"] [--source …]
@@ -545,8 +546,7 @@ async function opsCmd({ pos, opt }) {
       return O.recipeKey(pf, opt.host ? String(opt.host) : null);
     };
     if (sub === 'set') {
-      const platform = keyOf();
-      const META = new Set(['platform', 'host', 'title', 'why', 'kind', 'json', 'replace', 'guess', 'absent', 'unlock', 'project']);
+      const META = new Set(['platform', 'host', 'title', 'why', 'kind', 'observes', 'json', 'replace', 'guess', 'absent', 'unlock', 'project']);
       const recipe = opt.json ? JSON.parse(String(opt.json)) : {};
       for (const [k0, v] of Object.entries(opt)) {
         if (META.has(k0)) continue;
@@ -554,14 +554,25 @@ async function opsCmd({ pos, opt }) {
         if (!O.RECIPE_KEYS[k] || k === 'state') die(`不认识的参数 --${k0}\n${OPS_USAGE}`);
         recipe[k] = ['switches', 'steps', 'caveats', 'pitfalls'].includes(k) ? [].concat(v).map(String) : /_ms$/.test(k) ? Number(v) : String(v);
       }
+      const observes = opt.observes ? String(opt.observes).split(',').map(s => s.trim()).filter(Boolean) : null;
+      // 只改操作本身（--observes / --title / --why / --kind）：配方一个字也不碰，也不校验配方里的存量字段。
+      // 以前这里也会把配方的 state 改成「已确认」、source 改成「用户设置」：批量登记 observes 时，推测的配方被抬成了已确认、出处全被抹掉
+      const opOnly = !opt.absent && !opt.guess && !opt.replace && !Object.keys(recipe).length;
+      const platform = opOnly ? null : keyOf();
+      const cur = platform ? O.loadOps(P.root)[id]?.platforms?.[platform] : null;
       if (opt.absent) {
         if (Object.keys(recipe).length) die('--absent 表示这个平台还做不了，不能同时写做法');
-      } else {
-        recipe.state = opt.guess ? 'guess' : recipe.verified ? 'verified' : 'confirmed';
-        recipe.source ||= '用户设置';
+      } else if (!opOnly) {
+        // 状态：显式 --guess / --verified 按它；改了做法（怎么做 / 执行器 / 读什么）又没说，记「已确认」—— 做法变了，旧的「已验证」不再成立；
+        // 只补说明（注意事项、坑、证据、出处……）不动状态。新配方记「已确认」
+        const changesHow = ['how', 'exec', 'steps', 'read', 'entry', 'eval', 'url', 'tab', 'port', 'gate', 'switches'].some(k => k in recipe);
+        recipe.state = opt.guess ? 'guess' : recipe.verified ? 'verified' : (!cur || cur.absent || changesHow || opt.replace) ? 'confirmed' : (cur.state || 'confirmed');
+        // 出处是这份配方从哪来的：只在原来没有、这次也没给 --source 时补默认
+        if (!recipe.source && (!cur || cur.absent || !cur.source || opt.replace)) recipe.source = '用户设置';
       }
-      const r = O.writeOp(P.root, id, { title: opt.title && String(opt.title), why: opt.why && String(opt.why), kind: opt.kind && String(opt.kind), platform, recipe, replace: !!opt.replace,
+      const r = O.writeOp(P.root, id, { title: opt.title && String(opt.title), why: opt.why && String(opt.why), kind: opt.kind && String(opt.kind), observes, platform, recipe, replace: !!opt.replace,
         absent: opt.absent ? { blocker: String(opt.absent), unlock: opt.unlock ? String(opt.unlock) : '' } : null, hosts: hostIds });
+      if (opOnly) { console.log(`✓ 更新 ${id}（只改了操作本身${observes ? `：读的是 ${observes.join(' / ')}` : ''}；配方没动）`); return; }
       const st = r.op.platforms[platform];
       console.log(`✓ ${r.created ? '新增' : '更新'} ${id} [${platform}] ${st.absent ? '缺实现' : O.STATE_LABEL[st.state]}${st.state === 'guess' ? `（确认后才用：acceptkit ops confirm ${id} --platform ${opt.platform}${opt.host ? ` --host ${opt.host}` : ''}）` : ''}`);
       const rest = O.opProblems(id, r.op, hostIds).filter(x => x.platform !== platform);
@@ -647,12 +658,27 @@ async function login({ pos, opt }) {
   const { resolveHost, hostApp } = await import('../core/hosts.mjs');
   const h = resolveHost(P.config, { host: opt.host ? String(opt.host) : null, platform: 'web' });
   const port = String(opt.port || (h.error ? '' : hostApp(P.config, h.id, 'web').port) || 9350);
-  const profile = join(P.root, '.acceptkit', `browser-${port}`);
-  const r = sh(process.execPath, [join(REPO_ROOT, 'adapters', 'web', 'cli.mjs'), 'open', '--port', port, '--profile', profile, '--url', url], { timeout: 60_000 });
-  const out = (r.stdout || '').trim().split('\n').pop();
-  let j; try { j = JSON.parse(out); } catch { die(`浏览器没起来：${r.stderr || out}`); }
-  if (!j.ok) die(j.error);
-  console.log(`✓ 独立浏览器实例（端口 ${port}，用户目录 ${profile}）已打开 ${url}\n  需要登录的话在这个窗口里登录一次；登录态留在这个独立用户目录里，不影响你日常用的浏览器。`);
+  // 用户目录：项目里的常驻目录；用户偏好 browsers.profile_dir 写了就用它（cdp.mjs stableProfile）
+  const pref = readUserConfig().prefs?.browsers?.profile_dir || null;
+  const { stableProfile } = await import('../adapters/web/cdp.mjs');
+  const profile = stableProfile(port, join(P.root, '.acceptkit', `browser-${port}`), pref);
+  const cli = join(REPO_ROOT, 'adapters', 'web', 'cli.mjs');
+  const call = args => { const r = sh(process.execPath, [cli, ...args], { timeout: 60_000 }); const out = (r.stdout || '').trim().split('\n').pop();
+    let j; try { j = JSON.parse(out); } catch { die(`浏览器没起来：${r.stderr || out}`); } if (!j.ok) die(j.error); return j; };
+  // --run R：在这个验收运行自己的标签页里打开（observe / shot 只连这个标签页，见 engine runTab）
+  if (opt.run) {
+    const run = String(opt.run), rp = join(P.root, 'runs', run, 'result.json');
+    if (!existsSync(rp)) die(`没有运行 ${run}`);
+    call(['open', '--port', port, '--profile', profile, ...(pref ? ['--pref', pref] : [])]);
+    const res = JSON.parse(readFileSync(rp, 'utf8'));
+    const cur = res.browser && String(res.browser.port) === port ? res.browser.target : null;
+    const t = call(['tab', '--port', port, ...(cur ? ['--target', cur] : []), '--url', url]);
+    if (t.target !== cur) { res.browser = { port: Number(port), target: t.target, opened_at: new Date().toISOString() }; writeFileSync(rp, JSON.stringify(res, null, 2) + '\n'); }
+    console.log(`✓ 运行 ${run} 的标签页（${t.target.slice(0, 8)}…，端口 ${port}）已打开 ${url}${t.fresh ? '（新开的）' : ''}\n  这个运行的 observe / shot 只在这个标签页上做；别的运行的标签页不会被截进来。`);
+    return;
+  }
+  call(['open', '--port', port, '--profile', profile, '--url', url, ...(pref ? ['--pref', pref] : [])]);
+  console.log(`✓ 独立浏览器实例（端口 ${port}，用户目录 ${profile}）已打开 ${url}\n  需要登录的话在这个窗口里登录一次；登录态留在这个独立用户目录里，不影响你日常用的浏览器。\n  验收时用 acceptkit browser --run <运行> <网址> 在运行自己的标签页里打开。`);
 }
 // 空闲浏览器回收：acceptkit 起的调试 Chrome 超过阈值（缺省 60 分钟，prefs browsers.idle_minutes）没用就关。
 // 关的是窗口，独立用户目录（登录态）留着，下次 login / 驱动复用。用户自己的 Chrome、别的工具起的不动（adapters/web/cdp.mjs sweepBrowsers）
@@ -826,6 +852,7 @@ const HELP = `acceptkit ${VERSION} — 本机验收 Agent 工具箱（不调用�
   project list · project forget <dir>  管理页面上列哪些项目
   doctor [--fix] [--backfill-review-fp]  体检；--fix 做迁移（旧租约导入、权限收紧）
   login web <网址> [--port P]          在独立浏览器实例里登录一次
+  browser --run <运行> <网址>           在这个验收运行自己的标签页里打开页面（observe / shot 只连它）
   browser <网址> [--port P]            打开项目的独立调试浏览器实例（不需要登录的页面用这个）
 知识
   know add "<内容 #标签>" [--file f] [--heading h] [--source s]
@@ -919,6 +946,7 @@ const own = {
       'devices.new_device': '新增设备时你自己那边还要做的事（一句话，原话）。acceptkit 要新建设备时会把它带进问你的问题里',
       'devices.idle_minutes': '设备空闲多少分钟算没人用、被回收关机（缺省 60）',
       'browsers.idle_minutes': 'acceptkit 起的调试浏览器空闲多少分钟就关掉（缺省 60；只关窗口，登录态留着）',
+      'browsers.profile_dir': '调试浏览器的用户目录放哪（登录态在里面）：模板，{port} 换成端口，例 ~/.local/share/my-chrome-{port}。不设就放项目的 .acceptkit/browser-<端口>；不能放 /tmp（重启就清空）',
       'devices.reinstall': '装包时什么情况要先卸载、什么情况覆盖安装就行（你的判断，原话）。过装包 / 卸载的闸时 acceptkit 会把它带出来' };
     const [sub = 'show', key, value] = pos;
     const u = readUserConfig();

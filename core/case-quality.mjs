@@ -8,7 +8,9 @@
 //
 // 机器判断不了的写成 QUESTIONS：新建用例和评审时列出来，由作者 / 评审人逐条回答。
 // 项目特有的规则（某个已淘汰的观测面、某类用例必须带的守卫）由 pack.qualityRules 追加，格式同 RULES。
-import { guardsOf, nonUiRead } from './evidence-gate.mjs';
+import { guardsOf, nonUiRead, bindingOf } from './evidence-gate.mjs';
+import { claimWordsOf, effectClaims, uncoveredClaims, opLayers, fmtMissing, LAYERS, observePointsOf, projectHasLayer, RESEARCH_STEPS } from './claims.mjs';
+import { recipeFor } from './ops.mjs';
 import { normalizePlatforms } from './platform.mjs';
 import { loadQualityBaseline } from './store/db.mjs';
 import { hostOfCase } from './hosts.mjs';
@@ -19,6 +21,15 @@ const isNegCheck = ch => {
   const [k, x] = Object.entries(ch.predicate || {})[0] || [];
   return NEG_PRED.has(k) || (k === 'eq' && String(x) === '0' && /(count|num|total|len|size|hits?|次数|条数|个数)/i.test(String(ch.pick || '')));
 };
+// 判「有」的谓词：只要有值 / 大于 0。开关两档下都可能成立，分不出对照（区分力）
+const isPresenceCheck = ch => {
+  const [k, x] = Object.entries(ch.predicate || {})[0] || [];
+  return k === 'nonempty' || (['gt', 'count_gt'].includes(k) && Number(x) === 0) || (k === 'gte' && Number(x) <= 1)
+    || (k === 'eq' && String(x) === '0');   // 「等于 0」不管读的叫什么，都只是在判有没有
+};
+// 读法里的 {param.x}：这个读数绑在哪个实体上（某个 unit、某个 trigger）
+const paramsOf = pattern => new Set([...String(pattern || '').matchAll(/\{param\.(\w+)\}/g)].map(m => m[1]));
+const readPattern = (recipe, pick) => (recipe?.read || []).find(r => pick === `read.${r.key}` || pick === r.key)?.pattern;
 const PLACEHOLDER = /TODO|^预期[a-z]($|（)|^操作[A-Z]（/;
 const VAGUE_ONLY = /^(正常|无异常|没有异常|符合预期|成功|生效|正确|可以|OK|ok|通过)[。.！!]?$/;
 const SUBMIT_OK = /(提示|toast|Toast|弹出)?.{0,6}(保存|提交|发布|创建|更新)(成功|完成)|返回成功|接口成功|code\s*[=:]\s*0/;
@@ -33,8 +44,8 @@ const FRESH_INSTALL = /(全新安装|全新装包|首次安装|卸载重装|fres
 const EXEC_STATE_KEYS = ['status', 'result', 'blocked_on', 'root_cause', 'evidence'];
 const EXEC_STATE_TEXT = /(待测|待真机核对|当前必红|已验证通过|本轮通过|暂时跳过)/;
 const NODE_KEYS = new Set(['op', 'tags', 'expect', 'children', 'conclusion', 'given', 'op_id', 'data', 'id', 'note', 'notes', 'applies', 'danger', 'shows', 'quality_waive']);
-const EXPECT_KEYS = new Set(['id', 'assert', 'machine', 'observe', 'applies', 'expect_data', 'desc', 'revisions', 'revision', 'assert_orig', 'assert_changelog',
-  'note', 'notes', 'scope_note', 'requires_uninstall', 'uninstall_why', 'tags', 'origin', 'source', 'judge', 'human_why', 'quality_waive', 'via', 'why_not_ui', 'seen_at']);
+const EXPECT_KEYS = new Set(['id', 'assert', 'machine', 'observe', 'applies', 'platform', 'platforms', 'expect_data', 'desc', 'revisions', 'revision', 'assert_orig', 'assert_changelog',
+  'note', 'notes', 'scope_note', 'requires_uninstall', 'uninstall_why', 'tags', 'origin', 'source', 'judge', 'human_why', 'quality_waive', 'via', 'why_not_ui', 'why_not_ui_checked', 'seen_at', 'claims_off', 'why_presence_only']);
 const clauses = s => String(s).split(/[；;]|，且|并且|同时|以及/).map(x => x.trim()).filter(x => x.length >= 4);
 const norm = s => String(s).replace(/\s+/g, '').replace(/[0-9]+/g, '#');
 // 行话：读的人得先弄懂一个概念才看得懂句子的词。用例正文（标题、为什么、操作、断言）是要念给人听的，
@@ -42,6 +53,8 @@ const norm = s => String(s).replace(/\s+/g, '').replace(/[0-9]+/g, '#');
 // 内核自己的规则文字也过这份清单（test/case-quality-wording.test.mjs）：检查者说行话，这道闸永远不会把自己标红。
 export const JARGON = [
   { match: '[两多反双单正]臂|臂\\s?[A-Za-z0-9一二]|(?<![手])臂(?=[：:，,、）)])', say: '直接写这一支的条件（例：「featureX = true 时」）；要指对照就写「对照组」「改动前 / 改动后」' },
+  // 「有牙 / 没牙」：owner 多次反馈听不懂（2026-11-18 起禁用）
+  { match: '[有没无长带证]牙|牙齿', say: '直接说「功能坏了这条会不会失败」：会失败就写「能抓出问题」，不会就写「功能坏了也照样通过」' },
 ];
 /** 文本里命中的行话 → [{ term, say }] */
 export function jargonHits(text, list = JARGON) {
@@ -78,6 +91,114 @@ export const RULES = [
       const x = nonUiRead(e, p, ops, hostOfCase(c, p));
       return x ? [{ at: e.id, msg: `${p} 上用 ${x.op} 读（exec=${x.exec}），不是界面通道，截不到读到值那一刻的图` }] : [];
     })) },
+
+  { id: 'Q22', level: 'block', since: '2026-11-18', title: '断言里说的效果要在那一层看到',
+    why: '断言写「拦截 + 弹窗」，观测只读了判定记录里的动作名，工具机判通过、盲审也放行 —— 弹窗弹没弹、请求拦没拦、上报发没发，从头到尾没人看过。判定里有这个动作名 ≠ 执行了 ≠ 用户看到了 ≠ 上报发出去了',
+    fix: '三选一：收窄说法，只说观测真正读到的那一层（例：「判定产出 fuse、alert 两个动作」）；或者补一条读那一层的观测（弹窗读被测 app 的画面、拦截读网络出口、上报读发出的载荷）；'
+      + '或者这个词在这条断言里本来就不是效果（讲的是某个部件里的记录），在断言上写 claims_off: [{ word, why }] 说清楚。观测用的操作要登记它读的是哪一层：acceptkit ops set <op> --observes <层>。'
+      + '项目里还没有这一层的观测口时，用例自己补：' + RESEARCH_STEPS.map((x, i) => `${'①②③④'[i]} ${x}`).join(' '),
+    check: ({ c, ops, cfg = {} }) => {
+      if (!ops) return [];
+      const words = claimWordsOf({ quality: cfg }), points = observePointsOf({ quality: cfg }), out = [];
+      for (const { e } of expects(c)) {
+        // claims_off 要说清为什么、要点得出是哪个词：不然它就成了一句「别查我」
+        for (const x of [].concat(e.claims_off || [])) {
+          const w = typeof x === 'string' ? x : x?.word;
+          if (!w || typeof x === 'string' || !String(x.why || '').trim()) out.push({ at: e.id, msg: `claims_off 的「${w || '?'}」没写 why（这个词在这条断言里为什么不是效果）` });
+          else if (!effectClaims(e.assert, words.filter(x2 => x2.word === w)).length) out.push({ at: e.id, msg: `claims_off 的「${w}」在断言原文里没被认成效果，这一项多余，删掉` });
+        }
+        if (e.judge === 'human' || !e.observe) continue;
+        const msgs = new Set();
+        for (const p of normalizePlatforms(c)) {
+          const host = hostOfCase(c, p);
+          const u = uncoveredClaims(e, { ops, platform: p, host, words });
+          if (!u.op || !u.missing.length) continue;   // 这一端没写读法（双端用例只译了一端）：交给别的检查
+          // 项目在这一端根本没有读这一层的操作：不是这条用例写错了，是项目还不知道这个效果该去哪看 —— 先补观测口
+          // 观测用的操作自己没登记层时先报它：登了也许就盖住了
+          const none = !u.layers ? [] : u.missing.flatMap(m => m.covers.some(l => projectHasLayer(ops, l, p, host)) ? [] : [m]);
+          if (none.length) msgs.add(`${p} 上项目里还没有任何操作读${none.map(m => `「${m.word}」`).join('')}那一层（${none.map(m => fmtMissing(m, points)).join('；')}）—— 先回被测系统里查清楚它的出口，沉淀成操作（见 fix 的 ①–④）`);
+          const rest = u.missing.filter(m => !none.includes(m));
+          if (rest.length) msgs.add(!u.layers ? `说了${rest.map(m => `「${m.word}」`).join('')}，观测用的 ${u.op} 没登记读的是哪一层（ops set ${u.op} --observes …）`
+            : `${p} 上用 ${u.op} 读的是${u.layers.map(l => LAYERS[l] || l).join('、')}；${rest.map(m => fmtMissing(m, points)).join('；')}`);
+        }
+        for (const msg of msgs) out.push({ at: e.id, msg });
+      }
+      // 用例级主张：证明它的那几条断言读到的层，要盖得住主张里说的效果
+      const byId = new Map(expects(c).map(({ e }) => [e.id, e]));
+      (c.claims || []).forEach((cl, i) => {
+        const fx = effectClaims(cl.text, words); if (!fx.length) return;
+        const seen = new Set();
+        for (const id of cl.proved_by || []) { const e = byId.get(id); if (!e?.observe) continue;
+          for (const p of normalizePlatforms(c)) { const b = bindingOf(e.observe, p); (b?.op ? opLayers(ops, b.op, p, hostOfCase(c, p)) || [] : []).forEach(l => seen.add(l)); } }
+        const miss = fx.filter(f => !f.covers.some(l => seen.has(l)));
+        if (miss.length) out.push({ at: `主张 ${i + 1}`, msg: `「${String(cl.text).slice(0, 30)}」：${miss.map(m => fmtMissing(m, points)).join('；')}，proved_by 里没有读这一层的断言` });
+      });
+      return out;
+    } },
+
+  { id: 'Q23', level: 'block', since: '2026-11-18', title: '判「没有」要先证明被判的那个对象在',
+    why: '读某个 unit 的动作、判「没有动作」：这个 unit 根本没执行时，读数同样是空，判定照样通过。整页非空（「这次决策评估了 10 项」）证明不了被判的那一项在里面',
+    fix: '加一条前提（guard），读同一个对象、判它在（例：评估清单里有这个 unit），再判它「没有」',
+    check: ({ c, ops }) => {
+      if (!ops) return [];
+      const out = [];
+      for (const { e } of expects(c)) {
+        if (!e.observe) continue;
+        const msgs = new Set();
+        for (const p of normalizePlatforms(c)) {
+          const b = bindingOf(e.observe, p); if (!b?.op) continue;
+          const recipe = recipeFor(ops[b.op], p, hostOfCase(c, p))?.recipe; if (!recipe?.read) continue;
+          const anchors = [...guardsOf(b), ...(b.checks || []).filter(ch => !isNegCheck(ch))].filter(x => !isNegCheck(x));
+          for (const ch of (b.checks || []).filter(isNegCheck)) {
+            const need = paramsOf(readPattern(recipe, ch.pick)); if (!need.size) continue;
+            const bound = anchors.some(a => { const have = paramsOf(readPattern(recipe, a.pick)); return [...need].every(x => have.has(x)); });
+            if (!bound) msgs.add(`${ch.pick} 判「没有」，读的是 ${[...need].map(x => `{param.${x}}`).join(' ')} 那一个对象；没有一条前提或判据先证明这个对象在`);
+          }
+        }
+        for (const msg of msgs) out.push({ at: e.id, msg });
+      }
+      return out;
+    } },
+
+  { id: 'Q24', level: 'warn', since: '2026-11-18', title: '开关类用例的判据要分得出对照',
+    why: '判据只是「有值 / 大于 0 / 等于 0」时，开关开和关两种情况下可能都成立：开关关了这条也照样通过，测不出开关',
+    fix: 'observe 写 flips_in：在哪个对照节点下这条判据会不成立（再在那个节点上放一条反向断言，或附一次反向运行）；或者换成只在这一档才有的读数',
+    check: ({ c }) => {
+      let lever = false; walkNodes(c.tree, ({ n }) => { if (n.tags?.lever) lever = true; });
+      if (!lever || c.kind === 'probe') return [];
+      // 各端一份读法（observe.by）的逐端看；flips_in 写在 observe 上或那一端的读法上都算
+      const presenceOnly = o => { const cs = o?.checks || []; return cs.length && !o.flips_in && cs.every(ch => isPresenceCheck(ch) || isNegCheck(ch)); };
+      return expects(c).filter(({ e }) => e.observe && !e.observe.flips_in && (e.observe.by ? Object.values(e.observe.by).some(presenceOnly) : presenceOnly(e.observe)))
+        .map(({ e }) => ({ at: e.id, msg: '判据只看「有没有 / 是不是 0」，没写 flips_in（在哪个对照节点下它会不成立）' }));
+    } },
+
+  { id: 'Q26', level: 'block', since: '2026-11-19', title: '说了上报 / 拦截 / 生效的用例，至少要有一条判内容',
+    why: '同样的输入就该得到同样的输出：只判「有上报」，上报里三个字段全是空值也照样通过（实测：一条统计上报的三个版本字段全是占位值，判据只看了有没有，靠盲审碰巧才发现）',
+    fix: '挑一条最关键的，判据写到字段和取值（例：read.payload.store_region 匹配 ^[A-Z]{2}$）；不知道该带哪些字段，用例自己补：' + RESEARCH_STEPS.slice(0, 3).map((x, i) => `${'①②③'[i]} ${x}`).join(' ')
+      + '。业务上确实只测有没有的，在断言上写 why_presence_only 说明',
+    check: ({ c, ops, cfg = {} }) => {
+      if (c.kind === 'probe' || c.kind === 'smoke') return [];
+      const words = claimWordsOf({ quality: cfg }), content = ['report', 'network', 'state'];
+      const hit = expects(c).filter(({ e }) => e.observe && e.judge !== 'human'
+        && effectClaims(e.assert, words, e.claims_off).some(m => m.covers.some(l => content.includes(l))));
+      if (!hit.length || hit.some(({ e }) => e.why_presence_only)) return [];
+      const presenceOnly = o => (o?.checks || []).every(ch => isPresenceCheck(ch) || isNegCheck(ch));
+      const all = hit.every(({ e }) => e.observe.by ? Object.values(e.observe.by).every(presenceOnly) : presenceOnly(e.observe));
+      return all ? [{ at: hit.map(({ e }) => e.id).join('、'), msg: '这几条说了上报 / 拦截 / 生效，判据全都只看「有没有」，一条判内容（字段、取值）的都没有' }] : [];
+    } },
+
+  { id: 'Q27', level: 'warn', since: '2026-11-19', title: '说了上报 / 拦截 / 生效，最好判到内容',
+    why: '「有上报」通过了，上报里带的是不是对的值还不知道；用例里别的断言判了内容，这一条只判有没有，就在这一条上漏',
+    fix: '判据加到字段和取值；确实只测有没有的写 why_presence_only',
+    check: ({ c, cfg = {} }) => {
+      if (c.kind === 'probe' || c.kind === 'smoke') return [];
+      const words = claimWordsOf({ quality: cfg }), content = ['report', 'network', 'state'];
+      const presenceOnly = o => (o?.checks || []).every(ch => isPresenceCheck(ch) || isNegCheck(ch));
+      return expects(c).filter(({ e }) => e.observe && e.judge !== 'human' && !e.why_presence_only
+        && effectClaims(e.assert, words, e.claims_off).some(m => m.covers.some(l => content.includes(l)))
+        && (e.observe.by ? Object.values(e.observe.by).some(presenceOnly) : presenceOnly(e.observe)))
+        .map(({ e }) => ({ at: e.id, msg: '只判了有没有，没判带的内容' }));
+    } },
 
   { id: 'Q01', level: 'block', title: '断言要有判定方式',
     why: '没有机器判据的断言大多落成「待测」或「阻塞」，跑不出结论；判据只在执行时临场想，同一条断言两次执行判法不同',

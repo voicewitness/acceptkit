@@ -18,6 +18,7 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { BLANK_HINT } from './shot-check.mjs';
 import { recipeFor } from './ops.mjs';
+import { claimList, uncoveredClaims, DEFAULT_CLAIM_WORDS } from './claims.mjs';
 
 export const isImage = x => /\.(png|jpe?g)$/i.test(x);
 export const isLocalEv = x => /^(shots|evidence)\//.test(x);
@@ -166,7 +167,8 @@ export function applyReview(r, key, verdict, note, by, opts = {}) {
   if (!VERDICTS[verdict]) throw new Error(`--verdict 取值：${Object.keys(VERDICTS).join('|')}`);
   const [scope] = key.split('::');
   r.reviews ??= {};
-  r.reviews[key] = { state: verdict, note: note || '', by: by || 'unknown', at: new Date().toISOString(), fp: opts.fp || null };
+  r.reviews[key] = { state: verdict, note: note || '', by: by || 'unknown', at: new Date().toISOString(), fp: opts.fp || null,
+    ...(opts.claims ? { claims: opts.claims, claims_checked: true } : {}) };
   // 盲审判「这是装置坏了 / 这个读数看不出来源」时，结论本身就是一条装置故障记录 ——
   // 顺手进台账，report 的「本轮装置故障」才数得出真实次数（靠执行者自己回头补登记是不会发生的）。
   if (verdict === 'apparatus_failure' || verdict === 'fabricated')
@@ -188,7 +190,12 @@ export function applyReview(r, key, verdict, note, by, opts = {}) {
 /** 盲审包里证据原文的上限。超了就明说必须判 insufficient（见 reviewPacket 内注释）。 */
 export const PACKET_MAX = 60000;
 
-export function reviewPacket({ key, c, r, dir, expectOf, nodeOf }) {
+/** 盲审要逐条核的主张：两条以上才要求逐条回答（一句话一件事的断言照旧整体判） */
+export function reviewClaims(e, words = DEFAULT_CLAIM_WORDS) {
+  const list = e?.assert ? claimList(e.assert, words, e.claims_off) : [];
+  return list.length >= 2 ? list.map((text, i) => ({ id: `C${i + 1}`, text })) : [];
+}
+export function reviewPacket({ key, c, r, dir, expectOf, nodeOf, words = DEFAULT_CLAIM_WORDS }) {
   const [scope, ev] = key.split('::');
   const isStep = scope.startsWith('step:');
   const e = isStep ? null : expectOf(scope);
@@ -227,6 +234,13 @@ export function reviewPacket({ key, c, r, dir, expectOf, nodeOf }) {
     `证据：${ev}${f ? `\n绝对路径：${f}` : ''}${isImage(ev) ? '\n（这是图片：必须打开看，不许凭文件名判断）' : ''}`,
     f && isImage(ev) ? sidecarLines(dir, ev).join('\n') : '',
     body ? `── 证据原文 ──\n${body}\n── 原文完 ──` : '',
+    ...(() => { const cl = isStep ? [] : reviewClaims(e, words); return cl.length ? [
+      `── 主张清单（逐条核，判 ok 前每条都要在证据里找到）──`, ...cl.map(x => `  ${x.id}  ${x.text}`),
+      // 作者声明不当效果的词：给审的人看见，原文读下来确实是效果的，照样按效果核（声明不能替断言收窄）
+      ...[].concat(e?.claims_off || []).filter(x => x?.word).map(x => `  （作者声明「${x.word}」在这条里不是效果：${x.why}。原文读下来它就是效果的，照样当一条主张核）`),
+      `  判 ok 时回写必须带 claims：[{"id":"C1","where":"证据第几行 / 截图哪一处"}, …]，每条都要有；`,
+      `  有一条在证据里找不到（例：只看到判定里有 alert 这个动作名，没看到弹窗）⇒ 不能判 ok，判 insufficient，note 写是哪一条`,
+    ] : []; })(),
     `请只凭上面的证据回答，给出一个 verdict：`,
     ...Object.entries(VERDICTS).map(([k, d]) => `  ${k.padEnd(18)} ${d}`),
     `并逐条核对：`,
@@ -342,6 +356,22 @@ export function imageKind(dir, rel) {
 // 只有用例里明确写了 via（log / diag / debugger / cli）和 why_not_ui（为什么界面上看不到）的断言，才用命令行手段验，
 // 而且证据要由 observe 亲自采（跑登记在操作库里的配方）—— 执行者自己交来的文件只能参考：它证明不了是当场读出来的。
 export const VIA_LABEL = { ui: '界面验证', log: '日志验证', diag: '诊断命令验证', debugger: '调试器验证', cli: '命令行验证' };
+// 用例里每个节点都是 carrier=static（读源码、读构建产物，没有 app 画面可拍）：有效截图规则不管它。
+// 判据面本来就没有界面，为过闸去截一张无关的 app 画面，等于造证据（owner 定过：缺图不是缺口）。record / observe / next / 看板共用这一份
+export function staticOnlyCase(c) {
+  const cs = new Set((c?.classifications?.carrier || []).map(String));
+  const go = ns => (ns || []).forEach(n => { if (n.tags?.carrier) cs.add(String(n.tags.carrier)); go(n.children); });
+  go(c?.tree);
+  return cs.size > 0 && [...cs].every(x => x === 'static');
+}
+// 某个运行的用例是不是纯静态（按运行结果里记的用例名去项目里读）
+const staticMemo = new Map();
+export function staticOnlyRun(root, res) {
+  const name = res?.case_ref || res?.case; if (!name) return false;
+  const k = `${root}::${name}`;
+  if (!staticMemo.has(k)) { let c = null; for (const f of [join(root, String(name)), join(root, 'cases', `${name}.case.json`)]) { try { c = JSON.parse(readFileSync(f, 'utf8')); break; } catch { /* 引用可能是路径也可能是名字；用例删了就按不是静态 */ } } staticMemo.set(k, staticOnlyCase(c)); }
+  return staticMemo.get(k);
+}
 export const viaOf = e => (e?.via && VIA_LABEL[e.via] ? e.via : 'ui');
 // 界面上的断言要用界面通道读：只有 exec=ui / web 的配方会在读到值那一刻截图（ui_observe）。
 // 用诊断 / 日志配方读，observe 重跑多少次都补不上那张图 —— 执行者会在 evidence_gap 上空转。用例检查（Q21）和缺口卡片共用这一个判断。
@@ -365,7 +395,7 @@ const execOfObserved = (o, ops) => o?.exec || Object.values(ops?.[o?.op]?.platfo
  * expects：用例里的断言定义（读 via）；ops：操作库（认 observe 用的配方是不是只读现成文件）。
  * 迁移前的运行按当时的规矩记的证据，不追溯这两条要求（与报告同口径）。
  */
-export function assertionGaps(dir, res, { expects = [], ops = {} } = {}) {
+export function assertionGaps(dir, res, { expects = [], ops = {}, words = DEFAULT_CLAIM_WORDS } = {}) {
   const out = {};
   const legacy = !!res?.demand?.migrated;
   const def = new Map((expects || []).map(e => [e.id, e]));
@@ -376,6 +406,11 @@ export function assertionGaps(dir, res, { expects = [], ops = {} } = {}) {
     if (!ev.length) g.push('no_evidence');
     else if (!legacy && viaOf(def.get(id)) === 'ui') { if (!ev.some(x => imageKind(dir, x) === 'ui_observe')) g.push('no_ui_shot'); }
     else if (!legacy && (!v.observed || v.observed.offline || FILE_EXECS.has(execOfObserved(v.observed, ops)))) g.push('not_tool_collected');
+    // 断言说的效果（弹窗 / 拦截 / 上报……）比观测读到的那一层宽，又没有盲审逐条核过主张：这条 pass 只证明了谓词。
+    // 继承下来的 pass 也走这里 —— 缺口跟着证据走，不跟着轮次走。
+    if (!legacy && v.status === 'pass' && ev.length && def.get(id)
+        && uncoveredClaims(def.get(id), { ops, platform: res.platform, words, usedOp: v.observed?.op }).missing.length
+        && !ev.some(x => { const rv = res.reviews?.[rkey(id, x)]; return rv?.state === 'ok' && rv.claims_checked; })) g.push('claims_uncovered');
     if (g.length) out[id] = g;
   }
   return out;
@@ -384,6 +419,7 @@ export const GAP_TEXT = {
   no_evidence: '没有任何证据',
   no_ui_shot: '界面上的断言，没有读到结论那一刻的 app 截图（acceptkit observe 的 UI 通道）',
   not_tool_collected: '声明了命令行验证，但证据不是 observe 亲自采的（读的是执行者交来的文件）',
+  claims_uncovered: '断言说的效果（弹窗 / 拦截 / 上报……）观测没读到那一层，也没经盲审逐条核过：这条 pass 只证明了判定谓词',
 };
 
 // **文字排版成的卡片不是图片证据**：它只是把文字转成了图片，不证明任何东西。

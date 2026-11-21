@@ -10,13 +10,17 @@ const ops = {
 };
 const caseOf = expects => ({ case: 'x', platform: 'ios', tree: [{ op: '做事', expect: expects }] });
 
-test('O4：声明「界面上看不到」，但操作库已有同一件事的界面读法 ⇒ 拦，提示复核 why_not_ui', () => {
+test('O4：声明「界面上看不到」，但操作库已有同一件事的界面读法 ⇒ 提示复核 why_not_ui（关键词重合只是可能，不拦）', () => {
   const c = caseOf([{ id: 'E6', assert: '后台期间发的事件立刻交给宿主上报口，category 里没有 retry_flag', via: 'debugger',
     why_not_ui: '事件日志分不出交没交出去', observe: { op: 'lldb-arm' } }]);
   const f = observabilityFindings(c, ops, ['ios']).filter(x => x.rule === 'O4');
   assert.equal(f.length, 1);
-  assert.equal(f[0].level, 'block');
+  assert.equal(f[0].level, 'warn');
   assert.match(f[0].msg, /demo-ui-event-log/);
+  // 核过这个界面读法确实读不到：记 why_not_ui_checked，它就不再被点名
+  const checked = caseOf([{ id: 'E6', assert: '后台期间发的事件立刻交给宿主上报口，category 里没有 retry_flag', via: 'debugger',
+    why_not_ui: '事件日志分不出交没交出去', why_not_ui_checked: [{ op: 'demo-ui-event-log', at: '2026-11-18', why: '日志页不显示投递' }], observe: { op: 'lldb-arm' } }]);
+  assert.equal(observabilityFindings(checked, ops, ['ios']).filter(x => x.rule === 'O4').length, 0);
 });
 
 test('O4 不误报：说的不是同一件事的调试器断言不提', () => {
@@ -51,4 +55,14 @@ test('事后：证据缺口算「证据充分」拦截；事前没提过的同�
   assert.ok(esc && esc.needs_retro);
   const post2 = assessRunPost(r, { gaps: { E6: ['no_ui_shot'] }, preItems: [{ at: 'E6', dimension: 'observable', level: 'block' }] });
   assert.ok(!post2.some(i => i.dimension === 'escape' && i.level !== 'ok'), '事前提过了就不算漏网');
+});
+
+test('事前评价：断言只在别的端跑（platform / platforms）→ 单平台评审单不评；换到那一端照常评', () => {
+  const c = { case: 'x', platform: 'both', tree: [{ op: '做事', expect: [
+    { id: 'E1', assert: 'a', platform: 'ios' }, { id: 'E2', assert: 'b', platforms: ['ios'] }, { id: 'E3', assert: 'c' }] }] };
+  const findings = ['E1', 'E2', 'E3'].map(at => ({ rule: 'Q01', level: 'block', title: 't', at, msg: 'm' }));
+  const blocks = ps => assessCasePre(c, { findings, platforms: ps }).filter(i => i.level === 'block').map(i => i.at).sort();
+  assert.deepEqual(blocks(['android']), ['E3']);
+  assert.deepEqual(blocks(['ios']), ['E1', 'E2', 'E3']);
+  assert.deepEqual(blocks([]), ['E1', 'E2', 'E3'], '平台未定：都评');
 });

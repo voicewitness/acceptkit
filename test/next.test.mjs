@@ -214,7 +214,8 @@ test('截不了图的 UI 节点：断言判不了且进了台账，或这一步�
   ok(dir, 'record', run, '--expect', 'E1', '--status', 'blocked', '--blocked-kind', 'capability', '--actual', '页面打不开', '--unlock', '我要先把本地服务起起来');
   ok(dir, 'blockers', 'D1', '--set', 'B1', '--review-note', '评审后才出现：本地服务换了端口');
   ok(dir, 'blockers', 'D1', '--raise');
-  assert.deepEqual(kinds(dir), ['report_due']);
+  // 自己的能力缺口提过也还是执行者的活：一直出 blocker_own，直到 --resolve 或断言有了结论
+  assert.deepEqual(kinds(dir), ['blocker_own', 'report_due']);
 
   // 没有断言结论、但执行者把这一步登记成取证手段的问题：也不再出 step_todo
   const dir2 = project();
@@ -275,7 +276,8 @@ test('评审单中途加用例：只挡新加的那条；阶段按用例算；�
   // 内容漂移重钉指纹不等于替 Owner 批了新加的用例
   const cf = join(dir, 'cases', 'c1.case.json');
   writeFileSync(cf, readFileSync(cf, 'utf8').replace('页面顶部显示「你好」', '页面顶部第一行显示「你好」'));
-  ok(dir, 'plan', 'recheck', 'D1', '--why', '断言写得更具体');
+  // 改了断言原文 = 会影响结论：owner 认了才重钉（只加不删的改动不用，见 case-edit 测试）
+  ok(dir, 'plan', 'recheck', 'D1', '--why', '断言写得更具体', '--by', 'owner', '--quote', '改得对');
 
   let cs = cards(dir);
   const ask = cs.find(c => c.subject === 'plan_approval');

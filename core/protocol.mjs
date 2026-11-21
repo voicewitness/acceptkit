@@ -185,7 +185,7 @@ export const COMMANDS = [
       run: RUN,
       pack: flag('出证据包'),
       limit: int('这次最多出几份包'),
-      apply: str('回写盲审结论：jsonl 文件，每行 {"run","key","verdict","note"}；- 表示从标准输入读'),
+      apply: str('回写盲审结论：jsonl 文件，每行 {"run","key","verdict","note"}；包里列了主张清单的，判 ok 那行还要带 "claims":[{"id":"C1","where":"证据第几行"},…]，每条都要有，有一条找不到就判 insufficient；- 表示从标准输入读'),
       by: str('回写时记谁判的，默认 blind'),
       reopen: str('重开一条复核（证据没变、被判的上下文变了）：复核键 <断言或 step:节点>::<证据>，要配 --run 和 --why'),
       why: str('--reopen 的理由'),
@@ -229,6 +229,14 @@ export const COMMANDS = [
     }),
     argv: 'acceptkit plan approve {demand} --by {by} --quote {quote} --json',
     returns: 'plan 卡片' },
+
+  { name: 'plan_recheck',
+    description: '批准后改过的用例重新钉住。只加不删的改动（加断言 / 判据 / 前提、换观测用的操作、改步骤和说明）直接记下、事后通知 owner；'
+      + '会改结论或范围的（删断言、改断言原文、删改判据、改适用范围、声明某个词不算效果）要 owner 本人认：带 --by --quote，attention 卡片（subject=case_edit）的 on_reply 就是它。--by 写执行者自己会被拒。',
+    input_schema: obj(['demand', 'why'], { demand: DEMAND, why: str('为什么改'), case: str('只处理这几条用例（逗号分隔）'),
+      by: str('认这次改动的人（owner 本人；只加不删的改动不用）'), quote: str('他的原话，照抄') }),
+    argv: 'acceptkit plan recheck {demand} --why {why} [--case {case}] [--by {by}] [--quote {quote}] --json',
+    returns: '文本' },
 
   { name: 'plan_return',
     description: 'owner 看了评审单不同意、要改：记下他的意见，退回给执行者。不是批准；已批过的用例照常测。attention 卡片（plan_approval）的 on_reject 就是它。--by 写执行者自己会被拒。',

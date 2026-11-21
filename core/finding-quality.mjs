@@ -25,6 +25,7 @@ const JARGON = [
   [/[⇒⟹]/, '推导箭头（断言原文？）'],
   [/\b(?!HTTPS?\b)[A-Z][A-Z_]{3,}\b/, '全大写常量名（ALWAYS 这类要先用人话解释，放到「为什么」里）'],
   [/\b(tree|raw|leaf|unit)\[/, '配置字段下标'],
+  [/[有没无长带证]牙|牙齿/, '「有牙 / 没牙」这种黑话（直接说：功能坏了这条会不会失败）'],
 ];
 const PLAIN_FIELDS = { what: '一句话', impact: '影响范围', options: '选项', recommend: '推荐' };
 

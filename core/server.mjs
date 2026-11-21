@@ -4,14 +4,14 @@
 //   /p/<项目>/             该项目的看板（#run=<面板键> 直接停在某份报告上，见 links.mjs）
 //   /p/<项目>/asset?f=…    看板里的截图，按需出图（不内联进 HTML —— 大项目内联后页面会超出字符串上限）
 //   /p/<项目>/evidence?f=… 证据原文（点开时才取；只出 runs/ 与 evidence/ 下的文件，最多 400KB）
-//   /p/<项目>/panel?k=…   一个面板的内容 + 它用到的证据表（看板首屏只带面板空壳，见 splitPanels）
+//   /p/<项目>/panel?k=…   一个面板的内容 + 它用到的证据表（看板首屏只带面板空壳；切到哪一面才渲染哪一面，见 forkBoard）
 //   POST /p/<项目>/decide  owner 在裁定页写下决定 → acceptkit plan decide；或「看不懂，退回」→ plan bounce（唯一的写入口）
 //   /healthz              { ok, projects } —— link / open 用它判断服务在不在
 //
 // 默认只监听 127.0.0.1：看板里是被测系统的内部数据，不对局域网开放；要开放得显式 --host。
-// 看板按需生成并缓存：项目数据（用例、运行、评审单、操作库、配置）有变化才重新生成。
+// 看板按需生成并缓存：项目数据（用例、运行、评审单、操作库、配置）有变化才重新读数据；面板点到才渲染。
 import { createServer } from 'node:http';
-import { spawn } from 'node:child_process';
+import { spawn, fork } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, statSync, mkdirSync, createReadStream, openSync, readSync, closeSync, appendFileSync, realpathSync } from 'node:fs';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { join, resolve, sep, extname, basename } from 'node:path';
@@ -77,7 +77,7 @@ main{max-width:860px;margin:0 auto;padding:32px 16px}h1{font-size:20px;margin:0 
  * 起服务 → Promise<{ server, port, url }>。projects = 项目目录列表；port 0 = 系统挑一个空闲端口（测试用）。
  */
 // 看板一次生成所有面板（每轮、每次执行、每条用例，大项目四百多个、几十 MB），全塞进首屏 = 浏览器要解析几十 MB 才能点。
-// 这里把面板内容拆出来按需给：首屏留空壳（data-k 不变，路由、链接照旧），证据表也按面板拆。
+// 项目自带的看板脚本（pack.dashboard）出的是一整份 HTML：这里把面板内容拆出来按需给：首屏留空壳（data-k 不变，路由、链接照旧），证据表也按面板拆。
 // 裁定页、操作集首屏就要用（裁定表单、操作引用跳转在页面加载时绑定），留在首屏。
 // 依赖看板的形状：面板是不嵌套的 <section class="panel" data-k=…>，证据引用写成 data-ev="evN"。
 const EAGER = new Set(['decide', 'ops']);
@@ -112,38 +112,89 @@ export async function startServer({ roots, port = 9470, host = '127.0.0.1' }) {
   const TOKEN = randomBytes(24).toString('hex');
   const strictHost = LOOPBACK_HOST.test(host) || host === '::1';
   const projects = projectIds([...new Set(roots.map(r => resolve(r)))]);
-  const cache = new Map();   // id → { fp, html, gz, panels, at } | 再加 { pending, fpPending }
+  const cache = new Map();     // id → { fp, html, gz, at, panel(k), child?, dead?, stale?, used }
+  const building = new Map();  // id → { fp, pending }
+  const withGen = (raw, at) => {   // 页面记下自己是哪一版生成的，定时对 /version 问「变了没」—— 开着的旧页面要能知道自己旧了
+    const meta = `<meta name="ak-gen" content="${at}">`, h = raw.toString('utf8');
+    return Buffer.from(/<head>/i.test(h) ? h.replace(/<head>/i, m => m + meta) : meta + h);   // 看板脚本出的是片段，没有 <head>
+  };
+  // 常驻看板进程：数据读一次（大项目约 2s），点到哪一面才渲染哪一面，渲染过的按这一代缓存。
+  // 以前每次数据变化都把几百个面板全渲染一遍（大项目 45s、94MB），新数据要等这一整遍跑完才看得到。
+  const kids = new Set();   // 所有活着的看板进程（含正在起、等着被换下的）
+  const forkBoard = (p, script, fp) => new Promise((ok, fail) => {
+    const ch = fork(script, ['--worker', '--asset-base', `/p/${p.id}/asset`, '--evidence-base', `/p/${p.id}/evidence`],
+      { cwd: p.root, env: { ...process.env, ACCEPTKIT_PROJECT: p.root }, stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+    kids.add(ch);
+    let err = ''; ch.stderr.on('data', d => { err = (err + d).slice(-4000); });
+    const waits = new Map(), done = new Map(); let seq = 0, entry = null;
+    ch.on('message', m => {
+      if (m?.type === 'ready') {
+        const at = Date.now(), html = withGen(m.shell, at);
+        entry = { fp, html, gz: gzipSync(html), at, child: ch, used: at, panel(k) {
+          if (!done.has(k)) {
+            const id = ++seq;
+            const pr = new Promise((res, rej) => waits.set(id, { res, rej }));
+            pr.catch(() => done.delete(k));   // 渲染失败不缓存，下次再试
+            done.set(k, pr); ch.send({ type: 'panel', id, k });
+          }
+          return done.get(k);
+        } };
+        return ok(entry);
+      }
+      const w = waits.get(m?.id); if (!w) return; waits.delete(m.id);
+      m.error ? w.rej(new Error(m.error)) : w.res(m.body == null ? null : Buffer.from(m.body));
+    });
+    ch.on('exit', () => {
+      kids.delete(ch);
+      if (entry) entry.dead = true;
+      for (const w of waits.values()) w.rej(new Error('看板进程退出了，刷新再试')); waits.clear();
+      fail(new Error(`看板生成失败（${basename(script)}）：${err.trim().split('\n').slice(-3).join(' ')}`));
+    });
+  });
+  // 一个项目一个常驻进程；半小时没人看就收掉，下次打开再起
+  const IDLE_MS = 30 * 60e3;
+  setInterval(() => { for (const [id, e] of cache) if (e.child && Date.now() - e.used > IDLE_MS) { e.child.kill(); cache.delete(id); } }, 60e3).unref();
 
   async function dashboard(p) {
     const config = readConfig(p.root);
     const pack = await loadPack(p.root, config);
     const script = pack.dashboard ? resolve(p.root, pack.dashboard) : join(REPO_ROOT, 'core', 'dashboard.mjs');
     const fp = fingerprint(p.root, script);
-    const hit = cache.get(p.id);
+    const hit = cache.get(p.id)?.dead ? null : cache.get(p.id);
+    if (hit) hit.used = Date.now();
     if (hit?.fp === fp) return hit;
-    // 数据变了：已有旧版就先给旧版，后台重新生成（生成要几秒；执行者一直在写，每次都等就一直慢）。
+    // 数据变了：已有旧版就先给旧版，后台重新读（执行者一直在写，每次都等就一直慢）。
     // 用户刚在页面上写过（stale 标记）：等新版，否则他一刷新又看到写之前的样子。
-    const fresh = hit?.stale;
-    if (hit?.pending && hit.fpPending === fp) return hit.html && !fresh ? hit : hit.pending;
+    const serveOld = hit?.html && !hit.stale;
+    const b = building.get(p.id);
+    if (b?.fp === fp) return serveOld ? hit : b.pending;
+    const pending = (pack.dashboard ? staticBoard(p, script, fp) : forkBoard(p, script, fp)).then(entry => {
+      const old = cache.get(p.id);
+      cache.set(p.id, entry);
+      // 旧一代晚一分钟再收：开着旧页面的人可能正在等它渲染某一面
+      if (old?.child && old.child !== entry.child) setTimeout(() => old.child.kill(), 60e3).unref();
+      return entry;
+    });
+    pending.catch(() => { /* 打开时如实报错 */ }).finally(() => { if (building.get(p.id)?.pending === pending) building.delete(p.id); });
+    building.set(p.id, { fp, pending });
+    return serveOld ? hit : pending;
+  }
+
+  // 项目自带的看板脚本：一次出整份 HTML，拆成面板缓存
+  function staticBoard(p, script, fp) {
     const outDir = join(p.root, '.acceptkit'); mkdirSync(outDir, { recursive: true });
     const out = join(outDir, 'serve-dashboard.html');
-    const pending = new Promise((ok, fail) => {
+    return new Promise((ok, fail) => {
       const ch = spawn(process.execPath, [script, '--asset-base', `/p/${p.id}/asset`, '--evidence-base', `/p/${p.id}/evidence`, out], { cwd: p.root, env: { ...process.env, ACCEPTKIT_PROJECT: p.root }, stdio: ['ignore', 'ignore', 'pipe'] });
       let err = ''; ch.stderr.on('data', d => { err += d; });
       ch.on('close', code => {
         if (code !== 0) return fail(new Error(`看板生成失败（${basename(script)}）：${err.trim().split('\n').slice(-3).join(' ')}`));
         const at = Date.now();
-        // 页面记下自己是哪一版生成的，定时对 /version 问「变了没」—— 开着的旧页面要能知道自己旧了
         const { shell: raw, panels } = splitPanels(readFileSync(out));
-        const meta = `<meta name="ak-gen" content="${at}">`, h = raw.toString('utf8');
-        const shell = Buffer.from(/<head>/i.test(h) ? h.replace(/<head>/i, m => m + meta) : meta + h);   // 看板脚本出的是片段，没有 <head>
-        const entry = { fp, html: shell, gz: gzipSync(shell), panels, at };
-        cache.set(p.id, entry); ok(entry);
+        const html = withGen(raw, at);
+        ok({ fp, html, gz: gzipSync(html), at, used: at, panel: async k => panels.get(k) || null });
       });
     });
-    pending.catch(() => { const cur = cache.get(p.id); if (cur?.fpPending === fp) { delete cur.pending; delete cur.fpPending; } });
-    cache.set(p.id, { ...(hit || {}), pending, fpPending: fp });
-    return hit?.html && !fresh ? hit : pending;
   }
 
   const server = createServer(async (req, res) => {
@@ -174,11 +225,11 @@ export async function startServer({ roots, port = 9470, host = '127.0.0.1' }) {
       if (rest === '/version') {
         dashboard(p).catch(() => { /* 生成失败时页面照旧，打开时会报 */ });
         const cur = cache.get(p.id) || {};
-        return send(200, JSON.stringify({ gen: cur.at || 0, updating: !!cur.pending }), 'application/json');
+        return send(200, JSON.stringify({ gen: cur.at || 0, updating: building.has(p.id) }), 'application/json');
       }
       if (rest === '/panel') {
         const d = await dashboard(p);
-        const body = d.panels?.get(u.searchParams.get('k') || '');
+        const body = await d.panel(u.searchParams.get('k') || '');
         if (!body) return send(404, JSON.stringify({ error: '没有这一页（看板刚更新过，刷新一下）' }), 'application/json');
         const gz = /\bgzip\b/.test(req.headers['accept-encoding'] || '');
         return send(200, gz ? gzipSync(body) : body, 'application/json; charset=utf-8', gz ? { 'content-encoding': 'gzip' } : {});
@@ -252,6 +303,8 @@ export async function startServer({ roots, port = 9470, host = '127.0.0.1' }) {
     } catch (e) { return send(500, String(e.message || e)); }
   });
   await new Promise((ok, fail) => { server.once('error', fail); server.listen(port, host, ok); });
+  // 服务关了，常驻看板进程一起收（IPC 连着时它们会把服务进程拖住不退）
+  server.on('close', () => { for (const ch of kids) ch.kill(); cache.clear(); });
   // 起来就在后台把各项目的看板生成好：大项目生成要几秒，别让第一个打开的人等
   for (const p of projects) dashboard(p).catch(() => { /* 打开时会如实报错 */ });
   const real = server.address().port;

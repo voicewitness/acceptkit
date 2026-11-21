@@ -8,15 +8,16 @@
 //       → run_needed → stalled
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import { loadPlan, planCases, approvedCases, planDelta, checkPlan, readBlockers, returnedPending } from './plan-gate.mjs';
+import { loadPlan, planCases, approvedCases, planDelta, checkPlan, readBlockers, returnedPending, caseEdits } from './plan-gate.mjs';
 import { loadDemands } from './demand-registry.mjs';
 import { loadOps, doableOn } from './ops.mjs';
 import { loadRounds, repoSnapshot, demandRecords, resolveState, noShotHolders, shotInRound } from './rounds.mjs';
-import { reviewItems, isImage, appShotsIn, assertionGaps, nonUiRead } from './evidence-gate.mjs';
+import { reviewItems, isImage, appShotsIn, assertionGaps, nonUiRead, staticOnlyRun } from './evidence-gate.mjs';
 import { hostOfCase } from './hosts.mjs';
 import { findingProblems, blockerAskProblems } from './finding-quality.mjs';
 import { normalizePlatforms, RUNTIME_PLATFORMS } from './platform.mjs';
 import { readConfig } from './project.mjs';
+import { claimWordsOf } from './claims.mjs';
 import * as C from './cards.mjs';
 import * as ANDROID from '../adapters/android/device.mjs';
 import { smokeSpec, smokeState, smokeCaseId } from './smoke.mjs';
@@ -120,7 +121,7 @@ function untested(root, D, plan) {
   const carried = new Map();
   const state = resolveState(rf, rf.rounds.length - 1, recs, keys);
   // 有效截图规则：受规则管（端上平台、不是迁移来的）却一张 app 画面都没有的运行
-  const bare = (id, rd) => { const r = byId.get(id); return !!r && RUNTIME_PLATFORMS.includes(r.platform || r.device?.platform) && !r.demand?.migrated && !appShotsIn(join(dir, id)).some(shotInRound(rf, rd)); };
+  const bare = (id, rd) => { const r = byId.get(id); return !!r && RUNTIME_PLATFORMS.includes(r.platform || r.device?.platform) && !r.demand?.migrated && !staticOnlyRun(root, r) && !appShotsIn(join(dir, id)).some(shotInRound(rf, rd)); };
   const noShot = noShotHolders(state, bare);
   for (const [k, v] of state) {
     const i = k.indexOf('::'), n = k.slice(0, i);
@@ -206,7 +207,7 @@ function runCards(root, cfg, D, { id, dir, r }, blockers, allBlockers, carried =
   for (const e of todo) out.push(C.expectTodoCard(id, e, answered.get(e.id) || null));
   // 记了结论、证据不全：同一份判据（assertionGaps）—— 报告列缺口、看板不算通过、这里让执行者先补齐再送盲审
   //（整轮一张 app 画面都没有的，走下面的 shot_missing 开新运行，不在这里重复报）
-  const AG = RUNTIME_PLATFORMS.includes(platform) && !r.demand?.migrated && !appShotsIn(dir).length ? {} : assertionGaps(dir, r, { expects: exps, ops: loadOps(root) });
+  const AG = RUNTIME_PLATFORMS.includes(platform) && !r.demand?.migrated && !staticOnlyRun(root, r) && !appShotsIn(dir).length ? {} : assertionGaps(dir, r, { expects: exps, ops: loadOps(root), words: claimWordsOf(cfg) });
   const gapIds = exps.map(e => e.id).filter(x => AG[x]);
   if (gapIds.length) {
     // 缺截图的断言若读法本身不是界面通道，重跑 observe 也补不上：卡片要指出该换配方，而不是让执行者空转
@@ -226,7 +227,7 @@ function runCards(root, cfg, D, { id, dir, r }, blockers, allBlockers, carried =
   // 有效截图规则的旧账：规则加上之前记的结论，这个运行里一张 app 画面都没有。事后补截的图证明不了当时，所以要开新运行重测
   //（规则定下之前迁移进来的运行不追溯，与 record / report 的 legacyRun 同口径）
   const concluded = exps.filter(e => ['pass', 'fail'].includes(results[e.id]?.status)).length;
-  const noShot = concluded && RUNTIME_PLATFORMS.includes(platform) && !r.demand?.migrated && !appShotsIn(dir).length;
+  const noShot = concluded && RUNTIME_PLATFORMS.includes(platform) && !r.demand?.migrated && !staticOnlyRun(root, r) && !appShotsIn(dir).length;
   if (!noShot && !gapIds.length && !left && !rejected.length && !pending.length && !unreported && !unlogged.length) {
     // 报告写完后 run.md 比 result.json 新；之后又有记录改动，就要重出
     const md = join(dir, 'run.md'), res = join(dir, 'result.json');
@@ -266,6 +267,9 @@ export function nextCards(root, D, opts = {}) {
     attention.push(C.planApprovalCard(D, plan, delta, approved.size, via));
   }
 
+  // 批准后改了会影响结论的用例：等 owner 认（只加不删的改动不出卡，plan recheck 记下即可）
+  { const held = caseEdits(root, join(root, 'cases'), plan).filter(x => x.tier === 'ack');
+    if (held.length) attention.push(C.caseEditCard(D, held)); }
   // 写得 owner 定不了的不算「等你定」，是执行者的待办（与看板同口径）
   for (const f of (plan.findings || []).filter(awaitingOwner)) {
     const bad = findingProblems(f);
@@ -300,7 +304,14 @@ export function nextCards(root, D, opts = {}) {
       continue;
     }
     if (b.answer) continue;                                  // 已答复：落到断言卡片上照答复重测
-    if (ownCap(b)) { if (!b.reported) own.push(C.blockerOwnCard(D, b)); continue; }
+    // 自己的能力缺口：提没提过都还是执行者的活（提过只是告知），一直出卡直到 --resolve 或断言有了结论。
+    // 以前「已提过就不出卡」，于是 next 报 0 张、看板写「没有等你的事」，而活一件没做（2026-11-21 实测）。
+    // 同一用例同一解锁条件只出一张。
+    if (ownCap(b)) {
+      const key = `own|${b.case}|${b.unlock || b.text}`;
+      if (!unaskedSeen.has(key)) { unaskedSeen.add(key); own.push(C.blockerOwnCard(D, b)); }
+      continue;
+    }
     // 要 owner 答的，先得写成他能拍板的问题（问句 / 为什么问你 / 选项 + 后果 / 推荐）；没写成的是执行者的活。
     // 同一个解锁条件下的几条只出一张（一个问题常卡住十几条断言）
     if (blockerAskProblems(b).length) {

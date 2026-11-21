@@ -11,10 +11,12 @@
 //   --asset-base 时截图走 URL（server 按需出图，HTML 只有 KB）；否则内联 data-URI。
 //   评审内部数据：只在本地宿主页面(localhost) 的 iframe 里出，从不外发。
 import { readFileSync, writeFileSync, readdirSync, existsSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { consultFor } from './evidence-consult.mjs';
 import { join, dirname, relative } from 'node:path';
 import { loadProject, ownerIdentity } from './project.mjs';
 import { smokeState, smokeSpec } from './smoke.mjs';
+import { claimWordsOf } from './claims.mjs';
 
 const PROJ = await loadProject();
 if (!PROJ.root) { console.error('acceptkit open: 找不到项目（--project / ACCEPTKIT_PROJECT / 项目目录）'); process.exit(1); }
@@ -31,7 +33,7 @@ const EVID = join(ROOT, 'evidence');
 // 数据模型：需求↔用例多对多（关系在评审单里）；平台适用性算出来；图按身份分类
 import { applicability, fmtApplicability, RUNTIME_PLATFORMS, PLATFORM_LABEL, normalizePlatforms } from './platform.mjs';
 import { loadDemands, allPlans, planCaseSet, demandsReferencing } from './demand-registry.mjs';
-import { imageKind, appShotsIn, reviewItems, setCardMarkers, assertionGaps, GAP_TEXT, viaOf, VIA_LABEL } from './evidence-gate.mjs';
+import { imageKind, appShotsIn, reviewItems, setCardMarkers, assertionGaps, GAP_TEXT, viaOf, VIA_LABEL, staticOnlyRun } from './evidence-gate.mjs';
 import { nextCards, caseStages, STAGES } from './next.mjs';
 import { listLoopBindings, lastLoopStop } from './store/db.mjs';
 import { approvedCases, planDelta } from './plan-gate.mjs';
@@ -116,7 +118,7 @@ const runs = existsSync(RUNS)
       // 声明了调试器验证的断言被误判「证据不全」（报告那条路径会解析，所以两边不一致）
       const cdef = res && (ALL_CASES[res.case] || ALL_CASES[String(res.case_ref || '').replace(/^.*\//, '').replace(/\.case\.json$/, '')]);
       const cexp = []; (function w(ns) { for (const n of ns || []) { cexp.push(...(n.expect || [])); w(n.children); } })(cdef?.tree);
-      if (res?.results) for (const [eid, g] of Object.entries(assertionGaps(dir, res, { expects: cexp, ops: OPS_REG })))
+      if (res?.results) for (const [eid, g] of Object.entries(assertionGaps(dir, res, { expects: cexp, ops: OPS_REG, words: claimWordsOf(PROJ.config) })))
         if (res.results[eid].status === 'pass') res.results[eid] = { ...res.results[eid], status: 'gap', recorded_status: 'pass', gaps: g };
       const meta = loadJSON(join(dir, 'run.json')) || {};
       return { id, dir, res, meta, wild: !res, shots: collectShots(dir, id) };
@@ -228,7 +230,8 @@ let evInlined = 0;
 const EV_TOTAL_BUDGET = Number(process.env.ACCEPTKIT_EV_BUDGET || 60e6);
 function stashEvidence(rel, full) {
   if (evByPath.has(full)) return evByPath.get(full);
-  const id = 'ev' + evStore.size;
+  // 编号由路径决定、不按收录顺序：管理页面按面板分批取证据表，新旧两代看板进程给的面板会合进同一个页面，顺序号会撞
+  const id = 'ev' + createHash('sha1').update(relative(ROOT, full)).digest('hex').slice(0, 12);
   evByPath.set(full, id);
   if (EV_BASE) { evStore.set(id, { name: rel, src: `${EV_BASE}?f=${encodeURIComponent(relative(ROOT, full))}` }); return id; }
   let text = '', truncated = false;
@@ -1338,7 +1341,7 @@ function renderRoundPanel(dr, i) {
   // 迁移进来的 run（规则定下之前按当时的规矩跑的）不追溯 —— 与 report / record 的 legacyRun 同一口径
   const ruled = mem.runs.filter(r => !runs.find(x => x.id === r)?.res?.demand?.migrated);
   // 与 next 的 shot_missing 同一口径（rounds.mjs noShotHolders）：只数本轮结论现在还出自它的运行，被后来的运行覆盖了的不再标红
-  const bareRun = (r, rdId) => { const res = runs.find(x => x.id === r)?.res; return !!res && RUNTIME_PLATFORMS.includes(res.platform || res.device?.platform) && !res.demand?.migrated && !shots.some(m => m.run === r) && !appShotsIn(join(RUNS, r)).some(shotInRound(dr.rf, rdId)); };
+  const bareRun = (r, rdId) => { const res = runs.find(x => x.id === r)?.res; return !!res && RUNTIME_PLATFORMS.includes(res.platform || res.device?.platform) && !res.demand?.migrated && !staticOnlyRun(ROOT, res) && !shots.some(m => m.run === r) && !appShotsIn(join(RUNS, r)).some(shotInRound(dr.rf, rdId)); };
   const noShotRuns = [...noShotHolders(st, bareRun, { here: true }).keys()];
   const shotLine = !mem.records || !ruled.length ? '' : !shots.length
     ? `<div class="rule bad-rule">⚠️ <b>本轮没有一张 app 操作截图</b>（${ruled.length} 个 run 全是文本证据）。违反有效截图规则：验收过程和结果要有真实 app 画面能证明。这一轮的「通过」只有探针日志支撑。</div>`
@@ -1497,22 +1500,28 @@ const nav = navTop + navDecide + `<div class="navsec">需求执行记录</div>` 
     <span class="navtally">${tallyBadges(w.tally)}</span></span></button>`;
 }).join('') + '</div>';
 
-const roundPanels = demandRounds.map(dr => dr.rf.rounds.map((_, i) => renderRoundPanel(dr, i)).join('')).join('');
-const panels = roundPanels
-  + (pendingFindings.length ? `<section class="panel" data-k="decide" hidden>
+// 面板登记成「键 → 渲染函数」。本地文件一次全渲染；管理页面起的常驻进程（--worker）首屏只给空壳，切到哪一面才渲染哪一面。
+// 一个积累了几百轮的项目全渲染要半分钟以上（实测读数据 2s、渲染面板 28s、写 94MB 文件十几秒），几乎全花在没人看的面板上。
+const PANELS = new Map();
+for (const dr of demandRounds) dr.rf.rounds.forEach((rd, i) => PANELS.set(`round:${dr.did}:${rd.id}`, () => renderRoundPanel(dr, i)));
+if (pendingFindings.length) PANELS.set('decide', () => `<section class="panel" data-k="decide" hidden>
   <div class="phead"><h1>🔻 等你定（${readyFindings.length} 条）</h1><button class="copylink" data-k="decide">🔗 复制链接</button></div>
-  ${renderDecide()}</section>` : '')
-  + execs.map(ex => renderExecPanel(ex, false)).join('')
-  + cases.map(c => renderCaseDetail(c)).join('')
-  + `<section class="panel" data-k="allcases" hidden>
+  ${renderDecide()}</section>`);
+for (const ex of execs) PANELS.set(ex.session, () => renderExecPanel(ex, false));
+for (const c of cases) PANELS.set(`case:${c.case}`, () => renderCaseDetail(c));
+PANELS.set('allcases', () => `<section class="panel" data-k="allcases" hidden>
   <div class="phead"><h1>用例集合</h1><button class="copylink" data-k="allcases">🔗 复制链接</button></div>
-  ${renderCaseLibrary()}</section>`
-  + `<section class="panel" data-k="ops" hidden>
+  ${renderCaseLibrary()}</section>`);
+PANELS.set('ops', () => `<section class="panel" data-k="ops" hidden>
   <div class="phead"><h1>操作集</h1><button class="copylink" data-k="ops">🔗 复制链接</button></div>
-  ${renderOps()}</section>`
-  + libs.map(lib => `<section class="panel" data-k="${lib.key}" hidden>
+  ${renderOps()}</section>`);
+for (const lib of libs) PANELS.set(lib.key, () => `<section class="panel" data-k="${lib.key}" hidden>
   <div class="phead"><h1>${esc(lib.title)}</h1><button class="copylink" data-k="${lib.key}">🔗 复制链接</button></div>
-  ${lib.intro ? `<div class="meta">${esc(lib.intro)}</div>` : ''}${lib.html}</section>`).join('');
+  ${lib.intro ? `<div class="meta">${esc(lib.intro)}</div>` : ''}${lib.html}</section>`);
+const WORKER = process.argv.includes('--worker');
+// 裁定页、操作集首屏就要用（裁定表单、操作引用跳转在页面加载时绑定），常驻进程也随首屏给
+const EAGER = new Set(['decide', 'ops']);
+const panels = [...PANELS].map(([k, render]) => WORKER && !EAGER.has(k) ? `<section class="panel" data-k="${esc(k)}" hidden data-lazy></section>` : render()).join('');
 
 const wildBanner = wildRuns.length
   ? `<div class="wild">⚠️ 野生 run（没走 acceptkit、无 result.json）${wildRuns.length} 个：${wildRuns.map(r => `<code>${esc(r.id)}</code>`).join(' ')} —— 用 <code>acceptkit probe</code> 扶正</div>` : '';
@@ -2006,6 +2015,8 @@ const evJson = JSON.stringify(Object.fromEntries(evStore)).replace(/<\//g, '\\u0
 // ⚠️ 必须用**函数式**替换：String.replace 的字符串替换值里 `$'` `$\`` `$&` `$$` 是特殊模式，
 // 会被展开成"匹配前/后的内容"。证据原文（例如编码过的配置）里 `$` 和引号满地都是，
 // 用字符串替换会把 JSON 拦腰打断 —— 表现是页面上证据 chip 点了没反应（JSON.parse 静默失败）。
+if (WORKER) serveWorker();
+else {
 writeFileSync(OUT, HTML.replace('__EVDATA__', () => evJson));
 process.stderr.write(`wrote ${OUT} (${execs.length} 执行 / ${cases.length} 用例集 / ${runs.length} run / 内联证据 ${evStore.size} 份)\n`);
 // 溢出必须报出来：图改成 file:// 引用后，看板移动到别的机器就打不开那些图，
@@ -2013,3 +2024,22 @@ process.stderr.write(`wrote ${OUT} (${execs.length} 执行 / ${cases.length} 用
 if (__spilled) process.stderr.write(`⚠️  内嵌预算 ${(INLINE_BUDGET/1e6).toFixed(0)}MB 用完，${__spilled} 张图改为 file:// 引用`
   + `（本机能看，拷走就看不到）。要全内嵌：ACCEPTKIT_INLINE_BUDGET=<字节数>；`
   + `更好的办法是配 ASSET_BASE 让宿主页代理取图。\n`);
+}
+
+// 常驻模式（server.mjs 起）：数据只读一次，按面板键渲染。面板正文 + 它引用到的证据表一起回，形状同 /panel 接口
+function serveWorker() {
+  if (!process.connected) process.exit(0);   // 读数据期间服务就退了：断开事件已经错过，不查会一直留着
+  process.send({ type: 'ready', shell: HTML.replace('__EVDATA__', () => evJson) });
+  process.on('message', m => {
+    if (m?.type !== 'panel') return;
+    try {
+      const render = PANELS.get(String(m.k));
+      if (!render) return process.send({ id: m.id, body: null });
+      const html = render().replace(/^\s*<section\b[^>]*>/, '').replace(/<\/section>\s*$/, '');
+      const ev = {};
+      for (const x of html.matchAll(/data-ev="([^"]+)"/g)) if (evStore.has(x[1])) ev[x[1]] = evStore.get(x[1]);
+      process.send({ id: m.id, body: JSON.stringify({ html, ev }) });
+    } catch (e) { process.send({ id: m.id, error: String(e?.stack || e).split('\n').slice(0, 3).join(' ') }); }
+  });
+  process.on('disconnect', () => process.exit(0));   // 服务退了，这个进程别留着
+}

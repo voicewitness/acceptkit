@@ -6,7 +6,9 @@
 // 手改的文件也过同一道检查（acceptkit ops check、doctor）。
 //
 // 形状：
-//   { "_why": "…", "ops": { "<id>": { title, why, kind?: "observe"|"act", platforms: { <键>: 配方 } } } }
+//   { "_why": "…", "ops": { "<id>": { title, why, kind?: "observe"|"act", observes?: <层>|[<层>], platforms: { <键>: 配方 } } } }
+//   observes = 观测操作读的是哪一层（core/claims.mjs 的 LAYERS）：断言说「弹窗 / 拦截 / 上报」时，只有读到那一层的观测才证明得了；
+//   某端读法读的层不同，就写在那份配方上（配方的 observes 优先）。
 //   键 = <平台>（与宿主无关：该平台所有宿主都用它）| <平台>@<宿主>（只在这个宿主上成立，优先于前者）
 //   配方 = { how | exec | steps …, state: "guess"|"confirmed"|"verified", source }
 //        | { absent: true, blocker: "为什么这个平台（宿主）还做不了", unlock?: "怎样才能做" }
@@ -16,6 +18,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { RUNTIME_PLATFORMS } from './platform.mjs';
 import { HOST_ID } from './hosts.mjs';
+import { LAYERS } from './claims.mjs';
 
 export const opsPath = root => join(root, 'ops', 'registry.json');
 export const STATE_LABEL = { guess: '推测', confirmed: '已确认', verified: '已验证' };
@@ -28,11 +31,12 @@ export const RECIPE_KEYS = {
   steps: '分步做法（列表）', caveats: '注意事项（列表）', pitfalls: '踩过的坑（列表）',
   exec: '观测执行器名（kind=observe 时内核调用）', strength: '证据强度 S1–S4', read: '读哪个诊断项', port: '端口来源',
   url: '页面网址', tab: '页签匹配', eval: '页面内求值表达式', settle_ms: '操作后等多久再读', wait_ms: '等待上限',
-  gate: '先决条件（总闸等）', history: '做法的演变', verified: '实测记录（什么时候、在哪跑通的）', state: '推测 / 已确认 / 已验证', source: '从哪来的',
+  gate: '先决条件（总闸等）', observes: '这份配方读的是哪一层（不写就用操作上的 observes）', history: '做法的演变', verified: '实测记录（什么时候、在哪跑通的）', state: '推测 / 已确认 / 已验证', source: '从哪来的',
 };
 const ABSENT_KEYS = new Set(['absent', 'blocker', 'unlock']);
 const LIST_KEYS = new Set(['switches', 'steps', 'caveats', 'pitfalls']);
-const OP_KEYS = new Set(['title', 'why', 'kind', 'platforms', 'pitfalls', 'notes']);
+const OP_KEYS = new Set(['title', 'why', 'kind', 'observes', 'platforms', 'pitfalls', 'notes']);
+const badLayers = v => [].concat(v ?? []).filter(l => !LAYERS[l]);
 
 export function loadRegistry(root) {
   const f = opsPath(root);
@@ -68,6 +72,7 @@ export function opProblems(id, o, hosts = null) {
   if (!o.why) p('缺 why（为什么要有这个操作）');
   if (o.kind && !KINDS.includes(o.kind)) p(`kind 只能是 ${KINDS.join(' / ')}（缺省 act）`);
   for (const k of Object.keys(o)) if (!OP_KEYS.has(k)) p(`不认识的字段 ${k}`, null, 'warn');
+  if (badLayers(o.observes).length) p(`observes 只能是 ${Object.keys(LAYERS).join(' / ')}（写了 ${badLayers(o.observes).join(' / ')}）`);
   const plats = Object.entries(o.platforms || {});
   if (!plats.length) p('没有任何平台的配方');
   for (const [pl, r] of plats) {
@@ -82,6 +87,7 @@ export function opProblems(id, o, hosts = null) {
     }
     if (!r.how && !r.exec && !r.steps) p('配方至少要有 how / exec / steps 之一', pl);
     if (o.kind === 'observe' && !r.exec) p('kind=observe 的配方要写 exec（观测执行器）', pl);
+    if (badLayers(r.observes).length) p(`observes 只能是 ${Object.keys(LAYERS).join(' / ')}（写了 ${badLayers(r.observes).join(' / ')}）`, pl);
     if (r.state && !STATE_LABEL[r.state]) p(`state 只能是 ${Object.keys(STATE_LABEL).join(' / ')}`, pl);
     if (!r.state) p('缺 state（推测 / 已确认 / 已验证）', pl, 'warn');
     for (const k of Object.keys(r)) if (!RECIPE_KEYS[k]) p(`不认识的字段 ${k}`, pl, 'warn');
@@ -116,13 +122,14 @@ function save(root, doc) {
  * recipe 是要写入的字段；replace=false 时并进已有配方（只改给出的字段），true 时整份替换。
  * 写完这条操作必须没有问题，否则不落盘。
  */
-export function writeOp(root, id, { title, why, kind, platform, recipe = {}, replace = false, absent, hosts = null }) {
+export function writeOp(root, id, { title, why, kind, observes, platform, recipe = {}, replace = false, absent, hosts = null }) {
   const doc = loadRegistry(root);
   const cur = doc.ops[id];
   const o = cur ? structuredClone(cur) : { title: '', why: '', platforms: {} };
   if (title) o.title = title;
   if (why) o.why = why;
   if (kind) o.kind = kind;
+  if (observes) o.observes = observes.length === 1 ? observes[0] : observes;
   if (platform) {
     o.platforms ||= {};
     if (absent) o.platforms[platform] = { absent: true, blocker: absent.blocker, ...(absent.unlock ? { unlock: absent.unlock } : {}) };

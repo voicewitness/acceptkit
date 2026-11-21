@@ -7,6 +7,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { CONFIG_NAME } from './project.mjs';
 import { hostProblems, deviceHosts } from './hosts.mjs';
+import { LAYERS } from './claims.mjs';
 
 const ALLOW_KINDS = ['device', 'bundle', 'tenant'];
 const regexOk = v => { try { new RegExp(v); return null; } catch (e) { return `不是合法正则：${e.message}`; } };
@@ -46,6 +47,11 @@ const reasonItem = r => {
   return extra.length ? `不认识的字段 ${extra.join(' ')}` : null;
 };
 const markerItem = m => !m?.match ? '缺 match（正则）' : regexOk(m.match) || (!m.why ? '缺 why（命中说明什么）' : null);
+const claimWordItem = w => !w?.word ? '缺 word（这个效果叫什么）' : !w.match ? '缺 match（正则）' : regexOk(w.match)
+  || (!Array.isArray(w.covers) || !w.covers.length ? '缺 covers（读到哪几层算看到了这件事）' : w.covers.find(l => !LAYERS[l]) ? `covers 只能是 ${Object.keys(LAYERS).join(' / ')}` : null)
+  || (w.except ? regexOk(w.except) : null);
+const pointItem = x => !x?.layer ? '缺 layer（哪一层）' : !LAYERS[x.layer] ? `layer 只能是 ${Object.keys(LAYERS).join(' / ')}`
+  : !String(x.means || '').trim() ? '缺 means（本项目里这一层指什么、在哪看）' : null;
 const jargonItem = j => !j?.match ? '缺 match（正则）' : regexOk(j.match) || (!j.say ? '缺 say（改成怎么说）' : null);
 
 /** 每个键：类型、说明，以及列表项的主键（rm 时按它找） */
@@ -63,6 +69,8 @@ export const CONFIG_KEYS = {
   'report.uiSteps': { type: 'enum', values: ['all'], title: 'all = 所有步骤都按界面步骤要求截图' },
   'quality.dangerOps': { type: 'regex', title: '项目特有的危险动作词（追加在通用词之后）' },
   'quality.extraKeys': { type: 'list', title: '用例里允许的项目字段', item: str },
+  'quality.claimWords': { type: 'list', title: '项目自己的效果词（断言里出现时，要有读到对应层的观测）。和内核自带的弹窗 / 拦截 / 上报 / 不崩 / 生效同名就整条替换；except（正则）= 前后文命中它时不算效果', item: claimWordItem, key: 'word' },
+  'quality.observePoints': { type: 'list', title: '本项目每个观测层指什么、在哪看（例：report = 交给上报 SDK 的那一下；crash = 业务自己的崩溃收集口）。用例检查和盲审按这里的说法讲', item: pointItem, key: 'layer' },
   'quality.jargon': { type: 'list', title: '项目自己的行话（用例正文里不许出现）', item: jargonItem, key: 'match' },
   'apparatus.markers': { type: 'list', title: '取证手段自己的失败形状', item: markerItem, key: 'match' },
   'evidence.cardMarkers': { type: 'list', title: '项目自己的出卡工具写进图片的标记串（带这些标记的图算文字判定卡，不算截图证据）', item: str },

@@ -183,3 +183,28 @@ test('loop stop：还有能做的事就要写理由；理由和剩下的件数�
   assert.equal(st.session, 'sess-1'); assert.match(st.why, /今天先到这/); assert.ok(st.left > 0);
 });
 
+
+test('设备守卫不扫 acceptkit 自己的参数：gate 动作描述里写了设备名不算动设备；同一行别的命令照样扫', async () => {
+  const { withoutAcceptkit } = await import('../core/hooks.mjs');
+  assert.equal(withoutAcceptkit('acceptkit gate --action "装包到 emulator -avd Demo_API33" --sim avd:x').trim(), '');
+  assert.equal(withoutAcceptkit('node bin/acceptkit.mjs observe R; emulator -avd Demo_API33').includes('emulator -avd Demo_API33'), true);
+  const { hook } = setup();
+  assert.notEqual(hook('H1', bash('acceptkit gate --action "emulator -avd Demo_API33 上装包" --sim avd:Demo_API33 --bundle com.a'))?.hookSpecificOutput?.permissionDecision, 'deny');
+  assert.equal(hook('H1', bash('acceptkit observe R && emulator -avd Demo_API33 &')).hookSpecificOutput.permissionDecision, 'deny');
+});
+
+test('设备号先赋给变量再用：代进去认出是哪台；simctl 认不出目标时不算 Android 设备', async () => {
+  const { deviceTargets } = await import('../core/hooks.mjs');
+  const U = ['0A1B2C3D', '0000', '4000', '8000', '00000000DDDD'].join('-');
+  const d = deviceTargets(`U=${U}; xcrun simctl get_app_container $U com.example.app.ep 2>&1`);
+  assert.deepEqual(d.ids, [U]); assert.equal(d.any, false);
+  const b = deviceTargets('xcrun simctl launch booted com.example.app');
+  assert.equal(b.any, false, '不算连着的 Android 设备'); assert.equal(b.anyIos, true);
+  // 别的会话占着这台模拟器：拦，点名的是它
+  const { dir, hook } = setup();
+  const now = new Date().toISOString();
+  saveLeases(dir, { [U]: { run: 'R9', holder: 'x', platform: 'ios', since: now, heartbeat: now, session: 'sess-2' } });
+  const r = hook('H1', bash(`U=${U}; P=$(xcrun simctl get_app_container $U com.example.app.ep 2>&1); echo "$P"`));
+  assert.equal(r.hookSpecificOutput.permissionDecision, 'deny');
+  assert.match(r.hookSpecificOutput.permissionDecisionReason, new RegExp(U));
+});

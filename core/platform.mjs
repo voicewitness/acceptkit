@@ -33,6 +33,13 @@ export function normalizePlatforms(c) {
 }
 
 /** 写回用的规范形式：单平台给字符串（不动存量），多平台给数组。 */
+/** 断言级平台范围：platforms: ["ios"] 或 platform: "ios"（同用例级 platform 的写法）。没声明返回 null（跟着用例走） */
+export function expectPlatforms(e) {
+  const v = e?.platforms ?? e?.platform;
+  if (v === undefined || v === null || (Array.isArray(v) && !v.length)) return null;
+  return normalizePlatforms({ platform: v });
+}
+
 export function platformValue(list) {
   const u = [...new Set((list || []).filter(p => RUNTIME_PLATFORMS.includes(p)))];
   return u.length === 1 ? u[0] : u;

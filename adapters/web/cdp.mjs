@@ -93,9 +93,26 @@ export async function sweepBrowsers({ idleMin = 60, dry = false, roots = [], now
   return { idle_minutes: idleMin, dry_run: dry, browsers: out };
 }
 
+// 调试 Chrome 的用户目录（登录态在里面）要常驻：放 /tmp 重启就清空，SSO 会话跟着丢，自动化卡在登录页（实测出过事）。
+// 位置：用户偏好 browsers.profile_dir（acceptkit prefs set，模板，{port} 换成端口）> 调用方给的常驻目录 > ~/.config/acceptkit/browser-profiles/<端口>。
+// 同一个端口永远落回同一个目录：回收关掉之后再起，登录态还在。
+const TMP_RE = /^(\/private)?\/tmp\//;
+export function stableProfile(port, given = null, pref = null) {
+  if (pref) return String(pref).replace(/\{port\}/g, String(port)).replace(/^~(?=\/)/, homedir());
+  if (given && !TMP_RE.test(given)) return given;
+  return join(homedir(), '.config', 'acceptkit', 'browser-profiles', String(port));
+}
 /** 起（或复用）一个独立用户目录的调试 Chrome。只复用「我们自己 profile 的活实例且端口活着」的情况，绝不连到别的 Chrome。 */
-export async function launchDebugChrome({ port, profile, url = 'about:blank' }) {
+export async function launchDebugChrome({ port, profile, url = 'about:blank', pref = null }) {
   if (!port || !profile) throw new Error('launchDebugChrome 需要 port 与 profile');
+  const want = stableProfile(port, profile, pref);
+  if (want !== profile) {
+    // /tmp 下已经有活实例（之前按旧默认值起的）：先复用它，别在同一个端口上再起一个
+    if (!(ownInstanceAlive(profile) && await cdpAlive(port))) {
+      process.stderr.write(`⚠️  浏览器用户目录 ${profile} ${TMP_RE.test(profile) ? '在 /tmp 下，重启就清空、登录态会丢' : '被用户偏好 browsers.profile_dir 替换'}：改用 ${want}\n`);
+      profile = want;
+    }
+  }
   if (ownInstanceAlive(profile) && await cdpAlive(port)) { touchBrowser(port, profile); return { port, reused: true }; }
   if (await cdpAlive(port)) throw new Error(`端口 ${port} 上已有一个不是本项目起的 Chrome —— 换一个端口，避免连到别人的浏览器会话`);
   if (!existsSync(CHROME_BIN)) throw new Error(`Chrome 二进制不存在: ${CHROME_BIN}（设 CHROME_BIN 覆盖）`);
@@ -109,13 +126,26 @@ export async function launchDebugChrome({ port, profile, url = 'about:blank' }) 
   throw new Error('调试 Chrome 没有起来');
 }
 
+/** 在这个调试 Chrome 里开一个新标签页 → 标签页 id。一个验收运行一个标签页：截图、读值只在自己的标签页上做 */
+export async function openTarget(port, url = 'about:blank') {
+  const u = `http://127.0.0.1:${port}/json/new?${encodeURIComponent(url)}`;
+  let res = await fetch(u, { method: 'PUT' });          // 新版 Chrome 只认 PUT
+  if (!res.ok) res = await fetch(u);
+  if (!res.ok) throw new Error(`开标签页失败：HTTP ${res.status}`);
+  return (await res.json()).id;
+}
+export async function targetAlive(port, id) {
+  try { return (await (await fetch(`http://127.0.0.1:${port}/json`)).json()).some(t => t.id === id && t.type === 'page'); } catch { return false; }
+}
 export class Page {
-  constructor(port, matchUrl) { this.port = port; this.matchUrl = matchUrl; }
+  // targetId：连指定的标签页（验收运行自己的那一个），找不到就报错 —— 不退回去连别的标签页
+  constructor(port, matchUrl, targetId = null) { this.port = port; this.matchUrl = matchUrl; this.targetId = targetId; }
   async connect() {
     const list = await (await fetch(`http://127.0.0.1:${this.port}/json`)).json();
     const pages = list.filter(t => t.type === 'page');
-    const p = (this.matchUrl && pages.find(t => new RegExp(this.matchUrl).test(t.url))) || pages[0];
-    if (!p) throw new Error(`端口 ${this.port} 上没有打开的页面`);
+    const p = this.targetId ? pages.find(t => t.id === this.targetId)
+      : (this.matchUrl && pages.find(t => new RegExp(this.matchUrl).test(t.url))) || pages[0];
+    if (!p) throw new Error(this.targetId ? `标签页 ${this.targetId} 已经不在了（被关掉或浏览器重启过）` : `端口 ${this.port} 上没有打开的页面`);
     touchBrowser(this.port); this._touched = Date.now();
     this.target = p;
     this.ws = new WebSocket(p.webSocketDebuggerUrl); this._id = 0; this._pend = new Map();
@@ -134,6 +164,21 @@ export class Page {
   async setViewport(width = 1920, height = 1000) { await this.send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false }); }
   // 按可见文本 DOM .click()（跨域 iframe 用 clickAt 坐标）
   async clickText(text, exact = true) { return this.eval(`(()=>{const b=[...document.querySelectorAll('button,a,[role=button]')].filter(e=>e.offsetParent).find(e=>${exact ? `e.innerText.trim()===${JSON.stringify(text)}` : `e.innerText.includes(${JSON.stringify(text)})`});if(!b)return 'NOTFOUND';b.click();return 'CLICKED';})()`); }
+  /**
+   * 结论截图前：在页面里找到显示这些值的元素，滚到视口中间（内层滚动容器也滚），再看它是否真在视口里。
+   * → { found: [值…], missing: [值…], in_view: bool }。页面在内层容器里滚动时，直接截图只拍到顶部那一屏（实测 7 张结论图一模一样）
+   */
+  async reveal(values) {
+    const vs = [...new Set((values || []).map(v => String(v).trim()).filter(v => v.length >= 2 && v.length <= 200))].slice(0, 12);
+    if (!vs.length) return { found: [], missing: [], in_view: null };
+    return this.eval(`(()=>{const vs=${JSON.stringify(vs)};const found=[],missing=[];let any=false;
+      const leafOf=v=>{const w=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);let n,best=null;while((n=w.nextNode())){if(n.nodeValue&&n.nodeValue.includes(v)){const el=n.parentElement;if(el&&el.getClientRects().length){best=el;break}}}
+        if(!best){for(const el of document.querySelectorAll('input,textarea,select')){if(String(el.value||'').includes(v)){best=el;break}}}return best};
+      for(const v of vs){const el=leafOf(v);if(!el){missing.push(v);continue}found.push(v);
+        if(!any){el.scrollIntoView({block:'center',inline:'nearest'});any=true}}
+      let in_view=null;if(found.length){const el=leafOf(found[0]);const r=el&&el.getBoundingClientRect();in_view=!!r&&r.bottom>0&&r.top<innerHeight&&r.right>0&&r.left<innerWidth}
+      return {found,missing,in_view}})()`);
+  }
   async shot(file) { const r = await this.send('Page.captureScreenshot', { format: 'png' }); writeFileSync(file, Buffer.from(r.data, 'base64')); }
   async wait(ms) { await sleep(ms); }
   close() { try { this.ws.close(); } catch {} }

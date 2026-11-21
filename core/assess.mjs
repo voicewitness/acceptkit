@@ -10,6 +10,8 @@
 // 是否放行由「有没有处置」决定 —— 采纳并改掉（下一次评价里这一项消失）、或 owner 明确接受现状 / 判建议不成立。
 // 「没登记处置」才拦，「登记了接受现状」不拦 —— 存量能渐进处理，而不是一夜全红。
 import { consultFor } from './evidence-consult.mjs';
+import { scopesOf, judge } from './version-scope.mjs';
+import { expectPlatforms } from './platform.mjs';
 
 export const RUBRIC_VERSION = 1;
 
@@ -36,8 +38,8 @@ export const DIM_LABEL = Object.fromEntries([...DIMENSIONS.pre, ...DIMENSIONS.po
 // case-quality 规则 → 维度。没列到的规则（项目 pack 自带的）归「表述」。
 const RULE_DIM = {
   Q01: 'decidable', Q02: 'decidable', Q03: 'decidable', Q13: 'decidable', Q14: 'decidable',
-  Q20: 'observable', Q21: 'observable',
-  Q04: 'control', Q05: 'control', Q08: 'control', Q11: 'control', Q07: 'control',
+  Q20: 'observable', Q21: 'observable', Q22: 'observable', Q26: 'observable', Q27: 'observable',
+  Q04: 'control', Q05: 'control', Q23: 'control', Q24: 'control', Q08: 'control', Q11: 'control', Q07: 'control',
   Q06: 'safety',
   Q09: 'clarity', Q10: 'clarity', Q12: 'clarity', Q15: 'clarity', Q16: 'clarity',
 };
@@ -75,13 +77,16 @@ export function observabilityFindings(c, ops, platforms) {
     // O4：「界面上看不到」是带日期的事实，被测产品加了观测入口它就过期了（实例：几条断言写着「事件日志分不出
     //     交没交出去」，后来观测台加了投递留痕，这句话就不再成立，却没人回头复核）。
     //     判据：不走界面的断言，操作库里有界面通道的配方与它说的是同一件事（关键词有交集）⇒ 提示复核 why_not_ui。
+    //     关键词重合只是「可能」，判不了「读得到」：只提示、不拦（实测一个需求 101 条断言被它拦下，why_not_ui 早写明了原因）。
+    //     核过某个界面读法确实读不到的，记在断言的 why_not_ui_checked: [{ op, at: "YYYY-MM-DD", why }]，那个读法不再点名。
     if (e.via && e.via !== 'ui') {
       const words = keyTerms(`${e.assert} ${e.why_not_ui || ''}`);
-      const hits = Object.entries(ops || {}).filter(([id, o]) => id !== op && Object.entries(o.platforms || {}).some(([k, r]) => platforms.includes(k.split('@')[0]) && UI_EXECS.has(r?.exec) && !r.absent))
+      const checked = new Set((e.why_not_ui_checked || []).filter(x => x?.op && x.at).map(x => String(x.op)));
+      const hits = Object.entries(ops || {}).filter(([id, o]) => id !== op && !checked.has(id) && Object.entries(o.platforms || {}).some(([k, r]) => platforms.includes(k.split('@')[0]) && UI_EXECS.has(r?.exec) && !r.absent))
         .map(([id, o]) => ({ id, n: keyTerms(`${id} ${o.title || ''} ${o.why || ''}`).filter(w => words.includes(w)).length })).filter(x => x.n >= 2).sort((a, b) => b.n - a.n);
-      if (hits.length) out.push({ rule: 'O4', dimension: 'observable', level: 'block', at: e.id,
+      if (hits.length) out.push({ rule: 'O4', dimension: 'observable', level: 'warn', at: e.id,
         msg: `写的是「界面上看不到」（via=${e.via}），但操作库里已有界面读法可能读得到：${hits.slice(0, 3).map(h => h.id).join('、')}`,
-        fix: `复核 why_not_ui：用 ${hits[0].id} 试读（observe --try）；读得到就改成界面读法（走评审单修订），读不到把原因补进 why_not_ui` });
+        fix: `复核 why_not_ui：用 ${hits[0].id} 试读（observe --try）；读得到就改成界面读法（走评审单修订）；读不到就在断言上记 why_not_ui_checked: [{"op":"${hits[0].id}","at":"<日期>","why":"<为什么读不到>"}]` });
     }
     if (e.observe && !e.seen_at && (!e.via || e.via === 'ui'))
       out.push({ rule: 'O3', dimension: 'observable', level: 'warn', at: e.id, msg: '没写这条结论的消费方在哪看得到（seen_at）', fix: '写 seen_at：用户 / QA 在哪个页面、工具、平台能看到这个结论' });
@@ -115,15 +120,26 @@ export function score(items, phase, decided = () => false) {
  * 事前评价一条用例（纯函数，不读写库）。
  * findings = case-quality checkCase 的原始结果（不按基线 / since 分级）。
  */
-export function assessCasePre(c, { findings = [], ops = {}, platforms = [] } = {}) {
+export function assessCasePre(c, { findings = [], ops = {}, platforms = [], build = null } = {}) {
   const items = [];
+  // 评审单记了被测包（plan --build）：落在不适用范围里的断言不评 —— 被删掉的那一支本来就不在这个包里，评它只会拦住评审单
+  const na = new Set();
+  if (build && Object.keys(build).length) for (const [id, sc] of Object.entries(scopesOf(c.tree))) if (judge(sc, build).state === 'na') na.add(id);
+  // 评审单是单平台（plan.platform）：断言声明了只在别的端跑的，不评 —— 与 applies 对称。同一条用例换到那一端的评审单照常评
+  const naPlat = new Set();
+  if (platforms.length) for (const { e } of walkExpects(c.tree)) { const ps = expectPlatforms(e); if (e.id && ps && !ps.some(p => platforms.includes(p))) naPlat.add(e.id); }
+  for (const id of naPlat) na.add(id);
+  if (na.size) { findings = findings.filter(f => !na.has(f.at)); }
   for (const f of findings) {
     const decidedByWaiver = !!f.waived;
     items.push({ dimension: dimOfRule(f.rule), rule: f.rule, at: f.at, level: f.level === 'block' ? 'block' : 'warn',
       finding: `${f.title}：${f.msg}`, evidence: f.why || '', fix: f.fix || '', waived: decidedByWaiver ? f.waived : null });
   }
-  for (const f of observabilityFindings(c, ops, platforms))
+  for (const f of observabilityFindings(c, ops, platforms).filter(f => !na.has(f.at)))
     items.push({ dimension: f.dimension, rule: f.rule, at: f.at, level: f.level, finding: f.msg, evidence: '', fix: f.fix });
+  const naBuild = [...na].filter(id => !naPlat.has(id));
+  if (naBuild.length) items.push({ dimension: 'clarity', rule: 'NA', at: '用例', level: 'ok', finding: `${naBuild.join(' ')} 在评审单记的被测包上不适用（applies），不参与评价`, evidence: '', fix: '' });
+  if (naPlat.size) items.push({ dimension: 'clarity', rule: 'NA', at: '用例', level: 'ok', finding: `${[...naPlat].join(' ')} 只在别的端跑，本评审单（${platforms.join(', ')}）不评`, evidence: '', fix: '' });
   for (const d of DIMENSIONS.pre) if (!items.some(i => i.dimension === d.id))
     items.push({ dimension: d.id, rule: '-', at: '用例', level: 'ok', finding: `${d.label}：没有发现问题（${d.ask}）`, evidence: '', fix: '' });
   return items;

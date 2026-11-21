@@ -207,3 +207,22 @@ test('read：文本按字符分页、列表按项分页，越界和逃出运行�
   assert.equal(h.stdout.trim(), 'x'.repeat(10));
   assert.match(h.stderr, /--offset 10/);
 });
+
+test('看板首屏只给面板空壳，切到哪一面才渲染哪一面；没有的面板 404', async () => {
+  const { dir } = project();
+  const { server, url } = await startServer({ roots: [dir], port: 0 });
+  try {
+    const id = (await (await fetch(url + '/healthz')).json()).projects[0].id;
+    const shell = await (await fetch(`${url}/p/${id}/`)).text();
+    const keys = [...shell.matchAll(/<section class="panel" data-k="([^"]+)"[^>]*data-lazy><\/section>/g)].map(m => m[1].replace(/&quot;/g, '"').replace(/&amp;/g, '&'));
+    assert.ok(keys.length >= 2, '面板都是空壳');
+    const k = keys.find(x => x.startsWith('case:')) || keys[0];
+    const r = await fetch(`${url}/p/${id}/panel?k=${encodeURIComponent(k)}`);
+    assert.equal(r.status, 200);
+    const j = await r.json();
+    assert.match(j.html, /class="phead"/, '回的是面板正文');
+    assert.doesNotMatch(j.html, /^\s*<section/, '外层 section 留在首屏');
+    assert.equal(typeof j.ev, 'object');
+    assert.equal((await fetch(`${url}/p/${id}/panel?k=nope`)).status, 404);
+  } finally { server.close(); }
+});

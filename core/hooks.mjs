@@ -10,6 +10,7 @@
 // 翻译成各家宿主的接法在 host-hooks.mjs（从 skill-refactor 拷来）；出错一律放行 —— 钩子坏了不能把 agent 锁死。
 // 只管验收的东西：不是验收设备、不在 acceptkit 项目里的文件、没绑定验收的会话，一律放行。
 import { existsSync, readFileSync, statSync, appendFileSync, mkdirSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { join, resolve, sep, basename, dirname } from 'node:path';
 import { readUserConfig, readConfig, REPO_ROOT, USER_CONFIG } from './project.mjs';
 import { loadLeases, loopBinding, listLoopBindings, unbindLoop, bindLoop, recordLoopStop } from './store/db.mjs';
@@ -81,6 +82,10 @@ function devicesIn(cmd) {
 // heredoc 喂给 node / cat / python 这类程序时，正文是数据（改文档、写脚本），不是要执行的命令；喂给 shell 的照样算命令。
 // 实测：改一份写着「emulator -avd …」的文档，被当成起模拟器拦下
 const commandsOf = t => String(t).replace(/^(?!\s*(?:\S*\/)?(?:ba|z)?sh\b)([^\n]*?)<<-?\s*(['"]?)(\w+)\2[^\n]*\n[\s\S]*?\n\s*\3\s*(?=\n|$)/gm, '$1');
+// 调用 acceptkit 自己的那一段不按设备命令扫：它自己核占用、过闸；参数里的文字（gate --action "装 xx 包到某台"）
+// 不是在动设备。实测：gate 的动作描述里写了别人那台的名字，整条命令被当成去动那台拦下，可它根本没指向那台
+const ACCEPTKIT_SEG = /(^|[;&|(]\s*|\n\s*)(?:\w+=\S+\s+)*(?:node\s+)?(?:\S*\/)?acceptkit(?:\.mjs)?(?=\s|$)(?:'[^']*'|"(?:\\.|[^"\\])*"|[^;&|\n'"])*/g;
+export const withoutAcceptkit = t => String(t).replace(ACCEPTKIT_SEG, '$1');
 const LIFECYCLE = /emulator[^|;&]*\s-avd\b|avdmanager[^|;&]*\bcreate\b|simctl\s+(boot|clone|create)\b|\.avd\/[^ ]*\.lock|cp\s[^|;&]*\.avd/;
 // ── 设备强制管控（11-16 三次事故：没占就在别人那台上装包推 mock；脚本写死 emulator-5554 打到了别的设备；设备停了占用方不知道）──
 // 规则：发往验收设备（白名单里的、正被占着的）的命令，只有「这台被本会话的运行占着」才放行；没人占也要先 device acquire。
@@ -106,7 +111,11 @@ function scriptTargets(t) {
   const ids = new Set();
   for (const m of t.matchAll(/emulator-\d+/g)) { const id = ANDROID.available() ? ANDROID.identityOf(m[0]) : null; if (id) ids.add(id); }
   for (const m of t.matchAll(/\b([0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12})\b/gi)) ids.add(m[1].toUpperCase());
-  return { ids: [...ids], any: !ids.size };
+  if (ids.size) return { ids: [...ids], any: false, anyIos: false };
+  // 认不出目标：调的是 adb 才算连着的 Android 设备，调的是 simctl 才算开着的 iOS 模拟器（以前一律算 Android，只调 simctl 的脚本被判成在动别人的 AVD）
+  const adb = /(['"`])adb\1|adbBin\(\)|adbPath\(\)|(?:^|[;&|(]\s*|\$\(\s*)adb\s+/m.test(t);
+  const sim = /(['"`])simctl\1|(?:^|[;&|(]\s*)xcrun\s+simctl\s+(?!list\b|help\b)/m.test(t);
+  return { ids: [], any: adb, anyIos: sim };
 }
 /** adb 的全局 -s（子命令之前的那个）；子命令之后的 -s 是子命令自己的参数（例：logcat -s TAG），不是设备 */
 export function adbSerial(call) {
@@ -120,8 +129,11 @@ export function adbSerial(call) {
 }
 export function deviceTargets(t, { script = false } = {}) {
   if (script) return scriptTargets(t);
-  const ids = new Set(); let any = false;
-  const calls = t.replace(/acceptkit(\.mjs)?\s+adb\b/g, '');   // acceptkit adb 封装：它自己按占用核对
+  const ids = new Set(); let any = false, anyIos = false;
+  let calls = t.replace(/acceptkit(\.mjs)?\s+adb\b/g, '');   // acceptkit adb 封装：它自己按占用核对
+  // 命令里先赋值再用的设备号（先把设备号赋给变量、后面的命令再引用变量）：代进去再认。不代的话认不出目标，只能按「目标不明」处理
+  const vars = new Map([...calls.matchAll(/(?:^|[\s;&|(])(\w+)=["']?([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}|emulator-\d+)["']?(?=[\s;&|)]|$)/g)].map(m => [m[1], m[2]]));
+  if (vars.size) calls = calls.replace(/\$\{?(\w+)\}?/g, (m, k) => vars.get(k) || m);
   // 只认处在命令位置的 adb / xcrun simctl（行首、管道 / 分号之后、$( 里，可带环境变量、timeout、路径前缀）；grep adb、echo 里的字样不算
   const adbCalls = [...calls.matchAll(new RegExp(CMD_POS + String.raw`(?:[\w.~/-]*/)?(adb\s[^\n|;&]*)`, 'gm'))].map(m => m[1]).filter(c => !ADB_IDENT.test(c));
   const simCalls = [...calls.matchAll(new RegExp(CMD_POS + String.raw`xcrun\s+(simctl\s+[^\n|;&]*)`, 'gm'))].map(m => m[1]).filter(c => !SIMCTL_READ.test(c));
@@ -135,9 +147,13 @@ export function deviceTargets(t, { script = false } = {}) {
     const s = adbSerial(c);
     if (s) addAddr(s); else any = true;
   }
-  for (const c of simCalls) { const u = /\b([0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12})\b/i.exec(c); if (u) ids.add(u[1].toUpperCase()); else any = true; }
-  return { ids: [...ids], any };
+  // simctl 认不出目标（booted、没代进去的变量）：只算开着的 iOS 模拟器。以前当成 adb 的「目标不明」，算上了所有连着的 Android 设备，
+  // 查自己占着的 iOS 模拟器被判成在动别人占着的 AVD（实测两次）
+  for (const c of simCalls) { const u = /\b([0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12})\b/i.exec(c); if (u) ids.add(u[1].toUpperCase()); else anyIos = true; }
+  return { ids: [...ids], any, anyIos };
 }
+const bootedIosIds = () => { try { const j = JSON.parse(spawnSync('xcrun', ['simctl', 'list', 'devices', 'booted', '-j'], { encoding: 'utf8', timeout: 10_000 }).stdout || '{}');
+  return Object.values(j.devices || {}).flat().filter(d => d.state === 'Booted').map(d => String(d.udid).toUpperCase()); } catch { return []; } };
 const connectedIds = () => { const out = []; try { if (ANDROID.available()) for (const d of ANDROID.listDevices()) { const id = ANDROID.identityOf(d.serial); if (id) out.push(id); } } catch {} return out; };
 function leaseOf(id) {
   const want = String(id).toUpperCase();
@@ -163,7 +179,7 @@ const DECIDE = {
   guard_device(n) {
     // 起 / 建 / 克隆设备：不管是哪台都只走 acceptkit —— 设备开在谁的屏上、被谁占着、给哪个需求跑，只有 acceptkit 起的才知道
     // （实测：执行者先 avdmanager 建一台新 AVD 再手动 emulator -avd 起，用户的显示器偏好、台账都没管到）
-    const cmds = n.texts.map(commandsOf);
+    const cmds = n.texts.map(commandsOf).map(withoutAcceptkit);
     const life = cmds.find(t => LIFECYCLE.test(t));
     if (life) return { decision: 'deny', reason: `设备只由 acceptkit 起：这条命令在起 / 建 / 克隆模拟器。`
       + `要设备用 acceptkit device acquire --run <运行>（会按用户偏好开在他指定的显示器上、记进台账）；`
@@ -174,7 +190,7 @@ const DECIDE = {
     const targets = [...cmds.map(t => ({ t, where: '这条命令' })), ...cmds.flatMap(t => scriptTexts(t, n.cwd)).map(x => ({ t: x.text, where: `脚本 ${x.file}`, script: true }))]
       .map(x => ({ ...x, d: deviceTargets(x.t, { script: x.script }) })).filter(x => x.d);
     for (const x of targets) {
-      const ids = [...new Set([...x.d.ids, ...(x.d.any ? connectedIds() : [])])].filter(isAcc);
+      const ids = [...new Set([...x.d.ids, ...(x.d.any ? connectedIds() : []), ...(x.d.anyIos ? bootedIosIds() : [])])].filter(isAcc);
       if (!ids.length) continue;
       const why = holdCheck(ids, n.session);
       if (why) { logOp({ session: n.session, denied: true, devices: ids, cmd: x.t.slice(0, 300), where: x.where }); return { decision: 'deny', reason: `${x.where}要动验收设备 ${ids.join('、')}。${why}${x.script ? '。脚本里别写死 emulator-NNNN：地址按启动顺序分配，会指到别的设备上' : ''}` }; }
@@ -189,7 +205,7 @@ const DECIDE = {
     const fresh = freshGateFor(hit[0], kind);
     if (fresh?.run) return { decision: 'allow', reason: `${hit[0]} 在 ${fresh.at} 由 run=${fresh.run} 过闸（${fresh.action}），${GATE_FRESH_MIN} 分钟内放行` };
     return { decision: 'deny', reason: `这条命令动的是验收设备 ${hit[0]}（${hit[1]}）。${fresh?.miss ? `有闸但不算：${fresh.miss}。` : ''}要验收就走 acceptkit：`
-      + `起 / 选设备用 acceptkit device acquire --run <运行>；装包先 acceptkit gate --action "<要做什么>"，过了就做（本 run 占着的设备不用再问用户）；卸载、清数据过闸要带理由：acceptkit gate --action "卸载 …" --reason <登记的理由 id> --why "<现场>"（没有登记的理由覆盖，闸会告诉你怎么问用户）；`
+      + `起 / 选设备用 acceptkit device acquire --run <运行>；装包先过闸：acceptkit gate --action "<要做什么>" --sim ${hit[0]} --bundle <包名> --run <运行>（目标要显式给，闸不从文字里猜），过了就做（本 run 占着的设备不用再问用户）；卸载、清数据过闸要带理由：acceptkit gate --action "卸载 …" --reason <登记的理由 id> --why "<现场>"（没有登记的理由覆盖，闸会告诉你怎么问用户）；`
       + `关机：本 run 占着的 acceptkit device release <设备> --run <运行> --shutdown，acceptkit 起的、没人占着的 acceptkit device stop <设备>；`
       + `不要删 AVD 锁文件、不要克隆 AVD —— 要新设备请用户加进白名单（acceptkit config add gate.allow …）。不是在做验收：换一台不在验收白名单里的设备。` };
   },

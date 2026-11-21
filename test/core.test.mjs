@@ -403,14 +403,14 @@ test('断言声明 platforms 不含本轮平台：建 run 预填 na；observe �
   const res = () => JSON.parse(readFileSync(join(dir, 'runs', id, 'result.json'), 'utf8'));
   assert.equal(res().results.E1.status, 'na');
   assert.equal(res().results.E1.na_platform, 'android');
-  assert.match(res().results.E1.actual, /platforms=\[ios\]/);
+  assert.match(res().results.E1.actual, /只在 ios 上跑/);
   assert.equal(res().results.E2.status, 'todo');
   // 早先被另一端的配方记成了假 blocked：重跑 observe 改成 na，且不去读 iOS 那份产物
   const r = res(); r.results.E1 = { status: 'blocked', actual: '前提不成立，无从判定', evidence: [] };
   writeFileSync(join(dir, 'runs', id, 'result.json'), JSON.stringify(r));
   const o = ak(dir, 'observe', id, '--expect', 'E1');
   assert.equal(o.status, 0, o.stderr + o.stdout);
-  assert.match(o.stderr, /平台不适用：断言声明 platforms=\[ios\]/);
+  assert.match(o.stderr, /平台不适用：断言只在 ios 上跑/);
   assert.equal(res().results.E1.status, 'na');
   assert.ok(!existsSync(join(dir, 'runs', id, 'evidence', 'obs')), '不该跑任何观测配方');
 });

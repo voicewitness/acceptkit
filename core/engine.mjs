@@ -19,17 +19,18 @@ import { checkAtRecord, addPending, reviewItems, reviewGaps, applyReview, review
          bindingOf, hasBindings, bindingPlatforms,
          apparatusHits, logApparatus } from './evidence-gate.mjs';
 // 流水线闸（用例评审 / 阻塞当场上报 / 报告只讲过与不过）—— 见 plan-gate.mjs 头注释
-import { loadPlan, savePlan, planPath, planCases, gateRun, checkPlan, caseFingerprints, driftedCases, approvedCases, planDelta,
+import { loadPlan, savePlan, planPath, planCases, gateRun, checkPlan, caseFingerprints, driftedCases, approvedCases, planDelta, caseEdits, saveSnapshots,
          raiseBlocker, readBlockers, writeBlockers, unreportedFor, closeBlockersFor, scopeFingerprint } from './plan-gate.mjs';
 // 平台适用性（声明 + 按操作库算）与需求登记表（需求↔用例的关系只在评审单里）
 import { runAction } from './settings.mjs';
 import { loadOps as loadOpsAt, opRecipe as opRecipeAt, doableOn } from './ops.mjs';
 import { resolveHost, hostOfCase, caseHosts, hostApp, deviceHosts } from './hosts.mjs';
 import { evaluate as qualityOf, formatFindings, standardSummary, QUESTIONS, checkCase } from './case-quality.mjs';
+import { uncoveredClaims, claimWordsOf, fmtMissing } from './claims.mjs';
 import * as AS from './assess.mjs';
-import { PLATFORMS, RUNTIME_PLATFORMS, PLATFORM_LABEL, platformOfUdid, applicability, fmtApplicability, runtimePlatform, normalizePlatforms, platformValue } from './platform.mjs';
+import { PLATFORMS, RUNTIME_PLATFORMS, PLATFORM_LABEL, platformOfUdid, applicability, fmtApplicability, runtimePlatform, normalizePlatforms, platformValue, expectPlatforms } from './platform.mjs';
 import { loadDemands, registerDemand, demandsReferencing, demandOfRun, allPlans, planCaseSet } from './demand-registry.mjs';
-import { imageKind, ASSERT_IMAGE_KINDS, appShotsIn, setCardMarkers, assertionGaps, GAP_TEXT } from './evidence-gate.mjs';
+import { imageKind, ASSERT_IMAGE_KINDS, appShotsIn, setCardMarkers, assertionGaps, GAP_TEXT, reviewClaims, staticOnlyRun, viaOf } from './evidence-gate.mjs';
 import { findingProblems, parseOption, FINDING_KINDS, blockerAskProblems } from './finding-quality.mjs';
 import { shotPlaybook, shotNudge } from './shot-guide.mjs';
 import { decodePng, blankness, blankVerdict, judgeShot, BLANK_REFUSE } from './shot-check.mjs';
@@ -124,9 +125,10 @@ const KNOWN_FLAGS = new Set([
 // 平台不适用的 na 只由 observe 的平台分流写入。用 Symbol 做键：命令行解析只产出字符串键，
 // 造不出它，所以手工 record 绕不过版本范围闸。
 const PLATFORM_NA = Symbol('platform-na');
-// 断言级平台范围（platforms: ["ios"]）在本轮平台上不适用时的说明；适用 / 没声明 / 平台未定时返回 null
-const platformNaWhy = (e, plat) => plat && Array.isArray(e?.platforms) && e.platforms.length && !e.platforms.includes(plat)
-  ? `平台不适用：断言声明 platforms=[${e.platforms.join(', ')}]，本轮跑在 ${plat}` : null;
+// 断言级平台范围（platforms: ["ios"] 或 platform: "ios"）在本轮平台上不适用时的说明；适用 / 没声明 / 平台未定时返回 null。
+// 以前只认 platforms，写成 platform: "ios" 的断言在 Android 轮次照样开成 todo、拿 Android 配方去跑
+const platformNaWhy = (e, plat) => { const ps = expectPlatforms(e);
+  return plat && ps && !ps.includes(plat) ? `平台不适用：断言只在 ${ps.join(', ')} 上跑，本轮跑在 ${plat}` : null; };
 // 本轮平台一定下来（建 run 时单平台用例、占设备时 both 用例）就把不适用的断言预填 na，不开成 todo 挡报告。
 // 只动还是 todo 的：已经有结论的不在这里改（要改走 observe，它会按同一条规则改记 na）
 function prefillPlatformNa(results, c, plat) {
@@ -322,6 +324,11 @@ function validate(c) {
       errs.push(`[${where}] shows 必须是非空的字符串数组，写这一步画面上应该出现的字，如 ["已退出登录"]`);
     for (const e of n.expect || []) {
       if (e.applies) errs.push(...validateScope(e.applies, `[${where}] ${e.id || '?'}`));
+      for (const k of ['platform', 'platforms']) if (e[k] !== undefined) {
+        const bad = [].concat(e[k]).filter(x => !PLATFORMS.includes(String(x)));
+        if (bad.length || ![].concat(e[k]).length) errs.push(`[${where}] ${e.id || '?'} 的 ${k}=${JSON.stringify(e[k])} 不合法：只能是 ${PLATFORMS.join('|')} 或它们的数组`);
+      }
+      if (e.platform !== undefined && e.platforms !== undefined) errs.push(`[${where}] ${e.id || '?'} 同时写了 platform 和 platforms，留一个`);
       if (!e.id) errs.push(`[${where}] 有 expect 缺 id`);
       else if (seen.has(e.id)) errs.push(`expect id 重复：${e.id}`);
       else seen.add(e.id);
@@ -813,7 +820,8 @@ function shotCtx(run, r = loadResult(run)) {
   return { run, platform: r.platform, dev, bound: !!bound };
 }
 // 端上 run、不是迁移进来的、到现在一张 app 截图都没有 —— 该提醒截图了
-const needsShot = (run, r = loadResult(run)) => RUNTIME_PLATFORMS.includes(r.platform) && !r.demand?.migrated && !appShotsOf(run).length;
+// 纯静态用例（staticOnlyCase）不要求 app 截图
+const needsShot = (run, r = loadResult(run)) => RUNTIME_PLATFORMS.includes(r.platform) && !r.demand?.migrated && !staticOnlyRun(ROOT, r) && !appShotsOf(run).length;
 
 function cmdRecord({ pos, opt: given }) {
   const run = pos[0] || die('用法：acceptkit record <run> (--step <nodeId> --evidence .. | --expect <id> --status <s> [--actual ..] [--evidence ..] [--finding Fx])');
@@ -894,7 +902,7 @@ function cmdRecord({ pos, opt: given }) {
         + `再记 na。范围写在资产上，旧版本回归时才会照常跑（只写在 run 里等于没人读）`);
       if (j.state === 'applies') die(`被测包 ${sc.component}@${j.version} < ${sc.below}：断言 ${id} 在这个包上适用，不能记 na`);
       if (j.state === 'unknown') die(`断言 ${id} 的适用范围看 ${sc.component}，但本 run 没记被测包版本 —— 加 --build ${sc.component}@<被测版本>`);
-      const want = `${sc.component}@${sc.below}`;
+      const want = `${sc.component}@${sc.below}${sc.line ? `#${sc.line}` : ''}`;
       if (opt.since && String(opt.since) !== want) die(`--since ${opt.since} 与用例声明的范围 ${want} 不一致 —— 以用例为准，改用例或去掉 --since`);
       opt.since = want;
     } else if (j.state === 'na') {
@@ -907,10 +915,11 @@ function cmdRecord({ pos, opt: given }) {
     delete cur.na_since;
     cur.na_platform = String(opt[PLATFORM_NA]);
   } else if (status === 'na') {
-    const m = String(opt.since || '').match(/^([A-Za-z0-9_]+)@(\S+)$/);
-    if (!m) die('--status na 必须带 --since <组件>@<起始版本>（例：组件 LibCore、起始版本 1.2.3）');
+    // 组件名口径同 applies（version-scope.mjs）：可带 - _ . :；按版本线限定的写成 <组件>@<版本>#<版本线>
+    const m = String(opt.since || '').match(/^([A-Za-z0-9][A-Za-z0-9_.:-]*)@([^#\s]+)(?:#(\S+))?$/);
+    if (!m) die('--status na 必须带 --since <组件>@<起始版本>[#<版本线>]（例：组件 LibCore、起始版本 1.2.3）');
     if (!opt.actual && !opt['actual-file'] && !cur.actual) die('--status na 必须写 --actual：这条断言测的东西在哪个版本、因为什么不存在了');
-    cur.na_since = { component: m[1], version: m[2] };
+    cur.na_since = { component: m[1], version: m[2], ...(m[3] ? { line: m[3] } : {}) };
     const regP = join(ROOT, 'state', 'applicability.json');
     let reg = {}; try { reg = JSON.parse(readFileSync(regP, 'utf8')); } catch { /* 首次 */ }
     const caseId = r.case || '';
@@ -922,7 +931,7 @@ function cmdRecord({ pos, opt: given }) {
   // 一张 app 截图都没有，看板照样显示通过。所以在写结论的这一刻查：端上 run 记 pass 之前，这个 run 里
   // 至少要有一张工具截的 app 画面（acceptkit shot，或 observe UI 通道）。fail 确实拍不了（app 起不来）时
   // 用 --allow-no-shot "<为什么拍不了>" 写明，理由留在结果里；pass 没有这个口子。
-  if ((status === 'pass' || status === 'fail') && RUNTIME_PLATFORMS.includes(r.platform) && !r.demand?.migrated && !appShotsOf(run).length) {
+  if ((status === 'pass' || status === 'fail') && needsShot(run, r)) {
     const guide = shotPlaybook(shotCtx(run, r)).join('\n');
     if (status === 'pass') die(`拒绝记 ${id}=pass：这个 run 里还没有一张 app 操作截图。判定证据照旧用探针文本，截图是证明这轮真在 app 上跑过、停在什么画面。\n${guide}`);
     if (!opt['allow-no-shot']) die(`拒绝记 ${id}=fail：这个 run 里还没有一张 app 操作截图。\n${guide}\n`
@@ -1090,7 +1099,7 @@ function nudgeReview(run, keys) {
 // 审的人只看「断言 + 证据原文」下结论（盲审包）。执行者自审记 --by self，report 会单列：
 // 执行者自己看过的证据最容易被放过（比如一张其实停在登录页的截图）。
 function cmdReview({ pos }) {
-  const run = pos[0] || die('用法：acceptkit review <run> [--list | --next | --count | --item <key> --verdict <v> --note .. --by blind|owner|self]');
+  const run = pos[0] || die('用法：acceptkit review <run> [--list | --next | --count | --item <key> --verdict <v> --note .. --by blind|owner|self [--claims \'[{"id":"C1","where":"…"}]\']]');
   const { opt } = parseArgs(process.argv.slice(3));
   const r = loadResult(run);
   const c = loadCase(r.case_ref || r.case);
@@ -1124,8 +1133,11 @@ function cmdReview({ pos }) {
       `拒绝回写 ${key}：复核人看到的内容（${shownFp}）与现在盘上的内容（${nowFp}）**不是同一版**。\n`
       + `   多半是你拿到结论后先去补了证据、才回来回写 —— 那条结论描述的是补之前的东西。\n`
       + `   正确顺序：**先回写结论，再动文件**；已经改了就把它当新内容重新送审（再跑一次 review --next）。`);
+    let raw = null; if (opt.claims) { try { raw = JSON.parse(String(opt.claims)); } catch { die('--claims 要写 JSON：[{"id":"C1","where":"证据第几行"},…]'); } }
+    const ca = claimAnswers(r, key, verdict, raw);
+    if (ca.error) die(`${key}：${ca.error}（单条回写用 --claims '<JSON>'）`);
     let out; try { out = applyReview(r, key, verdict, opt.note ? String(opt.note) : '', by,
-                                     { fp: evFingerprint(runDir(run), evPath) }); } catch (e) { die(e.message); }
+                                     { fp: evFingerprint(runDir(run), evPath), claims: ca.claims }); } catch (e) { die(e.message); }
     saveResult(run, r);
     const left = reviewItems(r).filter(i => i.rv.state === 'pending').length;
     console.log(`${verdict === 'ok' ? '✅' : '❌'} ${key} → ${verdict}${by === 'self' ? '（自审：不算独立复核，report 单列）' : ''}`
@@ -1138,7 +1150,7 @@ function cmdReview({ pos }) {
     r.shown ??= {};
     for (const it of pending) {
       r.shown[it.key] = evFingerprint(runDir(run), it.ev);   // 记下「复核人看到的是哪一版」
-      console.log(reviewPacket({ key: it.key, c, r, dir: runDir(run),
+      console.log(reviewPacket({ key: it.key, c, r, dir: runDir(run), words: claimWordsOf(CFG),
         expectOf: id => exps.find(e => e.id === id), nodeOf: nid => nodes.find(n => n.nodeId === nid) }) + '\n');
     }
     saveResult(run, r);
@@ -1150,7 +1162,7 @@ function cmdReview({ pos }) {
     if (!it) { console.log(`✅ ${run} 没有待复核的证据${rejected.length ? `（驳回 ${rejected.length} 条待处理）` : ''}`); return; }
     const nodes = allNodes(c), exps = allExpects(c);
     r.shown ??= {}; r.shown[it.key] = evFingerprint(runDir(run), it.ev); saveResult(run, r);
-    console.log(reviewPacket({ key: it.key, c, r, dir: runDir(run),
+    console.log(reviewPacket({ key: it.key, c, r, dir: runDir(run), words: claimWordsOf(CFG),
       expectOf: id => exps.find(e => e.id === id), nodeOf: nid => nodes.find(n => n.nodeId === nid) }));
     console.log(`\n回写：acceptkit review ${run} --item '${it.key}' --verdict <v> [--note "<理由>"] --by blind`);
     console.log(`（待复核共 ${pending.length} 条）`);
@@ -1184,7 +1196,15 @@ function rqScan({ demand, run }) {
     if (r.superseded_by) continue;                       // 被取代的轮次不补审（与 cmdReview 同口径）
     if (demand && (r.demand?.id || demandOfRun?.(d)) !== demand) continue;
     const items = reviewItems(r, { any: true, dir: runDir(d) });
-    const pending = items.filter(i => i.rv.state === 'pending');
+    // 机判 ok 的、断言说的效果又比观测读到的宽：机判只证明谓词，主张没人核过 —— 照样排进盲审（老运行里这样关掉的复核也在内）
+    let exps = null;
+    const wide = i => {
+      if (i.rv.state !== 'ok' || i.rv.by !== 'machine' || i.scope.startsWith('step:') || r.results?.[i.scope]?.status !== 'pass') return false;
+      try { exps ??= allExpects(loadCase(r.case_ref || r.case)); } catch { return false; }
+      const e = exps.find(x => x.id === i.scope);
+      return !!e && uncoveredClaims(e, { ops: loadOps(), platform: r.platform, words: claimWordsOf(CFG), usedOp: r.results[i.scope].observed?.op }).missing.length > 0;
+    };
+    const pending = items.filter(i => i.rv.state === 'pending' || wide(i));
     const rejected = items.filter(i => i.rv.state !== 'pending' && i.rv.state !== 'ok');
     if (!pending.length && !rejected.length) continue;
     out.push({ run: d, r, pending, rejected });
@@ -1249,7 +1269,7 @@ function cmdReviewQ({ pos }) {
         const fp = evFingerprint(runDir(run), it.ev);
         // 包的内容 = 断言/步骤文字 + note + 证据原文。只按证据指纹命名会在「证据没变、note 改了」时命中旧包，
         // 复核人看到的是旧 note。⇒ 文件名再带上包内容本身的哈希。
-        const body = reviewPacket({ key: it.key, c, r, dir: runDir(run),
+        const body = reviewPacket({ key: it.key, c, r, dir: runDir(run), words: claimWordsOf(CFG),
           expectOf: id => exps.find(e => e.id === id), nodeOf: nid => nodes.find(x => x.nodeId === nid) }) + '\n';
         const ph = createHash('sha1').update(body).digest('hex').slice(0, 8);
         const f = join(dir, rqPacketName(it.key, `${fp}-${ph}`));
@@ -1267,6 +1287,7 @@ function cmdReviewQ({ pos }) {
     console.log(`📦 盲审包：本次 ${index.length} 份（新写 ${made} · 命中缓存 ${hit}）${n < totP ? `；队列共 ${totP}，--limit 截到 ${n}` : ''}`);
     console.log(`   清单：${idx}`);
     console.log(`   回写：每行 {"run","key","verdict","note"} 写进一个 .jsonl → acceptkit reviewq --apply <文件> --by blind`);
+    console.log(`         包里列了主张清单的，判 ok 那行还要带 "claims":[{"id":"C1","where":"证据第几行"},…]，每条都要有`);
     return JSON_MODE ? reviewPackCard({ index: idx, made, cached: hit, packets: index.map(x => ({ run: x.run, key: x.key, packet: x.packet })) }) : undefined;
   }
 
@@ -1294,6 +1315,19 @@ function cmdReviewQ({ pos }) {
   if (totP) console.log(`\n下一步：acceptkit reviewq --pack${demand ? ' --demand ' + demand : ''}  → 交独立 subagent → acceptkit reviewq --apply <verdicts.jsonl> --by blind`);
 }
 
+// 主张两条以上的断言判 ok：每条主张都要写出在证据哪里看到；有一条找不到就不是 ok。
+// 以前盲审把「判定里有 alert 这个动作名」当成了「弹窗出来了」，整体判 ok，没人逐条对过。reviewq --apply 和 review --item 共用这一道。
+function claimAnswers(r, key, verdict, raw) {
+  const scope = key.split('::')[0];
+  if (verdict !== 'ok' || scope.startsWith('step:')) return { claims: null };
+  const need = reviewClaims(allExpects(loadCase(r.case_ref || r.case)).find(x => x.id === scope), claimWordsOf(CFG));
+  if (!need.length) return { claims: null };
+  const got = new Map((Array.isArray(raw) ? raw : []).map(x => [String(x?.id), String(x?.where || '').trim()]));
+  const lack = need.filter(x => !got.get(x.id) || /^(不存在|没有|无|找不到|未找到|n\/?a|none|-)$/i.test(got.get(x.id)));
+  if (lack.length) return { error: `判 ok 要逐条写出每条主张在证据哪里（claims:[{"id":"C1","where":"…"}]）；${lack.map(x => `${x.id}「${x.text.slice(0, 30)}」`).join('、')} 没答或答了找不到 —— 找不到就判 insufficient，note 写是哪一条` };
+  return { claims: need.map(x => ({ ...x, where: got.get(x.id) })) };
+}
+
 function rqApply(file, opt) {
   if (file !== '-' && !existsSync(file)) die(`--apply 指向的文件不存在：${file}`);
   const text = file === '-' ? readFileSync(0, 'utf8') : readFileSync(file, 'utf8');
@@ -1316,7 +1350,9 @@ function rqApply(file, opt) {
     const evPath = key.split('::').slice(1).join('::');
     const now = evFingerprint(runDir(run), evPath), shown = r.shown?.[key];
     if (shown && now && shown !== now) { refuse(i + 1, `${run} ${key}：复核人看到的 ${shown} ≠ 现在的 ${now}，先 --pack 重新出包`, v); continue; }
-    const out = applyReview(r, key, verdict, note, by, { fp: now });
+    const ca = claimAnswers(r, key, verdict, v.claims);
+    if (ca.error) { refuse(i + 1, `${run} ${key}：${ca.error}`, v); continue; }
+    const out = applyReview(r, key, verdict, note, by, { fp: now, claims: ca.claims });
     if (out.reverted) reverted++;
     ok++; log.push({ at: new Date().toISOString(), run, key, verdict, note, by, fp: now, reverted: out.reverted || null });
     results.push({ line: i + 1, run, key });
@@ -1378,8 +1414,10 @@ function cmdObserve({ pos }) {
   }
   if (!JSON_MODE) {
     const blocked = [];
-    for (const id of ids) if (observeOne(run, r, c, id, opt)?.held) blocked.push(id);
+    const badPick = [];
+    for (const id of ids) { const h = observeOne(run, r, c, id, opt)?.held; if (h === 'bad_pick') badPick.push(id); else if (h) blocked.push(id); }
     saveResult(run, r);
+    if (badPick.length && !blocked.length) die(`${badPick.join('、')} 没记：判据的 pick 取到的是对象，见上面每条的改法`);
     if (blocked.length) die(`${blocked.join('、')} 判定出来了但没记：这个运行里还没有一张 app 操作截图。先截图，再重跑 observe。\n${shotPlaybook(shotCtx(run, r)).join('\n')}`);
     return;
   }
@@ -1389,7 +1427,7 @@ function cmdObserve({ pos }) {
   for (const id of ids) {
     const tried = (r.results?.[id]?.attempts || []).length;
     let got; try { got = observeOne(run, r, c, id, opt); } catch (e) { if (!(e instanceof Refused)) throw e; refused.set(id, e.message); continue; }
-    if (got?.held) { refused.set(id, heldWhy); held = true; continue; }
+    if (got?.held) { refused.set(id, got.held === 'bad_pick' ? '判据的 pick 取到的是对象，判不了：改用例，把 pick 写到值上' : heldWhy); held = true; continue; }
     const a = (r.results?.[id]?.attempts || [])[tried];
     if (a) refused.set(id, `${ATTEMPT_WORDS[a.outcome] || a.outcome}${a.why ? `：${a.why}` : ''}，没改记录${a.shot ? `（这一刻的截图 ${a.shot}）` : ''}`);
   }
@@ -1629,6 +1667,18 @@ function webCli(args) {
   try { return JSON.parse(line); } catch { return { ok: false, error: `web 载体没有返回 JSON：${(x.stderr || x.stdout || '').slice(0, 300)}` }; }
 }
 const webPort = (params = {}, recipe = {}, ctx = {}) => String(params.port || recipe.port || process.env.ACCEPTKIT_WEB_PORT || appOf('web', ctx).port || '');
+// 一个验收运行一个标签页（记在运行结果 browser.target）：observe / shot 只连它。
+// 以前连的是端口上「当前那个标签页」：上一个运行留下的页面被下一个运行截进去当结论图（实测一个纯接口用例的 5 张结论图拍的全是别的运行的发布单）。
+// res：调用方手里的运行结果（observe 末尾会整份写回，在这里改它才不会被覆盖）；不给就现读现写。
+function runTab(run, port, { res = null, url = null } = {}) {
+  const r = res || loadResult(run);
+  const cur = r.browser && String(r.browser.port) === String(port) ? r.browser.target : null;
+  const x = webCli(['tab', '--port', String(port), ...(cur ? ['--target', cur] : []), ...(url ? ['--url', url] : [])]);
+  if (!x.ok) return { error: `开不了运行 ${run} 自己的标签页：${x.error}` };
+  if (x.target !== cur) { r.browser = { port: Number(port), target: x.target, opened_at: new Date().toISOString() }; if (!res) saveResult(run, r); }
+  return { target: x.target, fresh: !!x.fresh };
+}
+const blankTabHint = run => `运行 ${run} 自己的标签页刚开、还是空白：先在里面打开要验的页面 —— acceptkit browser --run ${run} <网址>（登录态和这个浏览器里别的标签页共用），或在观测配方里写 url`;
 const webTab = (params = {}, recipe = {}, ctx = {}) => String(params.tab || recipe.tab || appOf('web', ctx).tabMatch || '');
 const BUILTIN_OBSERVERS = {
   ui: execObserveUI,
@@ -1641,16 +1691,39 @@ const BUILTIN_OBSERVERS = {
     const ts = new Date().toISOString().replace(/[-:]/g, '').slice(0, 15);
     const rel = `shots/obs-${ctx.id || 'x'}-${ts}.ui.png`;
     mkdirSync(join(dir, 'shots'), { recursive: true });
-    const args = ['observe', '--port', port, '--eval', expr, '--out', join(dir, rel)];
-    const tab = webTab(params, recipe, ctx); if (tab) args.push('--tab', tab);
-    if (params.url || recipe.url) args.push('--url', String(params.url || recipe.url).replace(/\{project\}/g, ROOT));   // {project} = 项目目录（本地页面用 file://{project}/…）
+    // 不在界面上验的断言（via=cli 读接口等）没有页面结论：不出页面截图，免得一张无关的页面图冒充结论图
+    const e0 = ctx.c ? allExpects(ctx.c).find(x => x.id === ctx.id) : null;
+    const pageShot = !e0 || viaOf(e0) === 'ui';
+    const args = ['observe', '--port', port, '--eval', expr, ...(pageShot ? ['--out', join(dir, rel)] : [])];
+    const url = params.url || recipe.url;
+    if (ctx.run) {
+      const t = runTab(ctx.run, port, { res: ctx.res });
+      if (t.error) return { error: t.error };
+      if (t.fresh && !url) return { error: blankTabHint(ctx.run) };
+      args.push('--target', t.target);
+    } else { const tab = webTab(params, recipe, ctx); if (tab) args.push('--tab', tab); }
+    if (url) args.push('--url', String(url).replace(/\{project\}/g, ROOT));   // {project} = 项目目录（本地页面用 file://{project}/…）
     if (params.wait_ms || recipe.wait_ms) args.push('--wait', String(params.wait_ms || recipe.wait_ms));
     const r = webCli(args);
     if (!r.ok) return { error: `web 观测失败：${r.error || '未知错误'}` };
     const meta = { kind: 'ui_observe', platform: 'web', run: ctx.run, op: ctx.op, port, url: r.url, page_title: r.title,
-                   at: new Date().toISOString(), texts_read: r.value, obscuring_check: r.obscuring_check };
-    const shotOk = existsSync(join(dir, rel)) && statSync(join(dir, rel)).size > 1024;
+                   at: new Date().toISOString(), texts_read: r.value, obscuring_check: r.obscuring_check, ...(r.reveal ? { reveal: r.reveal } : {}) };
+    let shotOk = pageShot && existsSync(join(dir, rel)) && statSync(join(dir, rel)).size > 1024;
     const hints = [];
+    if (!pageShot) hints.push(`（${ctx.id} 不在界面上验，没有页面结论，不出结论截图）`);
+    // 结论图要拍到读到的值：页面上一个也找不到、或找到了却滚不进视口 → 这张图证明不了结论，不当结论图
+    if (shotOk && r.reveal && r.reveal.found && !r.reveal.found.length && r.reveal.missing?.length) {
+      shotOk = false; hints.push(`截图里找不到读到的值（${r.reveal.missing.slice(0, 3).join(' / ')}）：读值不是从这个画面上来的，这张图不当结论图。先把显示这些值的页面打开（acceptkit browser --run ${ctx.run} <网址>），再重跑 observe`);
+    } else if (shotOk && r.reveal?.in_view === false) {
+      shotOk = false; hints.push('读到的值在页面上，但滚不进视口：这张图拍不到它，不当结论图');
+    }
+    // 同一运行里别的断言的结论图和这张逐字节相同：多半是同一屏顶部，拍不到各自的判据
+    if (shotOk) {
+      const h = createHash('md5').update(readFileSync(join(dir, rel))).digest('hex');
+      const twin = readdirSync(join(dir, 'shots')).find(f => f !== rel.slice(6) && /^obs-.+\.ui\.png$/.test(f) && !f.startsWith(`obs-${ctx.id}-`)
+        && createHash('md5').update(readFileSync(join(dir, 'shots', f))).digest('hex') === h);
+      if (twin) { meta.same_as = `shots/${twin}`; hints.push(`这张结论图和 ${twin} 一模一样：两条断言的判据不该在同一屏的同一处，核对截到的是不是各自的判据`); }
+    }
     if (shotOk) {
       // 和 ui 通道同一道纯色闸。读值来自页面结构不是图，所以「图上认得出」要 OCR 在截图上找到读到的字
       const words = [];
@@ -1750,7 +1823,7 @@ function observeOne(run, r, c, id, opt) {
       if (!existsSync(src)) die(`--from-file 不存在：${src}`);
       return { raw: readFileSync(src, 'utf8'), cmdLine: `（离线复判）读取已采集的原始输出 ${src.startsWith(dir) ? src.slice(dir.length + 1) : src}` };
     }
-    return execObserve(rc, params, dir, r.device?.key ? liveAddress(run, r) : r.device?.udid, { run, id, c, op: o.op, platform: plat });
+    return execObserve(rc, params, dir, r.device?.key ? liveAddress(run, r) : r.device?.udid, { run, id, c, op: o.op, platform: plat, res: r });
   };
   const parse = (x) => {
     if (x.error) return { error: x.error };
@@ -1818,6 +1891,14 @@ function observeOne(run, r, c, id, opt) {
     status = 'blocked'; reason = `前提不成立，无从判定：${badG.gd.why || '输入/阳性对照没有出现'}`;
   } else {
     for (const x of gs) lines.push(`前提 ${x.gd.pick} = ${JSON.stringify(x.V).slice(0, 300)}  → 成立`);
+    // pick 落在对象上（例：read.hit 是 {"_":[…]}）时，any_match 拿到的是 "[object Object]"，静默判不成立。这是判据写错了，不是被测物的结论：不记，点名改法
+    const objPick = (usedChecks || []).map(ch => [ch, pick(pm.data, ch.pick)]).find(([ch, V]) => !['nonempty', 'empty', 'count_gt'].includes(Object.keys(ch.predicate || {})[0])
+      && [].concat(V).some(v => v && typeof v === 'object' && !Array.isArray(v)));
+    if (objPick) {
+      const [ch, V] = objPick, keys = Object.keys([].concat(V).find(v => v && typeof v === 'object') || {});
+      console.log(`⏸ ${id} 没记：判据 ${ch.pick} 取到的是对象（键：${keys.join(' / ') || '无'}），${Object.keys(ch.predicate)[0]} 判不了对象 —— 改用例，把 pick 写到值上（例：${ch.pick}.${keys[0] || '<键>'}）`);
+      return { held: 'bad_pick', status: null };
+    }
     const res = (usedChecks || []).map(ch => {
       const V = pick(pm.data, ch.pick); const ok = evalPredicate(V, ch.predicate);
       lines.push(`${ch.pick} = ${JSON.stringify(V).slice(0, 300)}  → ${ok ? '成立' : '不成立'}（要求 ${fmtPred(ch.predicate)}）`);
@@ -1899,10 +1980,16 @@ function observeOne(run, r, c, id, opt) {
     if (b && !b.reported) console.error(`   📮 已登记阻塞 ${b.id}（${id}）—— 补解锁条件与复盘后 acceptkit blockers ${demand} --raise`);
   } else closeBlockersOn(run, r, c, id, status);
   r.reviews ??= {};
+  // 机判只证明「谓词成立」。断言说的效果（弹窗 / 拦截 / 上报……）比谓词读到的那一层宽时，不能由工具自己把复核关掉：
+  // 实测一条「拦截 + 弹窗」只读了判定里的动作名，机判 ok 关掉了复核，从没进盲审，弹窗有没有出来没人看过。这种排进盲审，逐条主张去核。
+  const wide = status === 'pass' ? uncoveredClaims(e, { ops: loadOps(), platform: plat, host, words: claimWordsOf(CFG), usedOp }).missing : [];
+  const wideNote = wide.length ? `断言说的比观测读到的宽（${wide.map(fmtMissing).join('；')}）：机判只证明谓词成立，交盲审逐条核主张` : '';
+  if (wideNote) console.error(`   🔎 ${id}：${wideNote}`);
   for (const x of cur.evidence) {
     const k = rkey(id, x);
     // 带内容指纹：没有 fp 的机判会在下一次 record 对账时被当成「没记指纹」作废（observe 之后再 record 补证据，obs 证据会被打回 pending）
-    if (evs.includes(x)) r.reviews[k] = { state: 'ok', by: 'machine', note: 'observe 谓词机判：原文与判定由工具产出', at: new Date().toISOString(), fp: evFingerprint(runDir(run), x) };
+    if (evs.includes(x)) r.reviews[k] = wideNote ? { state: 'pending', at: new Date().toISOString(), note: wideNote }
+      : { state: 'ok', by: 'machine', note: 'observe 谓词机判：原文与判定由工具产出', at: new Date().toISOString(), fp: evFingerprint(runDir(run), x) };
     else if (changed && r.reviews[k]) r.reviews[k] = { state: 'pending', at: new Date().toISOString(), note: '判定变了，旧复核作废' };
   }
 }
@@ -2064,7 +2151,7 @@ function cmdReport({ pos }) {
   // 没有 app 内真实截图的验收不被接受 —— 每条 pass/fail 都要挂一张
   // UI 通道在读到判据那一刻截的 app 图（sidecar kind=ui_observe）；文本证据照留，但单有文本不算验收完。
   // 判据和看板、next 是同一份（evidence-gate assertionGaps）：报告说是缺口的，看板上就不会是「通过」
-  const AG = assertionGaps(runDir(run), res, { expects: exps, ops: loadOps() });
+  const AG = assertionGaps(runDir(run), res, { expects: exps, ops: loadOps(), words: claimWordsOf(CFG) });
   const gapNoUiShot = exps.filter(e => AG[e.id]?.includes('no_ui_shot')).map(e => e.id);
   const gapNotCollected = exps.filter(e => AG[e.id]?.includes('not_tool_collected')).map(e => e.id);
   const gapCount = gapNoEv.length + gapFailNoShot.length + gapStepNoShot.length + gapNoVisual.length + gapNoAppShot.length + gapNoProvenance.length
@@ -2306,7 +2393,7 @@ function cmdSteps({ pos }) {
 // probe 把调查也纳入 acceptkit：一步生成最小调查 case(可后续 record --step 追加节点/断言)+ run，
 // 走一样的 record/report/证据闸门/看板收口。调查不再是工具之外的野路子。
 function cmdProbe({ pos }) {
-  const slug = pos[0] || die('用法：acceptkit probe <slug> [标题] --demand <D-id> [--demand-title "…"] --platform ios|android');
+  const slug = pos[0] || die('用法：acceptkit probe <slug> [标题] --demand <D-id> [--demand-title "…"] --platform ios|android [--host <宿主>]');
   const title = pos.slice(1).join(' ') || `调查：${slug}`;
   const { opt } = parseArgs(process.argv.slice(3));
   const caseId = `probe-${slug}`;
@@ -2315,8 +2402,19 @@ function cmdProbe({ pos }) {
     const demand = resolveDemand(opt, '新建调查');
     const platform = opt.platform ? String(opt.platform) : (loadPlan(ROOT, demand.id)?.platform || die(`新建调查要给 --platform ${PLATFORMS.join('|')}（需求 ${demand.id} 的评审单也没声明平台）`));
     if (!PLATFORMS.includes(platform)) die(`--platform 只能是 ${PLATFORMS.join('|')}`);
+    // 宿主：--host 优先；没给就看这条需求评审单里同平台的用例是不是都在同一个宿主上跑。不写宿主，选设备不按宿主筛，
+    // 会挑中、甚至开起一台装着别的 app 的模拟器（实测：要在主 App 上取证，先后开了两台示例 App 的小模拟器）
+    const hostIds = Object.keys(CFG.hosts || {});
+    let host = opt.host ? String(opt.host) : null;
+    if (host && hostIds.length && !hostIds.includes(host)) die(`没有登记宿主 ${host}（已登记：${hostIds.join(' / ')}）`);
+    if (!host) {
+      const plan = loadPlan(ROOT, demand.id);
+      const hs = new Set([...(plan ? planCases(plan) : [])].map(n => { try { return hostOfCase(loadCase(n), platform); } catch { return null; } }).filter(Boolean));
+      if (hs.size === 1) host = [...hs][0];
+      else if (hostIds.length > 1) console.error(`⚠️  没给 --host，需求 ${demand.id} 的用例在 ${hs.size ? [...hs].join(' / ') : '（没有用例）'} 上跑，推不出这次在哪个宿主上：选设备不按宿主筛。要在某个 App 上取证就加 --host <宿主>`);
+    }
     const tpl = {
-      case: caseId, title, kind: 'probe', platform, origin: { id: demand.id, title: demand.title },
+      case: caseId, title, kind: 'probe', platform, ...(host ? { host } : {}), origin: { id: demand.id, title: demand.title },
       note: '调查/复现型 run。节点边查边加：acceptkit record <run> --step <nodeId> --evidence ...；结论断言直接 record --expect FINDING1 --status fail/pass。',
       classifications: { phase: ['repro', 'root-cause', 'verify'] },
       tree: [{
@@ -3234,6 +3332,8 @@ function cmdDeviceAcquire({ opt }) {
   const { decl, plats, host, caseNeed } = runDeviceNeeds(r);
   if (!plats.length) refuse(decl.includes('web') ? `运行 ${run} 是 web 用例，不占设备：直接 acceptkit shot ${run} --web` : `运行 ${run} 的用例没声明 ios / android 平台，选不了设备：给用例写 platform`);
   const need = { ...caseNeed, ...parseNeed(opt.need) };
+  // --need host=<宿主>：按宿主挑机器（和用例的 host 同一道筛），不是设备能力 —— 当能力传下去只会「读不到」被忽略
+  if (need.host) { const hostIds = Object.keys(CFG.hosts || {}); if (hostIds.length && !hostIds.includes(need.host)) refuse(`没有登记宿主 ${need.host}（已登记：${hostIds.join(' / ')}）`); for (const p of plats) host[p] = need.host; delete need.host; }
   const holder = opt.holder ? String(opt.holder) : (r.session || `run ${run}`);
   const exclude = new Map((r.device_rejects || []).map(x => [x.key, x.why]));
 
@@ -3242,7 +3342,14 @@ function cmdDeviceAcquire({ opt }) {
   if (bound) {
     const [, l] = findLease(loadLeases(), bound);
     const s = stateOf(bound);
-    if (l && l.run === run && s.connected && s.state === '已开机') { touchLease(bound, run); restamp(run, bound); return out(deviceCardOf(run, leaseKeyOf(bound), s, '已经占着', host[s.platform || plats[0]])); }
+    if (l && l.run === run && s.connected && s.state === '已开机') {
+      // 已占的这台也要过这次的要求：以前直接原样返回，--need host=… 被静默忽略，执行者在不对的宿主上接着跑
+      const p0 = s.platform || plats[0], want = host[p0], hs = deviceHosts(s.profile);
+      const fit = ANDROID.profileMeets(s.profile, need);
+      const unmet = [...(want && hs.length && !hs.includes(want) ? [`装的宿主是 ${hs.join('/')}，这次要 ${want}`] : []), ...(fit.ok === false ? [`能力不满足：${fit.unmet.join('、')}`] : [])];
+      if (unmet.length) refuse(`运行 ${run} 占着的 ${leaseKeyOf(bound)} 不满足这次的要求：${unmet.join('；')}。\n   换机：acceptkit device reject ${leaseKeyOf(bound)} --run ${run} --why "<为什么不行>"（放掉它、这个运行不再选它），再 device acquire --run ${run}`);
+      touchLease(bound, run); restamp(run, bound); return out(deviceCardOf(run, leaseKeyOf(bound), s, '已经占着', want));
+    }
   }
   // 一个需求同一平台只用一台：同需求别的运行占着一台，就接过来用；要第二台得 --parallel 给理由，核对过才另选
   if (bound && opt.parallel) refuse(`运行 ${run} 已经绑定 ${bound}，一次 run 只打一台。要双跑：另开一个运行（acceptkit run ${r.case} --demand ${demandIdOf(r)}），在那个运行上 acquire --parallel`);
@@ -3766,7 +3873,7 @@ function cmdShotWeb({ pos, opt }, run) {
   const png = join(sdir, base + '.png');
   const allow = opt['allow-obscured'] ? String(opt['allow-obscured']) : '';
   const args = ['shot', '--port', port, '--out', png, ...(allow ? ['--force', '1'] : [])];
-  const tab = webTab(opt, {}, ctx); if (tab) args.push('--tab', tab);
+  { const t = runTab(run, port); if (t.error) die(`shot: ${t.error}`); if (t.fresh) die(`shot: ${blankTabHint(run)}`); args.push('--target', t.target); }
   const r = webCli(args);
   if (!r.ok) die(`shot: web 截图失败：${r.error}`);
   const obs = r.obscuring_check || { ok: false, unknown: true, reason: '没有返回遮蔽层检查结果' };
@@ -3913,7 +4020,7 @@ function planQuality(plan) {
 }
 
 function cmdPlan({ pos }) {
-  const sub = pos[0] || die('用法：acceptkit plan <new|show|review|check|approve|return|add-case|finding|decide|bounce|settle|recheck> <demand> [..]\n       review = 给人读的评审稿（这次动了什么 → 所以验什么 → 挑几条真实断言展开），--out <file> 落盘');
+  const sub = pos[0] || die('用法：acceptkit plan <new|show|review|check|approve|return|add-case|build|finding|decide|bounce|settle|recheck> <demand> [..]\n       build = 记被测包（--build <组件>@<版本>[#<版本线>],…），事前评价按它剔掉不适用的断言\n       review = 给人读的评审稿（这次动了什么 → 所以验什么 → 挑几条真实断言展开），--out <file> 落盘');
   const demand = pos[1] || die('缺 <demand>（例：D1）');
   const { opt } = parseArgs(process.argv.slice(4));
   let plan = loadPlan(ROOT, demand);
@@ -3925,6 +4032,7 @@ function cmdPlan({ pos }) {
     if (opt.title) registerDemand(ROOT, { id: demand, title: String(opt.title), desc: opt.desc ? String(opt.desc) : '' });
     plan = { demand, title: opt.title ? String(opt.title) : demandTitle(demand),
              platform,   // ios | android；只对本平台报「操作缺实现」，并要求点名的用例在该平台可执行
+             ...(opt.build ? { build: (() => { try { parseBuild(opt.build); } catch (e) { die(e.message); } return String(opt.build); })() } : {}),
              revision: 1, created_at: new Date().toISOString(), approved_by: null, approved_at: null,
              surfaces: [], not_covered: [], history: [] };
     const f = savePlan(ROOT, plan);
@@ -3937,8 +4045,17 @@ function cmdPlan({ pos }) {
   }
   if (!plan) die(`需求 ${demand} 还没有评审单 —— 先 acceptkit plan new ${demand}`);
 
+  // 被测包：评审阶段的事前评价按它剔掉不适用的断言（applies）。不改用例集合，不升版本、不要重批
+  if (sub === 'build') {
+    const b = opt.build || pos[2] || die(`用法：acceptkit plan build ${demand} --build <组件>@<版本>[#<版本线>],…`);
+    try { parseBuild(b); } catch (e) { die(e.message); }
+    plan.build = String(b); savePlan(ROOT, plan);
+    console.log(`✓ ${demand} 的被测包记为 ${plan.build}：plan check 的事前评价不再评不适用的断言`);
+    return;
+  }
   if (sub === 'add-case') {
     const sid = opt.surface ? String(opt.surface) : die('缺 --surface <S-id>');
+    if (opt.build) { try { parseBuild(opt.build); } catch (e) { die(e.message); } plan.build = String(opt.build); }
     const before = approvedCases(plan);
     let s = plan.surfaces.find(x => x.id === sid);
     if (!s) { s = { id: sid, change: '', reuse: [], new: [], ops: [], note: '' }; plan.surfaces.push(s); }
@@ -4295,8 +4412,13 @@ function cmdPlan({ pos }) {
       for (const f of plan.findings) console.log(`  ${f.id}  ${f.what}\n       ${f.detail}\n       要你定：${f.decide}${f.decided_by ? `\n       已定：${f.decided_by} —— ${f.decision}` : ''}`);
     }
     if (plan.history.length) { console.log(`\n  修订历史：`); for (const h of plan.history) console.log(`   v${h.revision} ${h.at.slice(0, 10)} ${h.by || ''} ${h.change}`); }
-    const drift = driftedCases(CASES, plan);
-    if (drift.length) console.log(`\n  ↻ ${drift.length} 条用例在批准后被改过内容：${drift.join(', ')} —— acceptkit plan recheck ${demand} --why ".."`);
+    const edits = caseEdits(ROOT, CASES, plan);
+    if (edits.length) {
+      console.log(`\n  ↻ ${edits.length} 条用例在批准后被改过内容 —— acceptkit plan recheck ${demand} --why ".."：`);
+      for (const x of edits) console.log(`   ${x.tier === 'ack' ? '⏸ 要 owner 认' : x.tier === 'unknown' ? '· 分不出（没留底稿）' : '· 事后通知'}  ${x.case}${x.changes.length ? '：' + x.changes.map(c => c.what).join('；') : ''}`);
+    }
+    { const recent = (plan.notices || []).slice(-10);
+      if (recent.length) { console.log(`\n  最近的用例改动（已记下）：`); for (const n of recent) console.log(`   ${n.at.slice(0, 16).replace('T', ' ')} ${n.case}${n.acked_by ? `（${n.acked_by} 认了）` : '（事后通知）'}：${n.changes.join('；') || '—'} —— ${n.why}`); } }
     if (warns.length) { console.log(`\n  ⚠️  ${warns.length} 处提示：`); for (const w of warns) console.log(`   · ${w}`); }
     if ((plan.surfaces || []).some(s => (s.new || []).length)) { console.log(`\n  评审时逐条问新建用例（机器判断不了）：`); for (const q of QUESTIONS) console.log(`   ? ${q}`); }
     { const ag = planAssessGate(plan, 'tool');
@@ -4325,6 +4447,7 @@ function cmdPlan({ pos }) {
     plan.approved_by = by; plan.approved_at = new Date().toISOString(); plan.approved_quote = quote;
     delete plan.returned;   // 批了就不再是「退回待改」
     plan.fingerprints = caseFingerprints(CASES, plan);   // 钉住用例内容，之后改了要显形；键 = 批过的用例
+    saveSnapshots(ROOT, CASES, plan, Object.keys(plan.fingerprints));   // 留底稿：之后改了能分出是事后通知还是要 owner 认
     savePlan(ROOT, plan);
     recordApproval(ROOT, { kind: 'plan', subject: demand, by, quote, detail: { revision: plan.revision, added, removed, assessments: Object.fromEntries(ag.res.map(a => [a.case, { id: a.id, score: a.total, gate: a.gate }])) } });
     console.log(`✅ ${demand} 评审单 v${plan.revision} 已批准（${by}）—— 现在可以 acceptkit run 了`);
@@ -4337,18 +4460,37 @@ function cmdPlan({ pos }) {
     // 🔴 **不清空批准**。用例是有唯一 id 的资产，需求 ref 的是 id，
     //    一个需求的用例只评审一次；改测试取值属于资产内容修订，不是需求范围变更。
     //    这里只做三件事：升 revision、把「谁在什么时候为什么改的」记进 history、重钉指纹。
-    const drift = driftedCases(CASES, plan);
-    if (!drift.length) { console.log(`✅ ${demand}: 用例内容与批准时一致，没有漂移`); return; }
-    if (!opt.why) die(`${drift.length} 条用例在批准后被改过：${drift.join(', ')}\n   重新钉指纹必须带 --why "<为什么改>"`);
-    plan.revision += 1;
-    plan.history.push({ revision: plan.revision, at: new Date().toISOString(), by: opt.by ? String(opt.by) : null,
-                        change: `用例内容更新：${drift.join(', ')} —— ${opt.why}` });
-    // 只重钉批过的那些：指纹的键就是「批过哪些」，在这里扩进新加的用例等于替 Owner 批了它们
-    plan.fingerprints = caseFingerprints(CASES, plan, Object.keys(plan.fingerprints));
-    savePlan(ROOT, plan);
-    console.log(`↻ ${demand} 升到 v${plan.revision}（${drift.length} 条用例内容更新，已重钉指纹）`);
-    console.log(`   批准状态**保持不变**（${plan.approved_at ? '已批准' : '未批准'}）—— 评审的单位是需求 ref 的用例 id 集合，不是用例的逐字内容。`);
-    console.log(`   改动已记进 history，看板上可见；要加/减用例 id 才走 plan add-case（那才是需求范围变更）。`);
+    // 改动分两档（plan-gate classifyCaseEdit）：只加不删的事后通知 owner、直接重钉；会改结论 / 范围的要 owner 本人认（--by --quote）
+    const only = opt.case ? new Set(String(opt.case).split(',')) : null;
+    const edits = caseEdits(ROOT, CASES, plan).filter(x => !only || only.has(x.case));
+    if (!edits.length) { console.log(`✅ ${demand}: 用例内容与批准时一致，没有改动`); return; }
+    if (!opt.why) die(`${edits.length} 条用例在批准后被改过：${edits.map(x => x.case).join(', ')}\n   重新钉指纹必须带 --why "<为什么改>"`);
+    const by = opt.by ? String(opt.by) : null, quote = opt.quote ? String([].concat(opt.quote).join(' ')) : null;
+    const ownerOk = by && quote && !SELF_DECIDER.test(by);
+    if (by && SELF_DECIDER.test(by)) die(`--by ${by} 是执行者自己。会影响结论的改动只能由 owner 本人认：把 plan show ${demand} 里的改动交给他，他同意后记他的名字和原话`);
+    const pin = edits.filter(x => x.tier !== 'ack' || ownerOk), held = edits.filter(x => x.tier === 'ack' && !ownerOk);
+    if (pin.length) {
+      plan.revision += 1;
+      plan.history.push({ revision: plan.revision, at: new Date().toISOString(), by,
+                          change: `用例内容更新：${pin.map(x => x.case).join(', ')} —— ${opt.why}` });
+      // 事后通知：只加不删的改动 owner 不用先批，但要看得到（plan show / 看板）
+      plan.notices = [...(plan.notices || []), ...pin.map(x => ({ at: new Date().toISOString(), case: x.case, tier: x.tier, why: String(opt.why),
+        changes: x.changes.map(c => c.what), ...(x.tier === 'ack' ? { acked_by: by, quote } : {}) }))].slice(-200);
+      if (pin.some(x => x.tier === 'ack')) recordApproval(ROOT, { kind: 'case_edit', subject: demand, by, quote, detail: { cases: pin.filter(x => x.tier === 'ack').map(x => ({ case: x.case, changes: x.changes })) } });
+      // 只重钉批过的那些：指纹的键就是「批过哪些」，在这里扩进新加的用例等于替 Owner 批了它们
+      const keep = Object.keys(plan.fingerprints), now = caseFingerprints(CASES, plan, keep);
+      for (const x of pin) if (keep.includes(x.case)) plan.fingerprints[x.case] = now[x.case];
+      saveSnapshots(ROOT, CASES, plan, pin.map(x => x.case).filter(n => keep.includes(n)));
+      savePlan(ROOT, plan);
+      console.log(`↻ ${demand} 升到 v${plan.revision}：${pin.length} 条用例的改动已记下`);
+      for (const x of pin) console.log(`   ${x.tier === 'ack' ? `✅ owner 认了` : x.tier === 'unknown' ? '· 批准时没留底稿，分不出改了什么' : '· 事后通知'}  ${x.case}${x.changes.length ? '：' + x.changes.map(c => c.what).join('；') : ''}`);
+    }
+    if (held.length) {
+      console.log(`\n⏸ ${held.length} 条改了会影响结论 / 范围的内容，owner 认了才能跑：`);
+      for (const x of held) console.log(`   ${x.case}：${x.changes.filter(c => c.tier === 'ack').map(c => c.what).join('；')}`);
+      console.log(`   把这几处交给 owner；他同意后：acceptkit plan recheck ${demand} --case ${held.map(x => x.case).join(',')} --by <他> --quote "<原话>" --why "<为什么改>"`);
+      console.log(`   不想等：改回去，只做加判据、换观测这类只加不删的改动`);
+    }
     return;
   }
   die(`未知子命令 ${sub}（new|show|review|check|approve|return|add-case|finding|decide|bounce|settle|recheck）`);
@@ -4562,7 +4704,7 @@ function consultOf(run, eid) {
   const e = allExpects(c).find(x => x.id === eid) || die(`用例 ${r.case} 里没有断言 ${eid}`);
   const v = r.results?.[eid] || {};
   const D = r.demand?.id || r.demand || null;
-  const gaps = assertionGaps(runDir(run), r, { expects: allExpects(c), ops: loadOps() })[eid] || [];
+  const gaps = assertionGaps(runDir(run), r, { expects: allExpects(c), ops: loadOps(), words: claimWordsOf(CFG) })[eid] || [];
   const b = D ? readBlockers(ROOT, D).filter(x => x.run === run && x.expect === eid && !x.resolved).pop() : null;
   const situation = v.status === 'blocked' ? 'blocked' : gaps.length ? 'gap' : (v.status || 'todo');
   const k = consultFor({ assert: e.assert, via: e.via, why_not_ui: e.why_not_ui, op: e.observe?.op || e.op, situation, gaps, unlock: b?.unlock || v.unlock, text: b?.text || v.actual });
@@ -4772,14 +4914,16 @@ function assessCase(name, { demand = null, platform = null, by = 'tool' } = {}) 
   const platforms = platform ? [platform] : normalizePlatforms(c).filter(p => RUNTIME_PLATFORMS.includes(p));
   // 带 ops 才跑得到 Q21（caseQuality 现在也带）
   const findings = checkCase(c, { packRules: PACK.qualityRules || [], extraKeys: CFG.quality?.extraKeys, cfg: CFG.quality || {}, hosts: CFG.hosts || {}, ops });
-  const items = AS.assessCasePre(c, { findings, ops, platforms });
+  // 评审单记了被测包（plan new / add-case --build）：不适用的断言不评
+  let build = null; if (demand) { const b = loadPlan(ROOT, demand)?.build; if (b) { try { build = parseBuild(b); } catch { /* 记坏了的按没记 */ } } }
+  const items = AS.assessCasePre(c, { findings, ops, platforms, build });
   const ex = new Map(allExpects(c).map(e => [e.id, e.assert]));
   return { case: name, ...persistAssessment({ kind: 'case', subject: name, phase: 'pre', basis: caseBasis(name), demand, items, assertOf: at => ex.get(at) || '', by }) };
 }
 function assessRun(run, { by = 'tool' } = {}) {
   const r = loadResult(run); const c = loadCase(r.case_ref || r.case);
   const exps = allExpects(c);
-  const gaps = assertionGaps(runDir(run), r, { expects: exps, ops: loadOps() });
+  const gaps = assertionGaps(runDir(run), r, { expects: exps, ops: loadOps(), words: claimWordsOf(CFG) });
   const pre = latestAssessment(ROOT, 'case', c.case, 'pre');
   const appN = Array.isArray(r.apparatus) ? r.apparatus.length : Object.keys(r.apparatus || {}).length;
   const items = AS.assessRunPost({ ...r, run }, { gaps, apparatus: appN,
