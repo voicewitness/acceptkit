@@ -16,7 +16,7 @@ description: |
 
 1. **要测哪个项目由用户决定。** 一台电脑上项目很多，不要猜。从项目目录启动时，把它作为默认选项让用户确认。
 2. **能发现的不问。** 设备、浏览器、工具链、占用情况、登录态先自己查；要问时先说你试过什么。
-3. **Agent 不能替用户批准任何东西。** 评审单批准、危险动作确认，都要用户本人点头，记下原话。
+3. **批准主体必须如实记录。** 通常评审单和危险动作由用户本人批准，记下原话。仅在用户明确授权执行者批准某类用例时，执行者可用 `plan approve --by <实际执行者> --quote <本次批准理由> --delegated-by <授权用户> --delegation-quote <授权原话> --delegation-scope <仓库及变更范围>` 批准范围内的评审单；不要伪称用户逐条批准。危险动作、产品行为拍板和强制合并不随用例批准一起授权。
 4. **结论只认证据。** 结果性证据走 `observe`（工具执行、原文落盘、谓词判定）；你手工 `record` 时要 `--quote` 证据原文里的片段。
 5. **说话不超出证据。** 证据只证明一部分，就只写那一部分；判不了就记 `blocked` 并写清卡在哪、怎么解锁。
    「判定里有 alert 这个动作」不等于「弹窗出来了」，「动作名里有 report」不等于「上报发出去了」：断言说的效果要有读到那一层的观测（用例检查 Q22），否则收窄说法。
@@ -104,11 +104,11 @@ acceptkit know profile                         # ⑧ 环境画像 + 缺口清单
 - `attention` 和别的卡片并存：attention 照样问，与它无关的卡片照常做。
 - **用户一回复，先记再做（第 0 步）。** 用户的话只在聊天里，工具看不到；你照着做了却没记，下一轮会把定过的事再问一遍。所以每张等回答的 attention 卡片都带 `on_reply`：
   评审单批准 → `plan approve`；finding 拍板 → `plan decide`（一句话回了几条就 `--finding F1,F2`，选了某个选项带 `--option`，看不懂 → `plan bounce`）；阻塞答复 → `blockers --ack`；放行设备 → `config add gate.allow` 再 `device acquire`。
-  `--by` 写他、`--quote` 照抄他的话；写成执行者自己会被拒。他的回答不要用 `plan settle --kind answered` 收：那是给查实的事实用的，会丢原话。
+  用户亲自批准时，`--by` 写他、`--quote` 照抄他的话。执行者获明确授权批准评审单时，按铁律 3 填写代理授权字段；其他回答仍只能记用户原话。他的回答不要用 `plan settle --kind answered` 收：那是给查实的事实用的，会丢原话。
 
 | 卡片 | 你做什么 |
 |---|---|
-| `attention` | 有事等人（批准评审单、拍板 finding、解除阻塞、加设备）：question 原样问用户；没有 question 的（还没提的阻塞）照 note 先 `blockers --raise`，把输出原样交给用户；用户回了，先跑 `on_reply` 记下他的原话 |
+| `attention` | 有事等人（批准评审单、拍板 finding、解除阻塞、加设备）：评审单在明确代理授权范围内按铁律 3 批准；其余 question 原样问用户；没有 question 的阻塞照 note 先 `blockers --raise`，把输出原样交给用户；用户回了，先跑 `on_reply` 记下他的原话 |
 | `plan_draft` / `finding_unclear` | 评审单没写完 / finding 写得 owner 定不了：照 detail 补，`plan check` |
 | `blocker_own` | 自己的能力缺口：补上后 `blockers --resolve`，或按 note 补登记、补上报。不知道输入从哪来、结果在哪看：先 `consult <运行> --expect E` |
 | `blocker_unasked` | 要用户答的阻塞，先写成他能拍板的问题再提：`blockers <D> --set B1,B2 --ask "<问句？>" --why-you "<你为什么解决不了>" --option "做法 => 后果" --option "…" --recommend "<选哪个、为什么>"`。解锁条件（下发侧要做什么、判据是什么）是给你自己看的，不是问题；同一件事卡住几条就一次写一组 |
@@ -158,7 +158,7 @@ acceptkit know profile                         # ⑧ 环境画像 + 缺口清单
 | 用户说 | 你做 |
 |---|---|
 | 贴需求 / bug / 一句话 | `plan new <D> --title "…" --platform …`，拆改动面：`plan add-case <D> --surface S1 --change "…" --reuse a,b --new c`，要产品定的行为变更写 `plan finding`（必须写清性质 / 影响 / 为什么 / 选项+后果 / 推荐，人话；同一件事有进展就 `--finding Fxx` 改写原条，不另开。见 `docs/finding-quality.md`） |
-| 「批准」 | 用户本人说的才算：`plan approve <D> --by <他> --quote "<他的原话>"`（attention 卡片的 on_reply 就是这条）。你不能自己批 |
+| 「批准」 | 默认记用户原话：`plan approve <D> --by <他> --quote "<他的原话>"`。明确授权执行者批准用例时，按铁律 3 记录授权和本次批准理由；不扩展到其他审批 |
 | 取证手段自己坏了 | 挂在断言上的：`record … --failure-of apparatus`（不能记 fail）；整轮的折腾：`apparatus <run> --what "…" --fix "…" [--cost N]`。看一眼本轮噪音量：`apparatus <run>` |
 | 「回归一下」 | `regress <D>`；代码变了先 `round new <D> --assess "…"`，评估要如实（看了多少就写多少） |
 | 「出报告」 | `report <run>`；`bug <run> --expect E` 出缺陷单 |

@@ -4590,7 +4590,16 @@ function cmdPlan({ pos }) {
   }
   if (sub === 'approve') {
     const by = opt.by ? String(opt.by) : die('缺 --by <谁批的> —— 评审是有人拍板的，不能是「系统自己批的」');
-    if (SELF_DECIDER.test(by)) die(`--by ${by} 是执行者自己。评审单只能由用户本人批：把 acceptkit plan review ${demand} 交给他，他同意后记他的名字和原话`);
+    const delegated = SELF_DECIDER.test(by);
+    const delegatedBy = opt['delegated-by'] ? String(opt['delegated-by']) : '';
+    const delegationQuote = opt['delegation-quote'] ? String(opt['delegation-quote']) : '';
+    const delegationScope = opt['delegation-scope'] ? String(opt['delegation-scope']) : '';
+    if (delegated) {
+      if (!delegatedBy || SELF_DECIDER.test(delegatedBy) || !delegationQuote || !delegationScope)
+        die('执行者批准须同时提供 --delegated-by <用户>、--delegation-quote "<授权原话>"、--delegation-scope <适用范围>');
+    } else if (delegatedBy || delegationQuote || delegationScope) {
+      die('用户本人批准时不得填写代理授权字段');
+    }
     const { errs } = checkPlan(plan, opsIndexForPlan(), knownCaseNames());
     errs.push(...planPlatformErrors(plan), ...planQuality(plan).errs);
     // 留着 not_covered 的旧单子在 checkPlan 里就是硬错，上面已拒；这里不再指向已废弃的 set-pending
@@ -4599,16 +4608,20 @@ function cmdPlan({ pos }) {
     const ag = planAssessGate(plan, 'tool');
     if (ag.refuse) die(`评审单不能批 —— ${ag.refuse}`);
     // 批准必须带批准人的原话：Agent 不能替人批准，原话是「确实有人批了」的唯一凭据。
-    const quote = opt.quote ? String([].concat(opt.quote).join(' ')) : die('缺 --quote "<批准人的原话>" —— 评审单只能由人批准，原话会记进审批记录');
+    const quote = opt.quote ? String([].concat(opt.quote).join(' ')) : die('缺 --quote "<批准理由或用户原话>"');
     // 审批记录写清这次批的是哪些变化（相对上次批准加了 / 摘了哪些用例）：一张单子批过好几版，
     // 每版只批它的增量，事后要能回答「这条用例是哪一次、谁、凭哪句原话批进来的」
     const { added, removed } = planDelta(plan), first = !approvedCases(plan).size;
     plan.approved_by = by; plan.approved_at = new Date().toISOString(); plan.approved_quote = quote;
+    if (delegated) plan.delegation = { by: delegatedBy, quote: delegationQuote, scope: delegationScope };
+    else delete plan.delegation;
     delete plan.returned;   // 批了就不再是「退回待改」
     plan.fingerprints = caseFingerprints(CASES, plan);   // 钉住用例内容，之后改了要显形；键 = 批过的用例
     saveSnapshots(ROOT, CASES, plan, Object.keys(plan.fingerprints));   // 留底稿：之后改了能分出按哪条自动批准规则记
     savePlan(ROOT, plan);
-    recordApproval(ROOT, { kind: 'plan', subject: demand, by, quote, detail: { revision: plan.revision, added, removed, assessments: Object.fromEntries(ag.res.map(a => [a.case, { id: a.id, score: a.total, gate: a.gate }])) } });
+    recordApproval(ROOT, { kind: 'plan', subject: demand, by, quote, detail: { revision: plan.revision, added, removed,
+      ...(delegated ? { delegation: plan.delegation } : {}),
+      assessments: Object.fromEntries(ag.res.map(a => [a.case, { id: a.id, score: a.total, gate: a.gate }])) } });
     console.log(`✅ ${demand} 评审单 v${plan.revision} 已批准（${by}）—— 现在可以 acceptkit run 了`);
     console.log(first ? `   放行的用例：${[...planCases(plan)].join(' ')}`
       : `   这次放行：${added.join(' ') || '（没有新加用例）'}${removed.length ? `；摘掉：${removed.join(' ')}` : ''}`);
