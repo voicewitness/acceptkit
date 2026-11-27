@@ -287,14 +287,16 @@ export const COMMANDS = [
     returns: 'finding 卡片' },
 
   { name: 'plan_approve',
-    description: '记下用户本人对评审单的批准。attention 卡片（subject=plan_approval）的 on_reply 就是它：用户回了同意的话，先调它记原话，再开跑。'
-      + '只记用户本人的批准：--by 写执行者自己会被拒；评审单有硬错时拒收。',
+    description: '记录用户本人批准，或记录用户明确授权范围内的执行者批准。执行者批准须附授权人、授权原话和适用范围；评审单有硬错时拒收。',
     input_schema: obj(['demand', 'by', 'quote'], {
       demand: DEMAND,
-      by: str('谁批的（用户本人）'),
-      quote: str('他的原话，照抄，别复述'),
+      by: str('实际批准人；执行者批准时如实填写 agent 身份'),
+      quote: str('用户原话或执行者本次批准理由'),
+      'delegated-by': str('可选：授权执行者批准的用户'),
+      'delegation-quote': str('可选：用户授权的原话'),
+      'delegation-scope': str('可选：授权适用的仓库和变更范围'),
     }),
-    argv: 'acceptkit plan approve {demand} --by {by} --quote {quote} --json',
+    argv: 'acceptkit plan approve {demand} --by {by} --quote {quote} [--delegated-by {delegated-by} --delegation-quote {delegation-quote} --delegation-scope {delegation-scope}] --json',
     returns: 'plan 卡片' },
 
   { name: 'plan_recheck',

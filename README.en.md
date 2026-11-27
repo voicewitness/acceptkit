@@ -10,7 +10,7 @@ acceptkit is a local acceptance-testing toolkit. Your coding agent (Claude Code,
 
 - **No evidence, no pass.** Observations are executed by the tool, saved verbatim and judged by rules. When the agent records something by hand, the text it quotes must be found in the evidence.
 - **The executor doesn't review itself.** Every evidence bundle goes to a blind review in a fresh context that only sees the evidence.
-- **Human decisions require the human's words.** A person approves which cases run; nothing runs before that. Questions that block execution go into a blocker ledger, and answers are stored as the person's own words. The agent cannot approve on their behalf.
+- **Record who actually approves.** A person normally approves which cases run. An executor may approve a plan only within a user's explicit delegation, recording the user's exact authorization, its scope, and the executor's reason. Nothing runs before approval; other human decisions still require the person's own words.
 - **Hooks enforce what a manual can't.** Booting or killing devices, installing packages, or editing acceptance records outside acceptkit gets blocked by host hooks.
 - **The tool decides what's next.** Each turn the agent asks `next` what is left and does one step from the returned card. All state is on disk, so another session or another agent can pick up where it stopped.
 

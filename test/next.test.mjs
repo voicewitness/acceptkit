@@ -47,6 +47,22 @@ test('需求不存在：拒收是一句能照着改的话，--json 输出 refuse
   assert.match(ak(dir, 'next', 'D9').stderr, /没有需求 D9/);
 });
 
+test('执行者只能在记录用户授权及适用范围后批准评审单', async () => {
+  const dir = project();
+  ok(dir, 'plan', 'new', 'D1', '--title', '首页问候', '--platform', 'web');
+  ok(dir, 'plan', 'add-case', 'D1', '--surface', 'S1', '--change', '首页加了问候语', '--reuse', 'c1', '--risk', '看不到问候', '--uncovered', '其他页');
+  const base = ['plan', 'approve', 'D1', '--by', 'codex', '--quote', '已核对变更和用例断言'];
+  assert.match(ak(dir, ...base).stderr, /--delegated-by/);
+  assert.match(ak(dir, ...base, '--delegated-by', 'agent', '--delegation-quote', '授权', '--delegation-scope', 'repo').stderr, /--delegated-by/);
+  const r = ok(dir, ...base, '--delegated-by', 'voicewitness', '--delegation-quote', '自行批准用例和执行', '--delegation-scope', 'songlelaile/20260606sanjie PR #81');
+  assert.match(r.stdout, /已批准/);
+  const plan = JSON.parse(readFileSync(join(dir, 'state/plans/D1.json'), 'utf8'));
+  assert.equal(plan.approved_by, 'codex');
+  assert.deepEqual(plan.delegation, { by: 'voicewitness', quote: '自行批准用例和执行', scope: 'songlelaile/20260606sanjie PR #81' });
+  const { listApprovals } = await import('../core/store/db.mjs');
+  assert.deepEqual(JSON.parse(listApprovals(dir, 'D1')[0].detail).delegation, plan.delegation);
+});
+
 test('一个需求从评审单到报告，每一步的卡片种类和顺序（报告由工具自动出）', () => {
   const dir = project();
   ok(dir, 'plan', 'new', 'D1', '--title', '首页问候', '--platform', 'web');
@@ -78,7 +94,7 @@ test('一个需求从评审单到报告，每一步的卡片种类和顺序（�
   // 批准只能记用户本人的：执行者自签拒收，--json 返回 plan 卡片
   const self = ak(dir, 'plan', 'approve', 'D1', '--by', 'executor', '--quote', '可以', '--json');
   assert.notEqual(self.status, 0);
-  assert.match(JSON.parse(self.stdout).refused, /用户本人/);
+  assert.match(JSON.parse(self.stdout).refused, /--delegated-by/);
   const pc = JSON.parse(ok(dir, 'plan', 'approve', 'D1', '--by', 'owner', '--quote', '可以', '--json').stdout);
   assert.equal(pc.kind, 'plan'); assert.equal(pc.approved, true); assert.equal(pc.quote, '可以');
   ok(dir, 'plan', 'decide', 'D1', '--finding', 'F1', '--by', 'owner', '--quote', '换行');
