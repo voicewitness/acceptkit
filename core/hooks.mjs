@@ -15,6 +15,7 @@ import { join, resolve, sep, basename, dirname } from 'node:path';
 import { readUserConfig, readConfig, REPO_ROOT, USER_CONFIG } from './project.mjs';
 import { loadLeases, loopBinding, listLoopBindings, unbindLoop, bindLoop, recordLoopStop } from './store/db.mjs';
 import { nextCards } from './next.mjs';
+import { WAIT_OWNER, HAS_ASK_ID } from './ask-gate.mjs';
 import * as ANDROID from '../adapters/android/device.mjs';
 import { runHook, verdictOf, hookProblems, installSnippet, install, configPath, HOST_IDS } from './host-hooks.mjs';
 
@@ -23,9 +24,10 @@ export const HOOKS = [
     // 所有发往设备的 adb / simctl 命令都过这道（不只装卸包）；命令是跑一个脚本文件的，脚本里的 adb 也算（见 guard_device）
     match: 'emulator[^|;&]*-avd|avdmanager[^|;&]*\\bcreate|simctl\\s|\\badb\\b|\\.avd/[^ ]*\\.lock|cp\\s[^|;&]*\\.avd|\\b(node|bash|sh|zsh|python3?)\\s+[^|;&]*\\.(mjs|cjs|js|sh|py)\\b|--(serial|device|udid|device-id)[=\\s]|\\bANDROID_SERIAL=' },
   { id: 'H2', event: 'before_tool', on: 'write', run: 'guard_state', mode: 'block', title: '验收记录只由 acceptkit 写',
-    match: 'runs/[^/]+/result\\.json$|/state/(plans|blockers|rounds|review)/|acceptkit\\.project\\.json$' },
+    match: 'runs/[^/]+/result\\.json$|/state/(plans|blockers|rounds|review)/|/\\.acceptkit/|acceptkit\\.project\\.json$' },
   { id: 'H3', event: 'stop', on: 'any', run: 'loop_next', mode: 'continue', title: '验收没做完别停' },
   { id: 'H4', event: 'prompt', on: 'any', run: 'loop_next', mode: 'remind', title: '用户提到验收：先 acceptkit next', match: '验收|验一下|测一下|回归|复现|跑用例' },
+  { id: 'H6', event: 'stop', on: 'any', run: 'guard_ask', mode: 'continue', title: '要 owner 回答的事先走 acceptkit ask' },
   { id: 'H5', event: 'before_tool', on: 'shell', run: 'guard_decide', mode: 'block', title: '看板的写入口只给用户本人',
     match: '/p/[^\\s\'"]*/decide|\\bak_decide\\b' },
 ];
@@ -208,6 +210,14 @@ const DECIDE = {
       + `起 / 选设备用 acceptkit device acquire --run <运行>；装包先过闸：acceptkit gate --action "<要做什么>" --sim ${hit[0]} --bundle <包名> --run <运行>（目标要显式给，闸不从文字里猜），过了就做（本 run 占着的设备不用再问用户）；卸载、清数据过闸要带理由：acceptkit gate --action "卸载 …" --reason <登记的理由 id> --why "<现场>"（没有登记的理由覆盖，闸会告诉你怎么问用户）；`
       + `关机：本 run 占着的 acceptkit device release <设备> --run <运行> --shutdown，acceptkit 起的、没人占着的 acceptkit device stop <设备>；`
       + `不要删 AVD 锁文件、不要克隆 AVD —— 要新设备请用户加进白名单（acceptkit config add gate.allow …）。不是在做验收：换一台不在验收白名单里的设备。` };
+  },
+  guard_ask(n) {
+    // 只管绑定了验收的会话；回复里在等 owner、却没带提问编号（Qn / Fn / Bn）→ 打回去：要问的先走入口，自己的活自己做
+    const b = findBinding(n); if (!b) return { decision: 'allow' };
+    const t = n.texts.join('\n');
+    if (!WAIT_OWNER.test(t) || HAS_ASK_ID.test(t)) return { decision: 'allow' };
+    return { decision: 'continue', reason: `你的回复在等 owner 回答，但没走提问入口。先判这是不是你自己的活（登录测试账号、本 run 设备上的操作、调试页 mock、重试、换取证手段、自己工具的毛病都是）—— 是就直接做；`
+      + `真要 owner 定：acceptkit ask ${b.demand} --question … --kind behavior|others|irreversible|risk --context … --why-you … --option "做法 => 后果" … --recommend …（入口会查项目知识和已答记录，该你做的会拒收）。拿到编号后回复里只写编号和待答几条，不复述问题` };
   },
   guard_decide() {
     return { decision: 'deny', reason: '看板的写入口（/decide）只给用户本人在页面上点：执行者从这里提交就是冒充他的批准 / 答复。'

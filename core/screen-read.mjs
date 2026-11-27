@@ -13,7 +13,9 @@ export function readPool(rd, { seq, texts, nodes }, fill = String) {
 
 // 画面上的文字和可点元素（uiautomator dump 的 XML）
 export function parseUiDump(xml) {
-  const attr = (tag, k) => (tag.match(new RegExp(` ${k}="([^"]*)"`)) || [])[1] || '';
+  // uiautomator quotes an attribute with ' when its value contains " (seen 2026-11-24: a text holding
+  // actions=["report"] came out as text='...'); reading only "..." dropped the whole text silently.
+  const attr = (tag, k) => { const m = tag.match(new RegExp(` ${k}=(?:"([^"]*)"|'([^']*)')`)); return m ? (m[1] ?? m[2] ?? '') : ''; };
   const nodes = [];
   for (const [tag] of xml.matchAll(/<node [^>]*>/g)) {
     const unesc = v => v.replace(/&(amp|lt|gt|quot|apos|#\d+);/g, (m, e) =>

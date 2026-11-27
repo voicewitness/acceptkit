@@ -170,12 +170,79 @@ export const COMMANDS = [
       step: str('操作节点编号，如 n1.2（acceptkit steps <用例> 看编号）'),
       evidence: list('证据，运行目录里的相对路径'),
       note: str('这一步做了什么、停在哪'),
+      capture: list('这一步真实产生的值，名=值（例：room_id=7301…）；判据里写 {step.<这一步>.<名>} 引用，不写死'),
       supersede: list('撤下这些挂错的证据'),
       'failure-of': str('note 里命中装置故障词时必填', { enum: ['subject', 'apparatus'] }),
       'allow-literal': str('读数确实是字面量时放行，写理由'),
     }),
-    argv: 'acceptkit record {run} --step {step} --evidence {evidence}... [--note {note}] [--supersede {supersede}...] [--failure-of {failure-of}] [--allow-literal {allow-literal}] --json',
+    argv: 'acceptkit record {run} --step {step} --evidence {evidence}... [--note {note}] [--capture {capture}...] [--supersede {supersede}...] [--failure-of {failure-of}] [--allow-literal {allow-literal}] --json',
     returns: 'step 卡片' },
+
+  { name: 'assess_pack',
+    select: 'pack',
+    description: '用例评审：打评审包。每条用例的事实（带 id）、各维度标准（0–3 分各什么样、要复述什么）、每项的分数上限和必答信号；交给新上下文的子 agent 盲审，结果写成 jsonl 再 --apply。',
+    input_schema: obj([], {
+      pack: { type: 'boolean', description: '打评审包' },
+      plan: str('需求：打包评审单里的全部用例'),
+      case: str('或者指定用例，逗号分隔'),
+      changed: { type: 'boolean', description: '只打包没盲审过或内容变了的项' },
+      limit: { type: 'integer', description: '最多几条用例' },
+    }),
+    argv: 'acceptkit assess --pack [--plan {plan}] [--case {case}] [--changed] [--limit {limit}] --json',
+    returns: '评审包 { card, rubric, how, cases: [{ case, facts, signals, items: [{ key, dim, at, cap, cap_facts, signals, fp }] }] }' },
+
+  { name: 'assess_apply',
+    select: 'apply',
+    description: '用例评审：提交盲审结果（jsonl，一行一项）。逐行核对：分数不越上限、复述的值是原文里的字、信号都回答、引用的事实在本项范围内、不到 3 分有能执行的 fix；考题打高了整批拒收。门槛只认 --by blind。',
+    input_schema: obj(['apply'], {
+      apply: str('jsonl 文件路径（- 读标准输入）'),
+      by: str('谁评的：blind = 新上下文的子 agent 只看评审包；self = 自评，只算草稿', { enum: ['blind', 'self'] }),
+    }),
+    argv: 'acceptkit assess --apply {apply} [--by {by}] --json',
+    returns: '{ accepted, refused, results: [{ line, key, ok | refused }] }' },
+
+  { name: 'assess_canary',
+    select: 'canary-add',
+    description: '登记一道考题：owner 判过不合格的步骤原文。打评审包时排在内置考题前面，盲审打得高过 max 整批拒收。',
+    input_schema: obj(['canary-add'], {
+      'canary-add': str('步骤原文（照抄 owner 判过不合格的那一句）'),
+      max: { type: 'integer', description: '这道题「能照着做」最多能给几分（0–2）' },
+      source: str('出处（例：哪个需求、哪次评审）'),
+      quote: str('owner 的原话'),
+    }),
+    argv: 'acceptkit assess --canary-add {canary-add} [--max {max}] [--source {source}] [--quote {quote}] --json',
+    returns: '{ id, text, max }' },
+
+  { name: 'assess_walk',
+    select: 'walk',
+    description: '逐节点走查：每条用例按树的顺序列出每一步（人话、操作展开、配置、触发来源）和每条预期（结论、因果、怎么看、判据），每个节点旁是评审分数，低于门槛的带理由；末尾核对看到的节点数。人或主 agent 按节点审一遍用。',
+    input_schema: obj([], {
+      walk: { type: 'boolean', description: '逐节点走查' },
+      plan: str('需求'),
+      case: str('或者指定用例，逗号分隔'),
+    }),
+    argv: 'acceptkit assess --walk [--plan {plan}] [--case {case}] --json',
+    returns: '{ cases: [{ case, status, nodes, text }] }' },
+
+  { name: 'assess_walk_done',
+    select: 'walk-done',
+    description: '逐节点走查签收：列出这条用例全部节点 nid 和预期 id（--seen，一个不缺），写走查结论。用例之后再改签收作废。接入评审门槛的项目，没签收不能批准、不能开跑。',
+    input_schema: obj(['walk-done', 'by', 'seen', 'notes'], {
+      'walk-done': str('用例'), by: str('走查的人'), seen: str('全部节点 nid 和预期 id，逗号分隔'), notes: str('看出了什么、改了什么'),
+    }),
+    argv: 'acceptkit assess --walk-done {walk-done} --by {by} --seen {seen} --notes {notes} --json',
+    returns: '{ case, fp, by, at, nodes, notes }' },
+
+  { name: 'assess_status',
+    select: 'status',
+    description: '用例评审状态：每条用例评审通过 / 未过 / 过期 / 只有自评 / 不完整，以及低于门槛的项（理由、fix）。',
+    input_schema: obj([], {
+      status: { type: 'boolean', description: '看评审状态' },
+      plan: str('需求'),
+      case: str('或者指定用例，逗号分隔'),
+    }),
+    argv: 'acceptkit assess --status [--plan {plan}] [--case {case}] --json',
+    returns: '{ cases: [{ case, status, counts, low: [{ key, dim, at, state, score, reason, fix }] }] }' },
 
   { name: 'reviewq',
     description: '盲审队列。--pack 出证据包，交给新上下文的子 agent 只看包下结论；它的结论原样写成 jsonl 再 --apply。执行者不复核自己。'
@@ -231,11 +298,10 @@ export const COMMANDS = [
     returns: 'plan 卡片' },
 
   { name: 'plan_recheck',
-    description: '批准后改过的用例重新钉住。只加不删的改动（加断言 / 判据 / 前提、换观测用的操作、改步骤和说明）直接记下、事后通知 owner；'
-      + '会改结论或范围的（删断言、改断言原文、删改判据、改适用范围、声明某个词不算效果）要 owner 本人认：带 --by --quote，attention 卡片（subject=case_edit）的 on_reply 就是它。--by 写执行者自己会被拒。',
-    input_schema: obj(['demand', 'why'], { demand: DEMAND, why: str('为什么改'), case: str('只处理这几条用例（逗号分隔）'),
-      by: str('认这次改动的人（owner 本人；只加不删的改动不用）'), quote: str('他的原话，照抄') }),
-    argv: 'acceptkit plan recheck {demand} --why {why} [--case {case}] [--by {by}] [--quote {quote}] --json',
+    description: '批准后改过的用例按自动批准标准记下，不找 owner（他批的是验什么，批过就作数）。只加不删、只换取证办法的直接通过；'
+      + '判法改了（删改判据 / 前提、改成人判）的通过，最新一轮里这几条的旧结论作废、按新判法重测；验的范围变了（删断言、改断言原文、改适用范围、去平台）的写理由后通过，需求页列给 owner 看。',
+    input_schema: obj(['demand', 'why'], { demand: DEMAND, why: str('为什么改'), case: str('只处理这几条用例（逗号分隔）') }),
+    argv: 'acceptkit plan recheck {demand} --why {why} [--case {case}] --json',
     returns: '文本' },
 
   { name: 'plan_return',
@@ -322,6 +388,137 @@ export const COMMANDS = [
     argv: 'acceptkit consult {run} --expect {expect} --json',
     returns: 'consult 卡片（faces / surfaces[{where, ask}] / questions / knowledge / owner_ask{question, why, options} / next）' },
 
+  { name: 'consult_trigger',
+    description: '用例评审时（不用等开跑）查一条用例里不是真实触发的步骤（直接注入 / 说不清）：工具在被测仓里找手写字段在哪算出来、调试 / 工具代码和项目脚本里哪里碰到它们，'
+      + '执行者顺着往上追到真实情况下产生这个输入的入口，写成测法建议（--propose）交 owner 定改不改。被测仓用 round repos 登记的，或这次 --repo 临时给。',
+    input_schema: obj(['case'], {
+      case: str('用例名'),
+      node: str('只看这一步，如 n1.2；不给就列出所有不是真实触发的步骤'),
+      demand: str('哪个需求（读它登记的被测仓；不给按评审单里引用了这条用例的需求找）'),
+      repo: str('临时给被测仓：<名>=<路径>，可给多个'),
+      propose: { type: 'boolean', description: '记一份测法建议（配 --node --real --evidence --how --catches [--prep]）' },
+      steps: { type: 'boolean', description: '步骤咨询：从提测内容 + 项目操作集推出每处不清晰的步骤 / 预期该挂哪个操作、怎么看' },
+      apply: { type: 'boolean', description: '配 --steps：把明确的候选写回用例（记下来源）' },
+      real: str('配 --propose：真实情况下，是什么产生了这一步的输入'),
+      evidence: str('配 --propose：代码依据「文件:行 这里是什么」，可给多个'),
+      how: str('配 --propose：换成真实触发后这一步具体怎么做'),
+      catches: str('配 --propose：换过去以后多验到的是哪一段'),
+      prep: str('配 --propose：开测前要先补的东西和工作量（现在就能测的不写）'),
+    }),
+    argv: 'acceptkit consult {case} [--steps [--apply]] [--node {node}] [--demand {demand}] [--repo {repo}...] [--propose --real {real} --evidence {evidence}... --how {how} --catches {catches} [--prep {prep}]] --json',
+    returns: '不带 --propose：consult_trigger 卡片（steps[{node, from, fields, anchors, leads{assembly, tools, tests}, scripts, real_ops, proposals}] / research / next）；带 --propose：记下的测法建议' },
+
+  { name: 'configset',
+    description: '配置集：一组用例跑之前被测端要处在什么配置下（开关、AB / 下发值、mock 的全局信号、账号、地区、包）。有名字、能复用，用例或某一支节点写 config: [<id>] 引用。'
+      + '每项说清是 mock（只 mock 全局信号，要写 why）还是 env（真实环境的选择）。set 新增 / 改（按项名合并），show 看，diff 看两份差在哪',
+    input_schema: obj(['id'], {
+      id: str('配置集名（小写字母、数字、连字符）'),
+      title: str('配置集是什么场景，一句话'),
+      item: str('一项：名=值，可给多个'),
+      kind: str('这几项是哪种', { enum: ['mock', 'env'] }),
+      why: str('mock 的要写：为什么不用真值'),
+      apply: { type: 'string', description: '这些项用哪个已登记操作施加（例：配置页 AB mock、全局特征 mock 页）；步骤里就不用再写 mock' },
+      replace: { type: 'boolean', description: '整份替换（不给就按项名合并）' },
+    }),
+    argv: 'acceptkit configset set {id} [--title {title}] --item {item}... --kind {kind} [--why {why}] [--apply {apply}] [--replace] --json',
+    returns: '配置集 { id, title, items[{ key, value, kind, why }] }' },
+
+  { name: 'configset_show', description: '看配置集：每项的名、值、是 mock 还是环境、为什么',
+    input_schema: obj([], { id: str('只看这一份') }),
+    argv: 'acceptkit configset show [{id}] --json', returns: '{ <id>: { title, items } }' },
+
+  { name: 'configset_diff', description: '两份配置集差在哪：只列取值不同的项（两组用例结果不一样，先看这个）',
+    input_schema: obj(['a', 'b'], { a: str('配置集'), b: str('另一份配置集') }),
+    argv: 'acceptkit configset diff {a} {b} --json', returns: '{ a, b, diff[{ key, a, b }] }' },
+
+  { name: 'clarify',
+    description: '跑过的用例改清晰（AI 写的用例跑过一次后，必须清晰或判不可执行，否则不能再开跑）。不带写回参数：列出哪里不清晰，以及那次执行的事实（这一步跑过的命令、截的图、观测打开的页和读到的值）当候选；'
+      + '带 --node / --expect / --unexecutable：写回用例，工具核对够不够具体、有没有空值，不够就拒收；每次写回记下来源运行和改前的样子',
+    input_schema: obj(['case'], {
+      case: str('用例名'),
+      run: str('事实取自哪次运行（不给取最近一次）'),
+      node: str('改哪一步，如 n1.2'),
+      op: str('配 --node：这一步写成「动作 + 对象」：进入「…」页、点击「…」、在「…」输入 …，命令写在反引号里'),
+      param: str('配 --node：要填的值 名=值，可给多个'),
+      'op-id': str('配 --node：挂一个带人看步骤的操作'),
+      'to-op': str('配 --node：把这一步文字里的命令提成一个操作（这个名字），命令作机器步骤，配 --human'),
+      human: str('配 --to-op：这个操作的人话步骤（打开「…」页 / 点击「…」），可给多个'),
+      expect: str('写哪条预期的看法，如 E1'),
+      see: str('配 --expect：人怎么看，一步一个，可给多个；至少一步说得出具体对象（「」里的页 / 行 / 按钮）'),
+      say: str('配 --expect：判据的人话，按判据顺序一句对一条（例：「did assembly succeed」这一行是 yes）'),
+      unexecutable: { type: 'boolean', description: '整条判不可执行（配 --why）' },
+      kind: str('配 --node：节点种类（分组只是标题，不能带操作 / 参数 / 触发声明）', { enum: ['action', 'group'] }),
+      config: str('配 --node：给这一步挂配置集（可给多个）'),
+      'no-config': str('配 --node：摘掉这一步的配置集'),
+      'add-expect': str('配 --node：在这一步下加一条断言（这个编号），配 --assert --observe-op --checks [--param --see --detail --twin-of]'),
+      assert: str('配 --add-expect：一句话'),
+      detail: str('配 --add-expect：依据 / 细节'),
+      'observe-op': str('配 --add-expect 或 --expect：观测操作（--expect 时原地换观测，改前的样子留底）'),
+      checks: str('判据 JSON 数组：[{"pick":"read.x","predicate":{"eq":"y"},"say":"人话"}]'),
+      'twin-of': str('配 --add-expect：新断言作为哪条（注入的）断言的真实对照'),
+      input: str('配 --expect：改这条预期声明的触发来源（不是 real 要配 --why）', { enum: ['real', 'mock-global', 'injected'] }),
+      'move-under': str('配 --node：把这一支挪到另一步下面（成为它的最后一个子节点），例：分组标题挪到产生结果的那一步下面'),
+      'because-from': str('配 --expect：这条预期的结果从哪来（step 链上某一步 / state 启动或配置后的状态 / artifact 静态产物），配 --why', { enum: ['step', 'state', 'artifact'] }),
+      'because-step': str('配 --because-from step：链上哪一步（nX 或 nid）'),
+      'because-input': str('配 --because-from step：那一步输入了什么（原文里的字）'),
+      role: str('配 --expect：claim 验需求本身 / control 对照 / precondition 前置检查', { enum: ['claim', 'control', 'precondition'] }),
+      'demand-ref': str('配 --role claim：对应评审单的哪个改动面'),
+      'add-node': str('加一步：挂在哪一步下面（nX / nid，或 root 加在最外层），配 --op [--op-id --param]'),
+      'config-unset': list('配 --node：从这一步起撤掉沿链继承来的配置集（配 --why）'),
+      'no-config-unset': list('配 --node：取消撤掉'),
+      'precondition-set': str('改第几条前置（从 0 数），new = 加一条；配 --text --how op:<操作>|manual --why'),
+      'precondition-rm': str('删第几条前置（从 0 数），配 --why'),
+      text: str('配 --precondition-set：这条前置是什么'),
+      how: str('配 --precondition-set：op:<操作 id>（能建立它的操作）或 manual（人工确认，--why 写理由）'),
+      'remove-node': str('删一个空节点（它和子孙都没有预期；配 --why），例：走不到的分支'),
+      'remove-expect': str('删一条断言（配 --why）；别的断言 real_twin 指向它的一并清掉，删前的样子留底'),
+      via: str('读取通道（单独配 --expect，或跟 --add-expect / --observe-op 一起）', { enum: ['ui', 'log', 'diag', 'debugger', 'cli'] }),
+      'why-not-ui': str('配 --via（不是 ui 时必填）：界面上为什么看不到'),
+      why: str('配 --unexecutable：为什么做不了，至少 10 字'),
+    }),
+    argv: 'acceptkit clarify {case} [--run {run}] [--node {node} [--op {op}] [--param {param}...] [--op-id {op-id}] [--to-op {to-op} --human {human}...]] [--expect {expect} --see {see}... [--say {say}...]] [--unexecutable --why {why}] [--kind {kind}] [--config {config}...] [--no-config {no-config}...] [--add-expect {add-expect} --assert {assert} [--detail {detail}] --observe-op {observe-op} --checks {checks} [--twin-of {twin-of}]] [--via {via} [--why-not-ui {why-not-ui}]] [--remove-expect {remove-expect} --why {why}] [--remove-node {remove-node} --why {why}] [--node {node} --move-under {move-under}] [--expect {expect} --because-from {because-from} [--because-step {because-step} --because-input {because-input}] --why {why}] [--expect {expect} --role {role} [--demand-ref {demand-ref}]] [--precondition-set {precondition-set} [--text {text}] --how {how} --why {why}] [--precondition-rm {precondition-rm} --why {why}] [--add-node {add-node} --op {op} [--op-id {op-id}] [--param {param}...]] [--node {node} --config-unset {config-unset}... [--no-config-unset {no-config-unset}...] --why {why}] [--expect {expect} --input {input} [--why {why}]] --json',
+    returns: '不带写回参数：{ kind: clarify, status, items[{ at, type, msg, facts, fix }], did_in_run }；写回后：{ kind: clarify, status, left[] }' },
+
+  { name: 'ask',
+    description: '要 owner 回答的事只有这一个入口（plan finding、blockers --ask 也过同一道检查）。先判该不该问：项目知识里写过不问 owner 的、同一件事答过的、属于执行者自己的活（登录测试账号、本 run 设备上的操作、调试页 mock、重试 / 换取证手段、自己工具的毛病）一律拒收并说明；'
+      + '只放行改产品行为或验收范围 / 动别人的资源或排期 / 对外发布或不可逆操作 / 接受风险四类，且要带上下文、选项和后果、推荐。记下拿到编号 Qn；回复和状态汇报里只写编号和待答几条',
+    input_schema: obj(['demand', 'question', 'kind', 'context', 'why-you', 'option', 'recommend'], {
+      demand: DEMAND,
+      question: str('要 owner 定什么，一句问句'),
+      kind: str('哪一类', { enum: ['behavior', 'others', 'irreversible', 'risk'] }),
+      context: str('来龙去脉：他不看别的也能懂'),
+      'why-you': str('为什么只有他能定'),
+      option: str('选项「做法 => 后果」，至少两个'),
+      recommend: str('你推荐哪个、为什么'),
+      'not-mine': str('通用清单判成你的活、但你确认真不是：写为什么只有 owner 能定（会给 owner 看）'),
+    }),
+    argv: 'acceptkit ask {demand} --question {question} --kind {kind} --context {context} --why-you {why-you} --option {option}... --recommend {recommend} [--not-mine {not-mine}] --json',
+    returns: '记下的提问 { id: Qn, … }；不该问时 { kind: ask_refused, why, ref, text, message }' },
+
+  { name: 'ask_answer', description: 'owner 答了一条提问：记他本人的名字和原话。只在用户回答了 ask 汇总卡之后用',
+    input_schema: obj(['demand', 'id', 'by', 'quote'], { demand: DEMAND, id: str('提问编号 Qn'), by: str('owner 本人'), quote: str('他的原话'), option: str('他选了第几个') }),
+    argv: 'acceptkit ask answer {demand} {id} --by {by} --quote {quote} [--option {option}] --json', returns: '更新后的提问' },
+
+  { name: 'ask_withdraw', description: '撤回一条提问（例：查到是自己的活、或已经不用问了），写理由',
+    input_schema: obj(['demand', 'id', 'why'], { demand: DEMAND, id: str('提问编号 Qn'), why: str('为什么撤回') }),
+    argv: 'acceptkit ask withdraw {demand} {id} --why {why} --json', returns: '更新后的提问' },
+
+  { name: 'ask_list', description: '这个需求提过的问：待答 / 已答 / 已撤回',
+    input_schema: obj(['demand'], { demand: DEMAND }),
+    argv: 'acceptkit ask list {demand} --json', returns: '{ demand, asks[] }' },
+
+  { name: 'consult_decide',
+    description: 'owner 对一份测法建议的决定：改（--adopt）或不改（--reject），记他本人的原话。只在用户回答了 trigger_proposal 卡片后用',
+    input_schema: obj(['proposal', 'by', 'quote'], {
+      proposal: str('测法建议编号，如 T1'),
+      adopt: { type: 'boolean', description: '改成真实触发' },
+      reject: { type: 'boolean', description: '不改' },
+      by: str('谁定的（owner 本人）'),
+      quote: str('他的原话'),
+    }),
+    argv: 'acceptkit consult decide {proposal} [--adopt] [--reject] --by {by} --quote {quote} --json',
+    returns: '更新后的测法建议' },
+
   { name: 'context',
     description: '做一个操作节点之前，一次取这一步的经验：操作做法（推测的不执行）、画面上应该出现的字（shows）、危险等级（danger）、相关知识、可能遇到的遮蔽层和关法、'
       + '这个节点以往失败 / 取证手段故障 / 盲审驳回的情况、截图做法。step_todo 卡片要做的那一步不熟、或上次在这一步栽过时调它；不用为它通读项目手册。只读，不改记录。',
@@ -362,7 +559,9 @@ export function findDef(cmd, pos = [], opt = {}) {
     const w = argvParts(d).words;
     return w[0] === cmd && (w.length === 1 || w[1] === pos[0]);
   });
-  return hits.find(d => d.select && opt[d.select] !== undefined) || hits.find(d => !d.select) || null;
+  // 同一个命令词有几种用法（例：consult 按运行问取证、按用例问触发方式）：挑认得全这些参数的那种，都不全就取第一种（报错时给它的用法）
+  const fits = d => Object.keys(opt).every(k => k === 'json' || argvParts(d).flags.has(k));
+  return hits.find(d => d.select && opt[d.select] !== undefined) || hits.find(d => !d.select && fits(d)) || hits.find(d => !d.select) || null;
 }
 
 /** 按定义查不认识的参数：返回一句能照着改的话，没问题返回 null。 */

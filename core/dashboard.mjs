@@ -17,6 +17,12 @@ import { join, dirname, relative } from 'node:path';
 import { loadProject, ownerIdentity } from './project.mjs';
 import { smokeState, smokeSpec } from './smoke.mjs';
 import { claimWordsOf } from './claims.mjs';
+import { stepInput, caseInputs } from './input-source.mjs';
+import * as CR from './case-review.mjs';
+import { surfacesOfCase } from './plan-gate.mjs';
+import { latestReviewItems } from './store/db.mjs';
+import { loadConfigSets } from './configsets.mjs';
+import { caseClarity, fillHuman, CLARITY_LABEL, expandHuman, REF_LINE } from './clarity.mjs';
 
 const PROJ = await loadProject();
 if (!PROJ.root) { console.error('acceptkit open: 找不到项目（--project / ACCEPTKIT_PROJECT / 项目目录）'); process.exit(1); }
@@ -27,8 +33,9 @@ setCardMarkers(PROJ.config.evidence?.cardMarkers);
 const DASH = PROJ.config.dashboard || {};
 const HOST_MSG = String(DASH.hostMessagePrefix || 'acceptkit').replace(/[^\w-]/g, '');
 const CASES = join(ROOT, 'cases');
+const CFGSETS = loadConfigSets(ROOT);
 const RUNS = join(ROOT, 'runs');
-import { fmtObserve, claimGaps } from './evidence-gate.mjs';
+import { fmtObserve, claimGaps, claimExpectIds } from './evidence-gate.mjs';
 const EVID = join(ROOT, 'evidence');
 // 数据模型：需求↔用例多对多（关系在评审单里）；平台适用性算出来；图按身份分类
 import { applicability, fmtApplicability, RUNTIME_PLATFORMS, PLATFORM_LABEL, normalizePlatforms } from './platform.mjs';
@@ -36,7 +43,8 @@ import { loadDemands, allPlans, planCaseSet, demandsReferencing } from './demand
 import { imageKind, appShotsIn, reviewItems, setCardMarkers, assertionGaps, GAP_TEXT, viaOf, VIA_LABEL, staticOnlyRun } from './evidence-gate.mjs';
 import { nextCards, caseStages, STAGES } from './next.mjs';
 import { listLoopBindings, lastLoopStop } from './store/db.mjs';
-import { approvedCases, planDelta } from './plan-gate.mjs';
+import { approvedCases, planDelta, AUTO_RULES, fmtCheck, judgedByCurrent } from './plan-gate.mjs';
+import { tunePacks } from './timing.mjs';
 import { CARD_KINDS } from './cards.mjs';
 import { findingProblems, FINDING_KINDS } from './finding-quality.mjs';
 import { loadRounds, deriveHistory, demandRecords, resolveState, roundMembers, recordTime, noShotHolders, shotInRound } from './rounds.mjs';
@@ -448,6 +456,30 @@ function renderOps() {
     而不是等跑到一半才发现。</div>${cards}`;
 }
 
+// 结论树（c.claims）：给人读的那一棵 —— 根是要证明什么，往下分几方面，叶子挂证实它的断言（只显示一句话）。
+// 每个节点的状态按它下面全部断言汇总；没证实的点名原因。操作树在它下面，给执行者按顺序跑
+function renderClaimMap(c, results = {}, gaps = []) {
+  if (!(c?.claims || []).length) return '';
+  const byId = new Map(); walkExpects(c.tree || [])(e => byId.set(e.id, e));
+  const node = cl => {
+    const ids = [...new Set(claimExpectIds(cl))];
+    const roll = tallyOf(cb => ids.forEach(id => byId.has(id) && cb(byId.get(id))), results);
+    const bad = gaps.find(g => g.startsWith(`「${cl.text}」`));
+    const leaves = (cl.proved_by || []).map(id => { const e = byId.get(id), v = results[id] || { status: 'todo' };
+      return `<li class="cm-as st-${esc(v.status)}">${ICON[v.status] || '·'} <code class="aid">${esc(id)}</code> ${esc(e ? e.assert : '（不是本用例的断言）')}</li>`; }).join('');
+    return `<li class="cm-n"><div class="cm-h"><span class="dot ${statusClass(roll.agg)}"></span> <b>${esc(cl.text)}</b> ${roll.n ? `<span class="pstat">${tallyBadges(roll.tally)}</span>` : ''}`
+      + `${bad ? ` <span class="dim">${esc(bad.replace(`「${cl.text}」`, ''))}</span>` : ''}</div>`
+      + `<ul class="cm">${(cl.children || []).map(node).join('')}${leaves}</ul></li>`;
+  };
+  return `<div class="rule cmap"><div class="rk">🧭 结论树：这条用例要证明什么、分哪几方面、每方面由哪几条断言证实</div><ul class="cm cm-root">${c.claims.map(node).join('')}</ul></div>`;
+}
+// 断言下面折叠着的两样：技术细节（读数位置、依据）与修订记录 —— 给执行者和复核人，owner 默认不用看
+const assertExtras = e => {
+  const hist = [].concat(e.history || []);
+  return (e.detail ? `<details class="exd"><summary class="dim">技术细节</summary><div class="exd-b">${esc(e.detail).replace(/\n/g, '<br>')}</div></details>` : '')
+    + (hist.length ? `<details class="exd"><summary class="dim">修订记录 ${hist.length} 条</summary>${hist.map(h => `<div class="exd-b">${typeof h === 'string' ? esc(h) : `<b>${esc(h.at || '')}</b> ${esc(h.text || '')}`}</div>`).join('')}</details>` : '');
+};
+
 function renderTree(nodes, results, steps, dir, prefix = 'n', casePlatform = '', reviews = null, caseName = '') {
   return `<ul class="tree">` + (nodes || []).map((n, i) => {
     const nodeId = `${prefix}${i + 1}`;
@@ -467,7 +499,7 @@ function renderTree(nodes, results, steps, dir, prefix = 'n', casePlatform = '',
         : (v.status === 'blocked' ? '<span class="bk">验不了 · 未分类</span>' : '');
       // 走的是哪条路：界面验证人能直接看图确认；命令行验证带上「为什么界面上看不到」
       const via = viaOf(e), viaTag = via === 'ui' ? `<span class="via ui">${VIA_LABEL.ui}</span>` : `<span class="via cli" title="${esc(e.why_not_ui || '')}">${VIA_LABEL[via]} · ${esc(String(e.why_not_ui || '没写理由').slice(0, 40))}</span>`;
-      return `<li class="as-li st-${v.status}">${ICON[v.status] || '·'} <code class="aid">${esc(e.id)}</code> ${esc(e.assert)} ${viaTag} ${bk}` +
+      return `<li class="as-li st-${v.status}">${ICON[v.status] || '·'} <code class="aid">${esc(e.id)}</code> ${esc(e.assert)} ${viaTag} ${bk}` + assertExtras(e) +
         (e.expect_data ? `<div class="exd"><b>预期</b> <code>${esc(e.expect_data)}</code></div>` : '') +
         // 「怎么观测才算 pass/fail」—— observe 是可执行规格（acceptkit observe 照它跑）；只有 machine 文本的如实标出未机判化
         (e.observe ? `<div class="exd"><b>观测</b> <code>${esc(fmtObserve(e.observe))}</code></div>`
@@ -495,6 +527,188 @@ function renderTree(nodes, results, steps, dir, prefix = 'n', casePlatform = '',
       (n.conclusion ? `<div class="concl">⇒ ${esc(n.conclusion)}</div>` : '') +
       (n.children?.length ? renderTree(n.children, results, steps, dir, `${nodeId}.`, casePlatform, reviews, caseName) : '') + `</li>`;
   }).join('') + `</ul>`;
+}
+
+
+// ---------- 步骤视图：在什么配置下 → 做了哪几步（每步怎么触发） → 每步看到什么 ----------
+// 读的人一眼要看清三件事，不用读一段段原文：配置是有名字的一份（点开看每一项）；步骤一行一件事，
+// 挂了操作的点开就是那串具体步骤、要填的值单列；预期一句话，结果和证据挂在它后面。原文、观测规格、证据细节在下面的完整操作树里。
+const TRIG = { real: ['真实', 'tr-real', '经真实用户 / app 路径触发'], 'mock-global': ['mock 全局', 'tr-mock', '只 mock 了全局信号'],
+  injected: ['注入', 'tr-inj', '构造好的输入直接交给判定入口：只验了判定那一段'], unknown: ['说不清', 'tr-unk', '没说清怎么触发：不算真实'] };
+function cfgChip(id) {
+  const s = CFGSETS[id];
+  if (!s) return `<span class="cfg bad" title="配置集里没有这一份">⚠ ${esc(id)}</span>`;
+  return `<details class="cfg"><summary>⚙ ${esc(s.title || id)} <span class="dim">${s.items.length} 项</span></summary><table class="tbl cfgt">${s.items.map(x =>
+    `<tr><td><code>${esc(x.key)}</code></td><td><code>${esc(x.value)}</code></td><td>${x.kind === 'mock' ? '<span class="tr tr-mock">mock</span>' : '<span class="dim">环境</span>'}</td><td class="dim">${esc(x.why || '')}</td></tr>`).join('')}</table></details>`;
+}
+function fragmentOf(opId, platform, params = {}) {
+  const o = OPS[opId]; if (!o) return '';
+  const r = (o.platforms || {})[platform || ''] || Object.entries(o.platforms || {}).find(([k, x]) => k.split('@')[0] === platform && !x.absent)?.[1];
+  const human = fillHuman(expandHuman(OPS, opId, new Set(), platform), params);
+  const ownLines = (() => { const r0 = (o.platforms || {})[platform || '']; return [].concat(r0?.human || o.human || []); })();
+  const machine = (r?.steps || []).map(x => typeof x === 'string' ? esc(x) : x?.use ? fragmentOf(x.use, platform, x.params || params) : esc(x?.do || x?.cmd || JSON.stringify(x)));
+  const tip = human.length ? human.map((x, i) => `${i + 1}. ${x}`).join('\n') : '还没写人看的步骤';
+  const body = (human.length ? `<ol>${(ownLines.length ? ownLines : human).map(x => REF_LINE.test(String(x).trim()) ? `<li>${fragmentOf(String(x).trim().slice(1), platform, params)}</li>` : `<li>${esc(fillHuman([x], params)[0])}</li>`).join('')}</ol>` : '<div class="warnline">还没写人看的步骤：跑过一次后要补（ops set ' + esc(opId) + ' --human …）</div>')
+    + (machine.length || r?.how ? `<details class="mach"><summary class="dim">机器做法</summary>${machine.length ? `<ol>${machine.map(x => `<li>${x}</li>`).join('')}</ol>` : `<pre class="ophow">${esc(r.how)}</pre>`}</details>` : '');
+  return `<details class="frag"><summary title="${esc(tip)}">🔗 ${esc(o.title)}${human.length ? ` <span class="dim">${human.length} 步</span>` : ' <span class="warnline">没写人看的步骤</span>'}</summary>${body}</details>`;
+}
+// 用例评审状态：一个标签；悬停 / 点开只列低于门槛的项（人话维度名 + 分数 + 理由 + 改法），2 分的灰字「待跑后补准」，3 分不显示
+// 不搜被测代码（界面字状态不进指纹），和 next 同口径
+function reviewOf(c) {
+  if (c.unexecutable) return { status: 'unexecutable', items: [] };
+  const sets = CFGSETS, ctx = { ops: OPS, sets, platform: CR.reviewPlatform(c), inputs: new Map(caseInputs(c, OPS, sets).map(x => [x.id, x.from])), surfaces: surfacesOfCase(ROOT, c.case) };
+  let recs = []; try { recs = latestReviewItems(ROOT, c.case); } catch { /* 库读不了就当没评 */ }
+  return CR.reviewState(CR.caseCard(c, ctx), recs, { liveCaps: false });
+}
+const RV_CLS = { pass: 'ok', fail: 'bad', stale: 'warn', draft: 'warn', incomplete: 'warn', unexecutable: 'bad' };
+const RV_STATE = { missing: '没评', stale: '用例改过要重评', draft: '只有自评、没盲审', low: '低于门槛', ran: '跑过了还是 2 分' };
+function clarityChip(c) {
+  const st = reviewOf(c);
+  if (st.status === 'unexecutable') return `<span class="mm-st mm-bad" title="${esc(String(c.unexecutable.why || c.unexecutable))}">不可执行</span>`;
+  const bad = st.items.filter(i => i.state === 'low' || i.state === 'ran').sort((a, b) => a.score - b.score);
+  const label = st.status === 'fail' ? `评审未过 ${bad.length} 处` : CR.STATUS_LABEL[st.status];
+  const rows = bad.slice(0, 8).map(i => `<li>${esc(i.pos || i.at)} ${esc(CR.DIM_LABEL[i.dim])} <b>${i.score}/3</b>：${esc(String(i.reason || '').slice(0, 140))}${i.fix ? `<div><code>${esc(i.fix)}</code></div>` : ''}</li>`).join('');
+  const other = Object.entries(st.counts).filter(([k, v]) => v && RV_STATE[k] && k !== 'low' && k !== 'ran').map(([k, v]) => `${RV_STATE[k]} ${v}`).join(' · ');
+  const twos = st.items.filter(i => i.state === 'ok' && i.score === 2).length;
+  if (!rows && !other) return `<span class="mm-st mm-${RV_CLS[st.status]}">${esc(label)}</span>${twos ? ` <span class="dim">${twos} 项待跑后补准</span>` : ''}`;
+  return `<details class="rvchip"><summary><span class="mm-st mm-${RV_CLS[st.status]}">${esc(label)}</span></summary>${rows ? `<ol>${rows}</ol>` : ''}${other ? `<div class="dim">${esc(other)}</div>` : ''}${twos ? `<div class="dim">${twos} 项 2 分：待跑后补准</div>` : ''}</details>`;
+}
+function renderStepView(c, results = {}, dir = null, reviews = null, { evidence = true } = {}) {
+  // 脑图：前置（配置 + 起点）→ 步骤框（一行一个动作，要填的值跟在后面）→ 预期框（一句话 + 结果 + 证据）。
+  // 只在不是真实触发时角上标一个小签（注入 / mock / 没说怎么触发）；编号、观测规格这些给执行者的东西不上脑图，在下面完整操作树里
+  const caseDefault = typeof c.input === 'string' ? { from: c.input } : c.input || null;
+  const RANK = { real: 0, 'mock-global': 1, unknown: 2, injected: 3 }, worse = (a, b) => RANK[b] > RANK[a] ? b : a;
+  const cfgMock = ids => ids.some(k => (CFGSETS[k]?.items || []).some(x => x.kind === 'mock'));
+  // 脑图上只标会影响「信不信这条结论」的两种：注入、mock。没写清怎么触发是用例的毛病，归检查（Q31）管，不上脑图
+  const TAG = { injected: ['注入', 'tr-inj'], 'mock-global': ['mock', 'tr-mock'] };
+  const ST = { pass: ['通过', 'ok'], fail: ['未通过', 'bad'], blocked: ['验不了', 'warn'], todo: ['待测', 'dim'], skip: ['跳过', 'dim'], na: ['不适用', 'dim'] };
+  const par = n => Object.entries(n.params || {}).map(([k, v]) => ` <code>${esc(k)}=${esc(typeof v === 'string' ? v : JSON.stringify(v))}</code>`).join('');
+  const stepLine = n => n.kind === 'group' ? `<div class="mm-l mm-gt">▸ ${esc(n.op || '')}</div>` : n.op_id && OPS[n.op_id]
+    ? `<div class="mm-l">${fragmentOf(n.op_id, c.platform, n.params || {})}${par(n)}${n.op && n.op !== OPS[n.op_id].title ? `<div class="dim">${esc(n.op)}</div>` : ''}</div>`
+    : `<div class="mm-l">${esc(n.op || '')}${par(n)}</div>`;
+  const howLook = e => {
+    if (e.judge === 'human') return `<div class="mm-how"><div class="mm-k">操作步骤</div>人看：${esc(e.human_why || '')}</div>`;
+    const b = e.observe?.by ? (e.observe.by[c.platform] || Object.values(e.observe.by)[0]) : e.observe;
+    if (!b) return '';
+    const see = [].concat(e.see || []), human = see.length ? see : (() => { const o = OPS[b.op], r0 = (o?.platforms || {})[c.platform || '']; const own = [].concat(r0?.human || o?.human || []); return own.length ? own : expandHuman(OPS, b.op, new Set(), c.platform); })();
+    const params = Object.entries(b.params || {}).filter(([, v]) => !/^(\$\^)?$/.test(String(v)));
+    const mach = `<details class="mach"><summary class="dim">机器怎么判</summary>${b.op ? `<div>观测：<code>${esc(b.op)}</code></div>` : ''}`
+      + (params.length ? `<div>${params.map(([k, v]) => `<code>${esc(k)}=${esc(typeof v === 'string' ? v : JSON.stringify(v))}</code>`).join(' ')}</div>` : '')
+      + [].concat(b.guard || []).filter(Boolean).map(g => `<div>前提：${esc(fmtCheck(g))}</div>`).join('') + (b.checks || []).map(ch => `<div>通过条件：${esc(fmtCheck(ch))}</div>`).join('') + `</details>`;
+    return `<div class="mm-how"><div class="mm-k">操作步骤</div>${human.length ? `<ol>${human.map(x => REF_LINE.test(String(x).trim()) ? `<li>${fragmentOf(String(x).trim().slice(1), c.platform, b.params || {})}</li>` : `<li>${esc(fillHuman([x], b.params || {})[0])}</li>`).join('')}</ol>` : '<div class="warnline">没写操作步骤：先写大致的（进哪一页、看什么），跑过后改准</div>'}${mach}</div>`;
+  };
+  const expBox = e => {
+    const v = results[e.id] || { status: 'todo' }, st = ST[v.status] || ST.todo, ev = (v.evidence || []).length;
+    return `<div class="mm-box mm-exp mm-${st[1]}"><div class="mm-k">预期 <span class="dim">${esc(e.id)}</span></div>`
+      + `<div>${esc(e.assert || '').replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')}</div>${e.detail ? `<details class="brief"><summary class="dim">依据</summary><div class="brief-full">${esc(e.detail).replace(/\n/g, '<br>')}</div></details>` : ''}` + howLook(e)
+      + `<div class="mm-foot"><span class="mm-st mm-${st[1]}">${st[0]}</span>${evidence && ev ? ` <span class="evs">${v.evidence.slice(0, 2).map(x => evChip(x, dir, rvOf(reviews, e.id, x))).join(' ')}</span>` : ''}`
+      + `${v.actual && v.status === 'fail' ? `<div class="dim">实际：${esc(String(v.actual).slice(0, 120))}</div>` : ''}</div></div>`;
+  };
+  const branch = (steps, exps, eff) => {
+    const tag = TAG[eff];
+    // 没有步骤（预期直接挂在前置上）：不画空的步骤框
+    if (!steps) return `<div class="mm-br"><div class="mm-exps">${exps.map(expBox).join('')}</div></div>`;
+    const onlyGroups = steps.every(n => n.kind === 'group');
+    return `<div class="mm-br"><div class="mm-box mm-step">${tag && !onlyGroups ? `<span class="tr ${tag[1]} mm-tag">${tag[0]}</span>` : ''}<div class="mm-k">${onlyGroups ? '分组' : '步骤'}</div>${steps.map(stepLine).join('')}`
+      + `${steps.some(n => n.note) ? `<details class="sv-note"><summary class="dim">说明</summary>${steps.filter(n => n.note).map(n => `<div>${esc(n.note)}</div>`).join('')}</details>` : ''}</div>`
+      + `<div class="mm-exps">${exps.length ? exps.map(expBox).join('') : '<div class="dim">（这一步没有预期）</div>'}</div></div>`;
+  };
+  // 每个根节点是一组：前置框 = 它的配置 + 它自己这一步；下面每个带预期的节点是一条分支，步骤框列出从根往下到它的每一步
+  const groups = (c.tree || []).map(root => {
+    const cfgs = [...[].concat(c.config || []), ...[].concat(root.config || [])];
+    const rootEff = worse(stepInput(root, OPS, caseDefault).from, cfgMock(cfgs) ? 'mock-global' : 'real');
+    const brs = [];
+    // 根节点自己的预期：步骤就是前置那一步，不再重复写一遍
+    if ((root.expect || []).length) brs.push(branch(null, root.expect, rootEff));
+    const walk = (n, path, eff, cfgPath) => {
+      const cf = [...cfgPath.filter(k => ![].concat(n.config_unset || []).includes(k)), ...[].concat(n.config || [])];
+      const e2 = n.kind === 'group' ? worse(eff, cfgMock(cf) ? 'mock-global' : 'real') : worse(worse(eff, stepInput(n, OPS, caseDefault).from), cfgMock(cf) ? 'mock-global' : 'real');
+      const p2 = [...path, n];
+      if ((n.expect || []).length) brs.push(branch(p2, n.expect, e2));
+      (n.children || []).forEach(ch => walk(ch, (n.expect || []).length ? [] : p2, e2, cf));
+    };
+    (root.children || []).forEach(ch => walk(ch, [], rootEff, cfgs));
+    const preTag = TAG[rootEff];
+    return `<div class="mm-g"><div class="mm-box mm-pre">${preTag ? `<span class="tr ${preTag[1]} mm-tag">${preTag[0]}</span>` : ''}<div class="mm-k">前置</div>${cfgs.map(cfgChip).join(' ')}<div class="mm-l"><b>${esc(root.op || '')}</b></div>`
+      + `${root.note ? `<details class="sv-note"><summary class="dim">说明</summary>${esc(root.note)}</details>` : ''}</div><div class="mm-brs">${brs.join('')}</div></div>`;
+  });
+  return `<div class="mm">${groups.join('')}</div>`;
+}
+
+// ---------- 用例与执行（需求页）：这个需求的全部用例，一页看清「验了多少、过了多少、每条怎么操作、每条结果和证据」 ----------
+// 上面一行总数（含：有几条走真实路径、几条是注入 —— 注入只验了判定那一段，过了也要打折看）；
+// 下面按改动面 → 用例 → 步骤 → 预期；可切「树」/「表格」，可按结果筛、按名字搜。每条预期的结果取这个需求下这条用例最近一次运行。
+const EB_ST = { pass: '通过', fail: '未通过', blocked: '验不了', todo: '待测', skip: '跳过', na: '不适用' };
+const EB_HOW = { observe: '机判', record: '手记', replay: '回放' };
+function renderConfigGroups(plan, runsOf) {
+  const groups = new Map(), order = [];
+  for (const s of plan?.surfaces || []) for (const name of [...(s.reuse || []), ...(s.new || [])]) {
+    const c = ALL_CASES[name]; if (!c || order.some(x => x.name === name)) continue; order.push({ name, c });
+  }
+  for (const { name, c } of order) (c.tree || []).forEach((root, i) => {
+    const ids = [...new Set([...[].concat(c.config || []), ...[].concat(root.config || [])])].sort();
+    const key = ids.join('+') || '（没指定配置）';
+    (groups.get(key) || groups.set(key, { ids, items: [] }).get(key)).items.push({ name, c, root, i });
+  });
+  return [...groups].map(([key, g]) => {
+    const title = g.ids.length ? g.ids.map(id => CFGSETS[id]?.title || id).join(' + ') : key;
+    const body = g.items.map(({ name, c, root, i }) => {
+      const rs = runsOf(name), last = rs[rs.length - 1], res = last?.res?.results || {};
+      const ids = []; (function w(n) { (n.expect || []).forEach(e => ids.push(e.id)); (n.children || []).forEach(w); })(root);
+      const st = ids.map(id => res[id]?.status || 'todo'), worst = st.includes('fail') ? 'fail' : st.includes('blocked') ? 'blocked' : st.includes('todo') ? 'todo' : 'pass';
+      return `<details class="eb-case" data-st="${[...new Set(st)].join(' ')}" data-q="${esc(`${name} ${c.title || ''}`.toLowerCase())}"><summary><span class="eb-st st-${worst}">${ICON[worst] || '·'}</span> <b>${esc(c.title || name)}</b> <code class="dim">${esc(name)} · 分支 n${i + 1}</code> <span class="dim">${st.filter(x => x === 'pass').length}/${st.length} 通过</span> <a class="caselink" href="#run=case:${esc(name)}">↗</a></summary>`
+        + renderStepView({ ...c, config: [], tree: [{ ...root, config: [] }] }, res, last?.dir || null, last?.res?.reviews || null) + '</details>';
+    }).join('');
+    return `<div class="eb-sf"><div class="sfc-h">⚙ ${esc(title)} <span class="dim">${g.items.length} 个用例分支 —— 配好这一份环境，把下面这些一次跑完</span></div>${g.ids.map(cfgChip).join(' ')}${body}</div>`;
+  }).join('');
+}
+function renderExecBoard(did, plan, runsOf) {
+  const surfaces = plan?.surfaces || [];
+  const tally = { pass: 0, fail: 0, blocked: 0, todo: 0, skip: 0, na: 0 }, trig = { real: 0, 'mock-global': 0, injected: 0, unknown: 0 };
+  const rows = [], blocks = [];
+  for (const s of surfaces) {
+    const cs = [...(s.reuse || []), ...(s.new || [])];
+    const caseBlocks = [];
+    for (const name of cs) {
+      const c = ALL_CASES[name]; if (!c) { caseBlocks.push(`<div class="dim">${esc(name)}（用例文件不在）</div>`); continue; }
+      const rs = runsOf(name), last = rs[rs.length - 1], results = last?.res?.results || {};
+      const howOf = id => [...(last?.res?.timeline || [])].reverse().find(e => e.id === id)?.how;
+      const trigOf = new Map(caseInputs(c, OPS, CFGSETS).map(x => [x.id, x.from]));
+      const ct = { pass: 0, fail: 0, blocked: 0, todo: 0, skip: 0, na: 0 };
+      walkTree(c.tree || [], n => (n.expect || []).forEach(e => {
+        const st = results[e.id]?.status && EB_ST[results[e.id].status] ? results[e.id].status : 'todo';
+        tally[st]++; ct[st]++; const tf = trigOf.get(e.id) || 'unknown'; trig[tf]++;
+        const v = results[e.id] || {};
+        rows.push(`<tr class="eb-row" data-st="${st}" data-q="${esc(`${name} ${c.title || ''} ${e.id} ${e.assert || ''}`.toLowerCase())}">`
+          + `<td><a class="caselink" href="#run=case:${esc(name)}">${esc(c.title || name)}</a><div class="dim"><code>${esc(name)}</code> · ${esc(s.id)}</div></td>`
+          + `<td class="eb-op">${esc(String(n.op || '').slice(0, 60))}</td>`
+          + `<td><span class="tr ${(TRIG[tf] || TRIG.unknown)[1]}">${(TRIG[tf] || TRIG.unknown)[0]}</span></td>`
+          + `<td><code class="aid">${esc(e.id)}</code> ${esc(e.assert || '').replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')}</td>`
+          + `<td><span class="eb-st st-${st}">${ICON[st] || '·'} ${EB_ST[st]}</span>${v.actual && st !== 'pass' ? `<div class="dim">${esc(String(v.actual).slice(0, 80))}</div>` : ''}</td>`
+          + `<td class="dim">${esc(EB_HOW[howOf(e.id)] || '')}</td>`
+          + `<td>${(v.evidence || []).length ? `<div class="evs">${v.evidence.slice(0, 1).map(x => evChip(x, last?.dir, rvOf(last?.res?.reviews, e.id, x))).join(' ')}${v.evidence.length > 1 ? ` <span class="dim">+${v.evidence.length - 1}</span>` : ''}</div>` : '<span class="dim">—</span>'}</td></tr>`);
+      }));
+      const worst = ct.fail ? 'fail' : ct.blocked ? 'blocked' : ct.todo ? 'todo' : 'pass';
+      caseBlocks.push(`<details class="eb-case" data-st="${Object.entries(ct).filter(([, n]) => n).map(([k]) => k).join(' ')}" data-q="${esc(`${name} ${c.title || ''}`.toLowerCase())}">`
+        + `<summary><span class="eb-st st-${worst}">${ICON[worst] || '·'}</span> <b>${esc(c.title || name)}</b> ${clarityChip(c)} <code class="dim">${esc(name)}</code> `
+        + Object.entries(ct).filter(([, n]) => n).map(([k, n]) => `<span class="tb ${k === 'pass' ? 'pass' : k === 'fail' ? 'fail' : 'todo'}">${EB_ST[k]} ${n}</span>`).join(' ')
+        + `${[].concat(c.config || []).map(id => ` <span class="dim">⚙ ${esc(CFGSETS[id]?.title || id)}</span>`).join('')}`
+        + `${last ? ` <span class="dim">· 最近 <code>${esc(last.id)}</code></span>` : ' <span class="dim">· 还没跑</span>'} <a class="caselink" href="#run=case:${esc(name)}" title="用例详情">↗</a></summary>`
+        + renderStepView(c, results, last?.dir || null, last?.res?.reviews || null) + `</details>`);
+    }
+    blocks.push(`<div class="eb-sf"><div class="sfc-h">${esc(s.id)} ${esc(String(s.change || '').split(/\n|。/)[0])}</div>${caseBlocks.join('')}</div>`);
+  }
+  const total = Object.values(tally).reduce((a, b) => a + b, 0), done = total - tally.todo;
+  const pct = n => total ? `${Math.round(n * 1000 / total) / 10}%` : '—';
+  const head = `<div class="eb-head"><div class="eb-big"><b>${pct(done)}</b><span class="dim">已执行 ${done}/${total}</span></div>`
+    + `<div class="eb-tal">${['pass', 'fail', 'blocked', 'skip', 'na', 'todo'].filter(k => tally[k] || ['pass', 'fail', 'todo'].includes(k)).map(k => `<div><span class="eb-st st-${k}">${ICON[k] || '·'} ${EB_ST[k]}</span> <b>${tally[k]}</b> <span class="dim">${pct(tally[k])}</span></div>`).join('')}</div>`
+    + `<div class="eb-tal"><div class="dim">怎么触发</div>${['real', 'mock-global', 'injected', 'unknown'].map(k => `<div><span class="tr ${TRIG[k][1]}">${TRIG[k][0]}</span> <b>${trig[k]}</b></div>`).join('')}`
+    + (trig.injected ? `<div class="dim">注入的只验了判定那一段，过了也要打折看</div>` : '') + `</div></div>`;
+  const bar = `<div class="eb-bar"><button class="eb-v on" data-v="cfg">按配置</button><button class="eb-v" data-v="tree">按用例（策略视角）</button><button class="eb-v" data-v="table">表格</button>`
+    + `<input class="eb-q" placeholder="搜用例名、编号、断言"/>`
+    + `<select class="eb-f"><option value="">全部结果</option>${Object.keys(EB_ST).map(k => `<option value="${k}">${EB_ST[k]}</option>`).join('')}</select></div>`;
+  return `<div class="eb" data-did="${esc(did)}">${head}${bar}<div class="eb-cfg">${renderConfigGroups(plan, runsOf)}</div><div class="eb-tree" hidden>${blocks.join('')}</div>`
+    + `<div class="eb-table" hidden><table class="tbl"><thead><tr><th>用例</th><th>步骤</th><th>怎么触发</th><th>预期</th><th>结果</th><th>怎么判的</th><th>证据</th></tr></thead><tbody>${rows.join('')}</tbody></table></div></div>`;
 }
 
 // ---------- 一次「执行」= 左侧一行 ----------
@@ -559,10 +773,7 @@ function caseTreeNode(c, runsOfCase, { compact = false } = {}) {
   }
 
   const cg = latest ? claimGaps(c || {}, latest.res || {}) : [];
-  const claims = (c?.claims || []).length ? `<div class="rule"><div class="rk">📣 用例主张（每句都要由断言证实，且证据已复核）</div>${c.claims.map(cl => {
-      const bad = cg.find(g => g.startsWith(`「${cl.text}」`));
-      return `<div>${bad ? '❌' : '✅'} ${esc(cl.text)} <span class="dim">← ${esc((cl.proved_by || []).join(' '))}${bad ? ' · ' + esc(bad.replace(`「${cl.text}」`, '')) : ''}</span></div>`;
-    }).join('')}</div>` : '';
+  const claims = renderClaimMap(c || {}, results, cg);
   const retries = rs.slice(0, -1);
   const gates = (latest?.meta?.gates || []).map(g => `<code>${esc(g.action)} → ${esc(g.verdict)}</code>`).join(' ');
 
@@ -579,11 +790,12 @@ function caseTreeNode(c, runsOfCase, { compact = false } = {}) {
     <div class="ctree-b">
       ${whyLine(roll.why)}
       ${retries.length ? `<div class="dim">本次执行内重试 ${retries.length} 轮：${retries.map(r => `<code>${esc(r.id)}</code>`).join(' ')} —— 下面是最后一轮的结果</div>` : ''}
-      ${!compact && c.rule ? `<div class="rule"><div class="rk">📐 被测规则（先看这个，再看断言）</div>${esc(c.rule).replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>').replace(/\n/g, '<br>')}</div>` : ''}
+      ${!compact && c.rule ? `<div class="rule"><div class="rk">📐 判定依据（写用例的人定的：预期从哪来、什么情况算失败）</div>${esc(c.rule).replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>').replace(/\n/g, '<br>')}</div>` : ''}
       ${!compact && c.report ? `<div class="rep">${Object.entries(c.report).map(([k, v]) => `<div><span class="k">${esc(k)}</span>${esc(v)}</div>`).join('')}</div>` : ''}
       ${!compact ? claims : ''}
       ${gallery ? `<details class="galwrap" open><summary><b>📷 判定图</b> <span class="dim">observe 截图 / 判定卡 · 点开大图</span></summary><div class="gal">${gallery}</div></details>` : ''}
-      ${renderTree(c.tree || [], results, steps, dir, 'n', c.platform || '', reviews, c.case)}
+      ${renderStepView(c, results, dir, reviews)}
+      <details class="fulltree"><summary class="dim">完整操作树（原文、观测规格、过程证据）</summary>${renderTree(c.tree || [], results, steps, dir, 'n', c.platform || '', reviews, c.case)}</details>
       ${!compact && dir ? runExtras(dir) : ''}
       ${gates ? `<div class="dim">⛔ 过闸留痕 ${gates}</div>` : ''}
       ${orphansHtml}
@@ -812,10 +1024,12 @@ function renderCaseDetail(c) {
   // 规格视图：断言只显示预期，不显示某一次的实际（实际属于 run，不属于用例本身）
   // 规格页以前传空结果 ⇒ 每条断言都显示「未跑」，读的人以为没测（看到一片「未跑」会被误导）。
   // 现在填「最近一次记录」：所有 run 里按记录时间取最新那条；证据在那次执行的面板里，这里只写出处。
-  const latest = {};
+  const latest = {}, expById = new Map(); walkTree(c.tree || [], n => (n.expect || []).forEach(e => expById.set(e.id, e)));
   for (const r of runs) {
     for (const [eid, x] of Object.entries(r.res?.results || {})) {
       if (!x || x.status === 'todo') continue;
+      // 判法改过（观测、判据、前提变了）：按旧判法得出的结论不算这条断言现在的结论 —— 不然改了测法，页面上还挂着旧的「通过」
+      { const e = expById.get(eid); if (e && x.observed && !judgedByCurrent(x, e)) continue; }
       const t = recordTime(r.dir, r.res, eid);
       if (!latest[eid] || t >= latest[eid]._t)
         latest[eid] = { status: x.status, blocked_kind: x.blocked_kind, na_since: x.na_since, finding: x.finding,
@@ -829,17 +1043,18 @@ function renderCaseDetail(c) {
     <div class="meta"><code>${esc(c.case)}</code>
       · 被引用于 ${(c._demandIds || []).length ? c._demandIds.map(d => `<a class="caselink" href="#run=${esc(d)}"><code>${esc(d)}</code></a>`).join(' ') : '<span class="dim">（没有评审单引用）</span>'}
       ${c.origin?.id ? `· 出处 <code>${esc(c.origin.id)}</code>` : ''}
-      · 平台 ${platChips(c)} · ${nodes} 个操作节点 / ${countExpects(c)} 条断言
-      · 跑过 ${runs.length} 次${last ? ` · 最近 <span class="pill ${statusClass(last.res?.verdict)}">${esc(String(last.res?.verdict))}</span>` : ''}
+      · ${clarityChip(c)} · 平台 ${platChips(c)} · ${nodes} 个操作节点 / ${countExpects(c)} 条断言
+      · 跑过 ${runs.length} 次${last ? ` · 最近 <span class="pill ${statusClass(last.res?.verdict)}">${esc(last.res?.verdict ? String(last.res.verdict) : '还没出结论')}</span>` : ''}
       · <a href="#run=allcases" class="opref">← 回用例清单</a></div>
     ${renderIncludes(c)}
     ${c.why ? `<div class="rule"><b>为什么要有这条用例</b><div>${esc(c.why)}</div></div>` : ''}
-    ${c.rule ? `<div class="rule"><b>被测规格</b><div>${esc(c.rule)}</div></div>` : ''}
-    ${(c.claims || []).length ? `<div class="rule"><b>用例主张 → 由哪些断言证实</b>${c.claims.map(cl => `<div>· ${esc(cl.text)} <span class="dim">← ${esc((cl.proved_by || []).join(' '))}</span></div>`).join('')}</div>` : ''}
+    ${c.rule ? `<div class="rule"><b>判定依据</b><div class="dim">写用例的人定的：预期从哪来、什么情况算失败</div><div>${esc(c.rule)}</div></div>` : ''}
+    ${renderClaimMap(c)}
     ${pre ? `<h3>前置条件</h3><ul class="pre">${pre}</ul>` : ''}
     ${cls ? `<h3>覆盖切面</h3><div>${cls}</div>` : ''}
-    <h3>操作 × 条件 × 输入 × 预期</h3>
-    ${spec}
+    <h3>步骤</h3>
+    ${renderStepView(c, latest, null, null, { evidence: false })}<div class="dim">证据在某一次执行里：点下面历史执行里的那一次看</div>
+    <details class="fulltree"><summary class="dim">完整操作树（原文、观测规格）</summary>${spec}</details>
     <h3>历史执行</h3>
     <table class="cases"><thead><tr><th>run</th><th>结论</th></tr></thead><tbody>${runRows}</tbody></table>
   </section>`;
@@ -994,6 +1209,14 @@ const demandRounds = [];
   }
   demandRounds.sort((a, b) => b.last - a.last);
 }
+// 还没跑过的评审单：侧栏「需求执行记录」按运行建，一次都没跑的需求没有面板 —— 新需求要 owner 批的评审单、
+// 要他定的 finding 因此整个看不见（实测：执行者发来的直达链接落到了别的需求，owner 找不到要他批的单子）。
+// 近 14 天动过的都单列一节；更早的不再摆（多半已弃用），link 照样能直达
+const PLAN_FRESH_MS = 14 * 86400e3;
+const planMtime = did => { try { return statSync(join(ROOT, 'state', 'plans', `${did}.json`)).mtimeMs; } catch { return 0; } };
+const planOnly = PLANS.filter(p => !demandRounds.some(dr => dr.did === p.demand)).sort((a, b) => planMtime(b.demand) - planMtime(a.demand));
+const planOnlyFresh = planOnly.filter(p => Date.now() - planMtime(p.demand) < PLAN_FRESH_MS);
+
 // 运行号 → 它所在那一轮的面板。链接常常直接带运行号（#run=<运行目录名>），而面板是按轮组织的；
 // 不认就会落到第一个需求上，读的人以为链接坏了。没有记录的运行归到它需求的最新一轮
 const RUN2K = {};
@@ -1001,7 +1224,10 @@ for (const dr of demandRounds) {
   const latest = `round:${dr.did}:${dr.rf.rounds[dr.rf.rounds.length - 1].id}`;
   for (const r of runs) if (r.res && (r.res.demand?.id || r.res.demand) === dr.did) RUN2K[r.id] = latest;
   dr.mem.forEach((m, i) => { for (const run of m.runs) RUN2K[run] = `round:${dr.did}:${dr.rf.rounds[i].id}`; });
+  // 评审单面板只在需求还没跑过时有；开跑后旧的 plan:<需求> 链接落到它的最新一轮，不落到别的需求
 }
+// 需求只有一个地址（#run=<需求>）。以前开跑前后在两个面板（评审单 / 第 N 轮）之间换位置，发出去的链接几分钟后就落空
+for (const did of new Set([...demandRounds.map(dr => dr.did), ...planOnly.map(p => p.demand)])) RUN2K[`plan:${did}`] = did;
 const stTally = st => { const t = { pass: 0, fail: 0, blocked: 0, gap: 0, todo: 0, skip: 0, na: 0 }; for (const v of st.values()) t[v.status] = (t[v.status] || 0) + 1; return t; };
 const aggOf = t => t.fail ? 'fail' : (t.blocked || t.gap || t.todo) ? 'mixed' : 'pass';
 function codeTable(rd) {
@@ -1384,7 +1610,8 @@ function renderRoundPanel(dr, i) {
 // 按需求分组，并默认只看**最近活跃**的需求 —— 全项目累积 103 条「待 owner 定」里，
 // 绝大多数是早期需求的历史条目（最早那几轮的，早已不成立）。
 // 全部塞进横幅等于噪音，owner 一眼看不出哪几条是现在要他定的。
-const __activeDids = new Set(demandRounds.slice(0, 2).map(dr => dr.did));   // 侧栏已按最近活跃排序
+// 还没跑过的新评审单也算活跃：它的 finding 恰恰是开跑前要 owner 定的
+const __activeDids = new Set([...demandRounds.slice(0, 2).map(dr => dr.did), ...planOnlyFresh.map(p => p.demand)]);   // 侧栏已按最近活跃排序
 const pendingAll = allPlans(ROOT).flatMap(p =>
   (p.findings || [])
     .filter(f => findingStatus(f)[1] === 'bad')          // 只有「待 owner 定」这一类
@@ -1459,18 +1686,38 @@ function renderDecide() {
   return head + groups.join('') + unclear;
 }
 
+// 定期优化包（core/timing.mjs）：最新一份的内容原样摆出来，处理完的写着怎么处理的
+const TUNE_LAST = tunePacks(ROOT).at(-1) || null;
 const navTop =
    `<div class="navsec">资产</div>`
   + `<button class="nav nav-d" data-k="allcases"><span class="dot pass"></span><span class="nt"><b>📋 用例清单</b><small>${cases.length} 条用例 · 点标题进详情</small></span></button>`
   + `<button class="nav nav-d" data-k="ops"><span class="dot pass"></span><span class="nt"><b>🧰 操作集</b><small>${Object.keys(OPS).length} 条操作 · 步骤 + 配图</small></span></button>`
+  + (TUNE_LAST ? `<button class="nav nav-d" data-k="tune"><span class="dot ${TUNE_LAST.done ? 'pass' : 'wip'}"></span><span class="nt"><b>🔧 优化包</b><small>${esc(TUNE_LAST.id)} · ${TUNE_LAST.done ? '已处理' : '还没处理'}</small></span></button>` : '')
   + libs.map(lib => `<button class="nav nav-d" data-k="${lib.key}"><span class="dot pass"></span><span class="nt"><b>📚 ${esc(lib.title)}</b><small>${lib.done}/${lib.total} 常备用例</small></span></button>`).join('')
   ;
 
 // 侧栏那颗点 = 面板顶上的 whole 状态，同一套 tallyOf 算出来（按断言，不按用例 verdict）。
 // 两处用两套算法时，侧栏会显示「通过」而面板显示「有验不了的」—— 那种自相矛盾不该存在。
-const navDemands = demandRounds.map((dr, di) => {
-  const cur = dr.states[dr.states.length - 1], t = stTally(cur);
-  const items = dr.rf.rounds.map((rd, i) => ({ rd, i })).reverse().map(({ rd, i }) => {
+// owner 在这个需求上要做的事：批评审单、定 finding、认用例改动、答阻塞问题。每件一句话 + 当场办或一步跳过去
+const nextMemo = new Map();
+const cardsOf = did => { if (!nextMemo.has(did)) { let cs = []; try { cs = nextCards(ROOT, did) || []; } catch { /* 算不出卡片：当没有 */ } nextMemo.set(did, cs); } return nextMemo.get(did); };
+function ownerTodo(did) {
+  const plan = PLANS.find(p => p.demand === did), cs = cardsOf(did), out = [];
+  if (plan && !cs.some(c => c.kind === 'plan_draft')) {
+    const { added } = planDelta(plan), kept = approvedCases(plan).size;
+    if (!plan.approved_at && added.length) out.push(`<b>同不同意把 ${added.length} 条用例加进这次验收</b>${kept ? ` <span class="dim">· 已同意过的 ${kept} 条照常测</span>` : ''}${approvalDetail(plan, added, kept)}`);
+  }
+  for (const f of (plan?.findings || []).filter(f => findingStatus(f)[1] === 'bad' && !findingProblems(f).length))
+    out.push(`<b>定一件事：</b>${esc(askOf(f))} <a class="ny-go" href="#run=decide&f=${esc(f.id)}">去定 →</a>`);
+  const bq = cs.filter(c => c.kind === 'attention' && c.subject === 'blocker' && c.question);
+  const dr = demandRounds.find(x => x.did === did);
+  if (bq.length) out.push(`<b>答 ${new Set(bq.map(c => String(c.question).trim())).size} 个问题</b> <span class="dim">· 执行者卡住了 ${bq.length} 条断言</span>${dr ? ` <a class="caselink" href="#run=${esc(`round:${did}:${dr.rf.rounds[dr.rf.rounds.length - 1].id}`)}">去答 →</a>` : ''}`);
+  return out;
+}
+
+// 侧栏：一个需求一行，不管还没跑、在跑还是跑完 —— 点进去永远是同一个需求页（最上面是等你做的事）。
+// 轮次挂在它下面当历史记录；还没跑过的需求只列近 14 天动过的（更早的多半弃用了，link 照样直达）
+const roundItems = dr => dr.rf.rounds.map((rd, i) => ({ rd, i })).reverse().map(({ rd, i }) => {
     const ti = stTally(dr.states[i]);
     // 卡片只给「已测 / 总条数」：已测 = 本轮测 + 继承来的（有结论的）；重置待测与从没测过的不算
     let tested = 0; for (const v of dr.states[i].values()) if ((v.source === 'here' || v.source === 'inherited') && v.status !== 'todo') tested++;
@@ -1479,18 +1726,25 @@ const navDemands = demandRounds.map((dr, di) => {
     return `<button class="nav nav-r" data-k="${esc(`round:${dr.did}:${rd.id}`)}"><span class="dot ${statusClass(aggOf(ti))}"></span>
       <span class="nt"><b>第 ${rd.seq} 轮${Date.parse(rd.opened_at) > 0 ? ` · ${esc(shortTime(rd.opened_at).slice(0, 10))}` : ''}</b>
       <small>${code ? `${esc(code.branch || '?')} @ ${esc((code.commit || '').slice(0, 8))}` : '代码版本未记录'}</small>
-      <small><b>有结论 ${tested} / 共 ${total} 条</b>${i === dr.rf.rounds.length - 1 && liveOf(dr, i) ? (() => { const tt = trustOf(dr.states[i]); return tt.noshot || tt.gap || tt.cant ? ` · <span class="t-bad">${[tt.noshot && `${tt.noshot} 无画面`, tt.gap && `${tt.gap} 证据不全`, tt.cant && `${tt.cant} 验不了`].filter(Boolean).join(' · ')}</span>` : ''; })() : ''}</small></span></button>`;
+      <small><b>有结论 ${tested} / 共 ${total} 条</b></small></span></button>`;
   }).join('');
-  const latestK = `round:${dr.did}:${dr.rf.rounds[dr.rf.rounds.length - 1].id}`;
-  return `<details class="dgrp"${di === 0 ? ' open' : ''} data-did="${esc(dr.did)}" data-latest="${esc(latestK)}"><summary><span class="dg-tw" title="收起 / 展开这条需求的轮次"></span><span class="dot ${statusClass(aggOf(t))}"></span><span class="nt"><b>${esc(dr.demand.title)}</b>
-    <small>${esc(dr.did)} · 测了 ${dr.rf.rounds.length} 轮 · ${dr.runCount} 个 run · 最近 ${esc(shortTime(new Date(dr.last).toISOString()).slice(0, 10))}</small>
-    <span class="navtally">${tallyBadges(t)}</span></span></summary>${items}</details>`;
+const DEMAND_NAV = [...demandRounds.map(dr => ({ did: dr.did, dr, t: Math.max(dr.last, planMtime(dr.did)) })),
+  ...planOnlyFresh.map(p => ({ did: p.demand, dr: null, t: planMtime(p.demand) }))].sort((a, b) => b.t - a.t);
+const navDemands = DEMAND_NAV.map(({ did, dr }, di) => {
+  const plan = PLANS.find(p => p.demand === did), todo = ownerTodo(did);
+  const t = dr ? stTally(dr.states[dr.states.length - 1]) : null;
+  const title = dr ? dr.demand.title : (plan?.title || did);
+  const sub = dr ? `测了 ${dr.rf.rounds.length} 轮 · 最近 ${esc(shortTime(new Date(dr.last).toISOString()).slice(0, 10))}` : (plan?.approved_at ? '已批准，还没开跑' : '还没跑');
+  return `<details class="dgrp"${di === 0 ? ' open' : ''} data-did="${esc(did)}" data-latest="${esc(did)}"><summary><span class="dg-tw" title="收起 / 展开这条需求的轮次"></span><span class="dot ${todo.length ? 'wip' : t ? statusClass(aggOf(t)) : 'todo'}"></span><span class="nt"><b>${esc(title)}</b>
+    <small>${esc(did)} · ${sub}</small>${todo.length ? `<small class="t-bad"><b>等你 ${todo.length} 件</b></small>` : ''}
+    ${t ? `<span class="navtally">${tallyBadges(t)}</span>` : ''}</span></summary>
+    <button class="nav nav-r" data-k="${esc(did)}"><span class="dot ${todo.length ? 'wip' : 'pass'}"></span><span class="nt"><b>总览</b><small>${todo.length ? `等你 ${todo.length} 件` : '没有要你做的'}</small></span></button>${dr ? roundItems(dr) : ''}</details>`;
 }).join('');
 const navDecide = pendingFindings.length
   ? `<div class="navsec">等你定</div><button class="nav" data-k="decide">🔻 待裁定 finding <span class="bs bad">${readyFindings.length}</span></button>`
   : '';
 // 「等你定」是独立的一节，排在「需求执行记录」标题之前（以前插在标题和需求之间，读起来像需求记录的一部分）
-const nav = navTop + navDecide + `<div class="navsec">需求执行记录</div>` + navDemands + '<div style="display:none">' + execs.map(ex => {
+const nav = navTop + navDecide + `<div class="navsec">需求</div>` + navDemands + '<div style="display:none">' + execs.map(ex => {
   const w = sumTallies(ex.cases.map(({ c, rs }) =>
     tallyOf(walkExpects(c.tree || []), rs[rs.length - 1]?.res?.results || {})));
   const sup = ex.supersededBy ? ` · <b style="color:var(--muted)">↻ 已被 ${esc(ex.supersededBy)} 复跑取代</b>` : '';
@@ -1504,6 +1758,58 @@ const nav = navTop + navDecide + `<div class="navsec">需求执行记录</div>` 
 // 一个积累了几百轮的项目全渲染要半分钟以上（实测读数据 2s、渲染面板 28s、写 94MB 文件十几秒），几乎全花在没人看的面板上。
 const PANELS = new Map();
 for (const dr of demandRounds) dr.rf.rounds.forEach((rd, i) => PANELS.set(`round:${dr.did}:${rd.id}`, () => renderRoundPanel(dr, i)));
+// 需求页：owner 只认这一个地址。从上往下：等你做的事（当场办或一步跳过去）→ 批准记录（谁批的、记下的原话，
+// 记错了一眼看得出）→ 这次要证明什么、做到哪了（按改动面列用例：结论树 + 结果）→ 逐轮记录（折叠）
+// 批准后的改动：按自动批准标准记下的（plan.notices 里带 rules 的）。验的范围变了的直接列出来给 owner 看（不挡事），其余折叠；
+// 每条规则的「后来被复核驳回」次数 = 标准放过了不该放的信号，据此收紧 AUTO_RULES
+function autoApproveStats(plan, did) {
+  const st = {};
+  for (const n of (plan?.notices || []).filter(n => n.rules?.length)) {
+    const rejected = (n.reset || []).some(id => runs.some(r => r.res?.case === n.case && (r.res.demand?.id || r.res.demand) === did
+      && Object.entries(r.res.reviews || {}).some(([k, v]) => k.startsWith(`${id}::`) && !['ok', 'pending'].includes(v?.state) && String(v?.at || '') > n.at)));
+    for (const rule of n.rules) { const x = (st[rule] ??= { n: 0, rejected: 0 }); x.n++; if (rejected) x.rejected++; }
+  }
+  return st;
+}
+function autoEditsHtml(plan, did) {
+  const ns = (plan?.notices || []).filter(n => n.rules?.length);
+  if (!ns.length) return '';
+  const scope = ns.filter(n => n.tier === 'scope'), st = autoApproveStats(plan, did);
+  // 每处改动一行摘要（几处、理由开头），明细（改了哪些、改前改后怎么判）点开看 —— 一次改几十条断言时整段铺开会把页面撑爆
+  const line = n => `<li><details><summary>${esc(shortTime(n.at))} <b>${esc(ALL_CASES[n.case]?.title || n.case)}</b>：${n.changes.length} 处改动 <span class="dim">—— ${esc(String(n.why || '').slice(0, 60))}${String(n.why || '').length > 60 ? '…' : ''}</span></summary><div>${esc(n.changes.join('；'))}</div><div class="dim">理由：${esc(n.why)}</div>`
+    + (n.judged || []).map(j => `<div class="dim">${esc(j.id)} 以前判：${esc(j.before)}；现在判：${esc(j.after)}</div>`).join('')
+    + ((n.reset || []).length ? `<div class="dim">${esc(n.reset.join(' '))} 的旧结论已作废，按新判法重测</div>` : '') + '</details></li>';
+  return `<div class="rule"><div class="rk">批准后的改动（按自动批准标准通过，不用你再批）</div>`
+    + (scope.length ? `<div><b>验的范围变了 ${scope.length} 处</b>（删断言、改断言原话、缩范围），给你看一眼：</div><ul>${scope.map(line).join('')}</ul>` : '')
+    + `<details class="apd"><summary>全部 ${ns.length} 处改动，和自动批准标准的表现</summary><ul>${ns.map(line).join('')}</ul>`
+    + Object.entries(st).map(([r, x]) => `<div class="dim">${esc(r)} ${esc(AUTO_RULES[r]?.title || '')}：通过 ${x.n} 次${x.rejected ? `，其中 <b>${x.rejected} 次后来被复核驳回</b>（这条规则放过了不该放的，要收紧）` : ''}</div>`).join('')
+    + `</details></div>`;
+}
+function renderDemandPage(did) {
+  const plan = PLANS.find(p => p.demand === did), dr = demandRounds.find(x => x.did === did);
+  const title = dr ? dr.demand.title : (plan?.title || did), todo = ownerTodo(did);
+  const draft = cardsOf(did).find(c => c.kind === 'plan_draft');
+  const todoHtml = `<div class="ask"><div class="ask-h"><b>${todo.length ? `等你 · ${todo.length} 件` : '现在没有要你做的事'}</b></div>${todo.length ? `<ol>${todo.map(x => `<li>${x}</li>`).join('')}</ol>` : ''}</div>`
+    + (draft ? `<div class="dim">执行者还在改评审单（${esc(draft.title)}），改好会出现在上面让你批。</div>` : '');
+  const decided = (plan?.findings || []).filter(f => f.decided_by);
+  const record = plan?.approved_at ? `<details class="rule apr"><summary><span class="rk">批准记录</span> 评审单 v${esc(String(plan.revision))}：<b>${esc(plan.approved_by || '')}</b> ${esc(shortTime(plan.approved_at))} 批准，记下的原话「${esc(plan.approved_quote || '')}」${decided.length ? ` <span class="dim">· 定了 ${decided.length} 件事，点开看</span>` : ''}</summary>`
+    + decided.map(f => `<div>${esc(f.id)} ${esc(askOf(f))} → 定了「${esc(clipStr(f.decision || '', 120))}」（${esc(f.decided_by)}）</div>`).join('')
+    + `<div class="dim">这不是你说的批准、或者定的不是你选的，跟执行者说撤回。</div></details>` : '';
+  const runsOf = c => runs.filter(r => r.res?.case === c && (r.res.demand?.id || r.res.demand) === did).sort((a, b) => (a.res.run_seq || 0) - (b.res.run_seq || 0));
+  const sf = (plan?.surfaces || []).map(x => { const cs = [...(x.reuse || []), ...(x.new || [])];
+    return `<div class="sfc"><div class="sfc-h">${esc(x.id)} ${esc(x.change || '')}</div>${cs.map(c => ALL_CASES[c] ? caseTreeNode(ALL_CASES[c], runsOf(c), {}) : `<div class="dim">${esc(c)}（用例文件不在）</div>`).join('')}</div>`; }).join('');
+  const hist = dr ? `<details class="apd"><summary>逐轮记录（${dr.rf.rounds.length} 轮）</summary>${dr.rf.rounds.map(rd => `<div><a class="caselink" href="#run=${esc(`round:${did}:${rd.id}`)}">第 ${rd.seq} 轮</a> ${Date.parse(rd.opened_at) > 0 ? esc(shortTime(rd.opened_at)) : ''}</div>`).join('')}</details>` : '';
+  return `<section class="panel" data-k="${esc(did)}" hidden>
+  <div class="phead"><h1>${esc(title)}</h1><button class="copylink" data-k="${esc(did)}">🔗 复制链接</button></div>
+  <div class="meta"><code>${esc(did)}</code>${plan ? ` · 评审单 v${esc(String(plan.revision))} · ${(plan.surfaces || []).length} 个改动面 / ${planCaseSet(plan).size} 条用例` : ' · 没有评审单'}${dr ? ` · 测了 ${dr.rf.rounds.length} 轮` : ' · 还没跑'}</div>
+  ${todoHtml}${record}${autoEditsHtml(plan, did)}<h3>用例与执行</h3>${(plan?.surfaces || []).length ? renderExecBoard(did, plan, runsOf) : '<div class="dim">评审单里还没有用例</div>'}${hist}</section>`;
+}
+for (const { did } of DEMAND_NAV) PANELS.set(did, () => renderDemandPage(did));
+if (TUNE_LAST) PANELS.set('tune', () => { let md = ''; try { md = readFileSync(TUNE_LAST.md, 'utf8'); } catch {}
+  return `<section class="panel" data-k="tune" hidden><div class="phead"><h1>🔧 优化包 ${esc(TUNE_LAST.id)}</h1></div>
+  <div class="meta">${TUNE_LAST.done ? `已处理（${esc(TUNE_LAST.done.done_at.slice(0, 10))}）：${esc(TUNE_LAST.done.note)}` : '还没处理：定期会话照包里每节的「要判断」处理，做完 acceptkit tune done ' + esc(TUNE_LAST.id) + ' --note "…"'}</div>
+  <div class="rule" style="white-space:pre-wrap">${esc(md)}</div></section>`; });
+for (const p of planOnly) if (!PANELS.has(p.demand)) PANELS.set(p.demand, () => renderDemandPage(p.demand));
 if (pendingFindings.length) PANELS.set('decide', () => `<section class="panel" data-k="decide" hidden>
   <div class="phead"><h1>🔻 等你定（${readyFindings.length} 条）</h1><button class="copylink" data-k="decide">🔗 复制链接</button></div>
   ${renderDecide()}</section>`);
@@ -1636,6 +1942,9 @@ details.ctree>summary .dot{margin-top:0}
 .ct-id{font-size:11px;color:var(--muted)}
 .ctree-d{font-size:11px}
 .ctree-b{padding:2px 10px 10px;border-top:1px solid var(--line)}
+.eb-head{display:flex;gap:28px;align-items:flex-start;flex-wrap:wrap;margin:8px 0 12px}.eb-big b{display:block;font-size:30px;line-height:1.1}.eb-tal{display:grid;gap:3px;font-size:13px}.eb-bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:6px 0 10px}.eb-v{border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:3px 12px;border-radius:5px;cursor:pointer}.eb-v.on{background:#0a5fbf;color:#fff;border-color:#0a5fbf}.eb-q{flex:1;min-width:160px;max-width:320px;padding:4px 8px;border:1px solid var(--line);border-radius:5px;background:var(--panel);color:var(--ink)}.eb-f{padding:4px;border:1px solid var(--line);border-radius:5px;background:var(--panel);color:var(--ink)}.eb-sf{margin:10px 0 14px}details.eb-case{border:1px solid var(--line);border-radius:6px;margin:6px 0;background:var(--panel)}details.eb-case>summary{cursor:pointer;padding:7px 10px}details.eb-case>.sv{padding:0 10px 8px}.eb-st{white-space:nowrap}.eb-st.st-fail{color:#b4232a}.eb-st.st-pass{color:#116329}.eb-op{max-width:220px;font-size:12px}.eb-table{overflow-x:auto}
+.mm{overflow-x:auto;padding:6px 0}.mm-g{display:flex;align-items:center;gap:0;margin:10px 0}.mm-brs{display:flex;flex-direction:column;gap:8px;padding-left:22px;border-left:2px solid var(--line);margin-left:22px;position:relative}.mm-br{display:flex;align-items:center;gap:22px;position:relative}.mm-br::before{content:'';position:absolute;left:-22px;top:50%;width:22px;border-top:2px solid var(--line)}.mm-exps{display:flex;flex-direction:column;gap:6px;position:relative}.mm-exps::before{content:'';position:absolute;left:-22px;top:50%;width:22px;border-top:2px solid var(--line)}.mm-box{border:1px solid var(--line);border-radius:6px;background:var(--panel);padding:6px 9px;font-size:12.5px;line-height:1.55;position:relative}.mm-pre{min-width:180px;max-width:260px;flex:none}.mm-step{width:340px;flex:none}.mm-exp{width:340px}.mm-k{font-size:10.5px;color:var(--faint);margin-bottom:2px}details.brief>summary{cursor:pointer;list-style:none}details.brief>summary::-webkit-details-marker{display:none}.brief-full{margin-top:4px;padding:6px;background:var(--line2);border-radius:4px;font-size:12px;max-height:260px;overflow:auto;word-break:break-word}.warnline{color:#9a6700;font-size:12px}details.mach{margin-top:3px}details.mach>summary{cursor:pointer;font-size:11px}.mm-how ol,details.frag ol{margin:3px 0 3px 18px;padding:0}.mm-how{margin-top:5px;padding-top:4px;border-top:1px dashed var(--line);font-size:12px;color:var(--muted)}.mm-how .mm-k{display:inline;margin-right:4px}.mm-l code{font-size:11px;color:var(--muted)}.mm-tag{position:absolute;right:6px;top:5px}.mm-exp.mm-bad{border-color:#e5534b;background:rgba(229,83,75,.06)}.mm-exp.mm-ok{border-color:#2da44e55}.mm-foot{margin-top:4px;font-size:11.5px}.mm-st{padding:0 6px;border-radius:3px}.mm-st.mm-ok{background:#dafbe1;color:#116329}.mm-st.mm-bad{background:#ffebe9;color:#b4232a}.mm-st.mm-warn{background:#fff8c5;color:#7d4e00}.mm-st.mm-dim{background:var(--line2);color:var(--muted)}:root:not([data-theme=light]) .mm-st.mm-ok{background:#12361f;color:#7ee2a8}:root:not([data-theme=light]) .mm-st.mm-bad{background:#4a1214;color:#ff9a9a}
+.sv-t td{vertical-align:top}.sv-step td{background:var(--line2)}.sv-id{white-space:nowrap}.sv-op{font-weight:600}.sv-par{margin-top:3px;font-size:12px;color:var(--muted)}.sv-exp td:nth-child(3){padding-left:14px}.sv-ev{min-width:90px}.sv-cfg{margin:6px 0}.tr{display:inline-block;font-size:11px;padding:1px 6px;border-radius:3px;white-space:nowrap}.tr-real{background:#dafbe1;color:#116329}.tr-mock{background:#ddf4ff;color:#0a5fbf}.tr-inj{background:#ffebe9;color:#b4232a}.tr-unk{background:#fff8c5;color:#7d4e00}:root:not([data-theme=light]) .tr-real{background:#12361f;color:#7ee2a8}:root:not([data-theme=light]) .tr-mock{background:#0c2d4a;color:#79b8ff}:root:not([data-theme=light]) .tr-inj{background:#4a1214;color:#ff9a9a}:root:not([data-theme=light]) .tr-unk{background:#3d2e00;color:#e3b341}details.cfg,details.frag{display:inline-block;vertical-align:top;margin-right:6px}details.cfg>summary,details.frag>summary{cursor:pointer;font-size:12px;color:#0a5fbf}.cfgt{margin:4px 0;max-width:640px}details.frag ol{margin:4px 0 4px 18px;font-size:12px}.frag1{font-size:12px;color:#0a5fbf}details.fulltree{margin-top:8px}
 details.ctree.gnode{border-style:dashed}
 details.ctree.sfnode{border-width:1px 1px 1px 3px;background:var(--bg2,#fafbfc)}
 details.ctree.sfnode>summary{font-size:13.5px}
@@ -1756,6 +2065,12 @@ h1{font-size:20px;margin:0 0 4px}.meta{color:var(--faint);font-size:12px;margin-
 .chead b{font-size:14px}.chead code,.dim{color:var(--faint);font-size:11.5px;font-family:var(--mono)}
 .rule{font-size:12.5px;line-height:1.7;background:var(--line2);border:1px solid var(--line);border-left:3px solid var(--pass);border-radius:8px;padding:9px 12px;margin:0 0 10px}
 .rule .rk{font-size:11px;font-weight:700;color:var(--muted);margin-bottom:4px}
+.cmap ul.cm{list-style:none;margin:2px 0 2px 8px;padding-left:12px;border-left:1px solid var(--line)}
+.cmap ul.cm-root{border-left:0;margin-left:0;padding-left:0}
+.cmap .cm-h{margin:3px 0}
+.cmap .cm-as{font-size:12px;color:var(--muted);margin:1px 0}
+details.exd>summary{cursor:pointer;font-size:11.5px}
+.exd-b{font-size:12px;line-height:1.6;color:var(--muted);margin:2px 0 4px 12px}
 .rep{font-size:12px;color:var(--muted);border-left:2px solid var(--line);padding-left:10px;margin:0 0 10px}
 .rep .k{display:inline-block;min-width:80px;color:var(--faint);font-family:var(--mono);font-size:11px}
 details.run{border-top:1px solid var(--line2);padding:8px 0}
@@ -1776,6 +2091,8 @@ li.node{margin:6px 0}
 .nhead{display:flex;align-items:baseline;gap:6px;flex-wrap:wrap;font-size:13px}
 .nhead b{font-weight:620}
 code.nid{font-family:var(--mono);font-size:10.5px;color:var(--faint)}
+.mm-gt{font-weight:600;color:var(--muted)}
+details.rvchip{display:inline-block}details.rvchip>summary{list-style:none;cursor:pointer}details.rvchip ol{margin:6px 0 0 18px;font-size:12px}
 code.tag{font-family:var(--mono);font-size:10px;color:var(--muted);background:var(--line2);padding:0 4px;border-radius:3px}
 code.aid{font-family:var(--mono);font-size:10.5px;color:var(--muted)}
 li.as-li{font-size:12.5px;margin:3px 0;line-height:1.5}
@@ -1865,6 +2182,10 @@ document.addEventListener('click',e=>{const a=e.target.closest('.caselink,.opref
 //  ① 跳过去看到一个关着的抽屉 = 这次点击没有任何可见结果（L7）；必须 open=true。
 //  ② 绝不写 location.hash —— hash 是面板路由（run=<session>），写成 case-node-x
 //     会让「复制链接 / 刷新」落到别的面板去（实测落到 allcases）。所以 preventDefault。
+document.addEventListener('click',e=>{const b=e.target.closest('.eb-v');if(!b)return;const eb=b.closest('.eb');eb.querySelectorAll('.eb-v').forEach(x=>x.classList.toggle('on',x===b));eb.querySelector('.eb-cfg').hidden=b.dataset.v!=='cfg';eb.querySelector('.eb-tree').hidden=b.dataset.v!=='tree';eb.querySelector('.eb-table').hidden=b.dataset.v!=='table';});
+function ebFilter(eb){const q=(eb.querySelector('.eb-q').value||'').toLowerCase().trim(),f=eb.querySelector('.eb-f').value;eb.querySelectorAll('.eb-row').forEach(r=>{r.hidden=(f&&r.dataset.st!==f)||(q&&!r.dataset.q.includes(q));});eb.querySelectorAll('.eb-case').forEach(c=>{c.hidden=(f&&!c.dataset.st.split(' ').includes(f))||(q&&!c.dataset.q.includes(q));});}
+document.addEventListener('input',e=>{const eb=e.target.closest('.eb');if(eb&&e.target.matches('.eb-q,.eb-f'))ebFilter(eb);});
+document.addEventListener('change',e=>{const eb=e.target.closest('.eb');if(eb&&e.target.matches('.eb-f'))ebFilter(eb);});
 document.addEventListener('click',e=>{const a=e.target.closest('a.cchip');if(!a)return;
  e.preventDefault();
  const el=document.querySelector(a.getAttribute('href'));if(!el)return;
@@ -1912,9 +2233,9 @@ document.addEventListener('click',e=>{const a=e.target.closest('a[href^="#run=de
  const has=k=>k&&pans.some(p=>p.dataset.k===k);
  if(!want)try{want=localStorage.getItem(${JSON.stringify(HOST_MSG + ':last:' + ROOT.split('/').pop())})||''}catch(e){}
  const known=has(want)||has(RUN2K[want]);if(!has(want)&&has(RUN2K[want]))want=RUN2K[want];
- // 没指定就落到第一个需求的最新一轮（需求执行记录是主视图）
- const firstRound=document.querySelector('.nav-r');
- sel(known?want:(firstRound?firstRound.dataset.k:(navs[0]&&navs[0].dataset.k)));})();
+ // 没指定就落到最近活跃的那个需求的需求页
+ const firstD=document.querySelector('details.dgrp');
+ sel(known?want:(firstD?firstD.dataset.latest:(navs[0]&&navs[0].dataset.k)));})();
 // 在页面上直接裁定：POST 给管理页面，由它调 acceptkit plan decide 写回那一条（原话照抄）。
 // 裁定人由管理页面填（这台电脑的主人，project.mjs ownerIdentity）；原话是 owner 自己选 / 写的，页面不替他写。
 (function(){const URL_=${JSON.stringify(DECIDE_URL)};if(!URL_)return;

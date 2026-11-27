@@ -45,7 +45,7 @@ export function latestRun(root) {
 export function resolveLink(root, ref) {
   const r = ref || latestRun(root);
   if (!r) return { error: '项目里还没有运行；给一个用例或需求：acceptkit link <用例|需求>' };
-  if (/^(case|round):/.test(r)) return { key: r, what: `看板面板 ${r}` };
+  if (/^(case|round|plan):/.test(r)) return { key: r, what: `看板面板 ${r}` };
   const res = resultOf(root, r);
   if (res) {
     const report = ['run.md', 'report.md'].map(f => join(root, 'runs', r, f)).find(existsSync) || null;
@@ -53,7 +53,8 @@ export function resolveLink(root, ref) {
   }
   const ofDemand = runsWhere(root, res => demandId(res) === r).at(-1);
   const rf = loadRounds(root, r);
-  if (rf?.rounds?.length) { const rd = rf.rounds[rf.rounds.length - 1]; return { key: `round:${r}:${rd.id}`, run: ofDemand?.x, what: `需求 ${r} 第 ${rf.rounds.length} 轮（最新）` }; }
+  // 需求只有一个地址：需求页（最上面是等你做的事）。开跑前后都是它，发出去的链接不会因为需求开跑而落空
+  if (rf?.rounds?.length || existsSync(join(root, 'state', 'plans', `${r}.json`))) return { key: r, run: ofDemand?.x, what: `需求 ${r}` };
   if (ofDemand) return { key: runKey(ofDemand.res), run: ofDemand.x, what: `需求 ${r} 最近一次运行 ${ofDemand.x}（还没有回归轮）` };
   if (existsSync(join(root, 'cases', `${r}.case.json`))) return { key: `case:${r}`, run: runsWhere(root, res => res.case === r).at(-1)?.x, what: `用例 ${r}` };
   return { error: `${r} 不是运行、需求，也不是用例（acceptkit cases / demands 看有哪些）` };

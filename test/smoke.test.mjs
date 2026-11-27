@@ -25,7 +25,7 @@ function project() {
   writeFileSync(join(dir, 'ops', 'registry.json'), JSON.stringify({ ops: { 'diag-read': { kind: 'observe', title: '读诊断产物', platforms: { android: { exec: 'json-file', strength: 'S2' } } } } }));
   writeFileSync(join(dir, 'cases', 'c1.case.json'), JSON.stringify({ case: 'c1', title: '首页问候语', platform: 'android',
     classifications: { carrier: ['page'] },
-    tree: [{ op: '打开首页', tags: { carrier: 'page' }, expect: [{ id: 'E1', assert: '页面顶部显示「你好」' }] }] }));
+    tree: [{ op: '打开「首页」', tags: { carrier: 'page' }, expect: [{ id: 'E1', assert: '页面顶部显示「你好」' }] }] }));
   ok(dir, 'plan', 'new', 'D1', '--title', '首页问候', '--platform', 'android');
   ok(dir, 'plan', 'add-case', 'D1', '--surface', 'S1', '--change', '首页加了问候语', '--reuse', 'c1', '--risk', '看不到问候', '--uncovered', '其他页');
   ok(dir, 'plan', 'approve', 'D1', '--by', 'owner', '--quote', '可以');

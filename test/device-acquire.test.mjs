@@ -38,9 +38,9 @@ function project() {
     [BIG]: { platform: 'ios', name: 'phone-big', state: 'Booted', app: { bundle: 'com.example.app', version: '1.2.3' }, running: 'pid 42' },
     [COLD]: { platform: 'ios', name: 'phone-cold', state: 'Shutdown' },
   }));
-  writeFileSync(join(dir, 'cases', 'c1.case.json'), JSON.stringify({ case: 'c1', title: '首页问候语', platform: 'ios',
+  writeFileSync(join(dir, 'cases', 'c1.case.json'), JSON.stringify({ case: 'c1', title: '首页问候语', platform: 'ios', input: 'real',
     device_need: { ram_mb: '>=8192' }, classifications: { carrier: ['app_ui'] },
-    tree: [{ op: '打开首页', tags: { carrier: 'app_ui' }, expect: [{ id: 'E1', assert: '首页顶部显示「你好」' }] }] }));
+    tree: [{ op: '打开「首页」', tags: { carrier: 'app_ui' }, expect: [{ id: 'E1', assert: '首页顶部显示「你好」' }] }] }));
   ok(dir, 'plan', 'new', 'D1', '--title', '首页问候', '--platform', 'ios');
   ok(dir, 'plan', 'add-case', 'D1', '--surface', 'S1', '--change', '首页加了问候语', '--reuse', 'c1', '--risk', '看不到问候', '--uncovered', '其他页');
   ok(dir, 'plan', 'approve', 'D1', '--by', 'owner', '--quote', '可以');

@@ -18,9 +18,9 @@ function project(platform = 'web') {
   const dir = mkdtempSync(join(tmpdir(), 'acceptkit-test-'));
   for (const d of ['cases', 'runs', 'state/plans', 'knowledge', 'ops']) mkdirSync(join(dir, d), { recursive: true });
   writeFileSync(join(dir, 'acceptkit.project.json'), JSON.stringify({ name: 't', gate: { allow: [] } }));
-  writeFileSync(join(dir, 'cases', 'c1.case.json'), JSON.stringify({ case: 'c1', title: '首页问候语', platform,
+  writeFileSync(join(dir, 'cases', 'c1.case.json'), JSON.stringify({ case: 'c1', title: '首页问候语', platform, input: 'real',
     classifications: { carrier: ['page'] },
-    tree: [{ op: '打开首页', tags: { carrier: 'page' }, shows: ['你好'], expect: [{ id: 'E1', assert: '页面顶部显示「你好」' }] }] }));
+    tree: [{ op: '打开「首页」', tags: { carrier: 'page' }, shows: ['你好'], expect: [{ id: 'E1', assert: '页面顶部显示「你好」' }] }] }));
   return dir;
 }
 const runId = dir => readdirSync(join(dir, 'runs'))[0];
@@ -265,7 +265,7 @@ test('评审单中途加用例：只挡新加的那条；阶段按用例算；�
   const dir = project();
   writeFileSync(join(dir, 'cases', 'c2.case.json'), JSON.stringify({ case: 'c2', title: '首页副标题', platform: 'web',
     classifications: { carrier: ['page'] },
-    tree: [{ op: '打开首页', tags: { carrier: 'page' }, shows: ['欢迎'], expect: [{ id: 'E1', assert: '问候语下面显示「欢迎回来」' }] }] }));
+    tree: [{ op: '打开「首页」', tags: { carrier: 'page' }, shows: ['欢迎'], expect: [{ id: 'E1', assert: '问候语下面显示「欢迎回来」' }] }] }));
   ok(dir, 'plan', 'new', 'D1', '--title', '首页问候', '--platform', 'web');
   ok(dir, 'plan', 'add-case', 'D1', '--surface', 'S1', '--change', '首页加了问候语', '--reuse', 'c1', '--risk', '看不到问候', '--uncovered', '其他页');
   ok(dir, 'plan', 'approve', 'D1', '--by', 'owner', '--quote', '可以');
@@ -276,8 +276,8 @@ test('评审单中途加用例：只挡新加的那条；阶段按用例算；�
   // 内容漂移重钉指纹不等于替 Owner 批了新加的用例
   const cf = join(dir, 'cases', 'c1.case.json');
   writeFileSync(cf, readFileSync(cf, 'utf8').replace('页面顶部显示「你好」', '页面顶部第一行显示「你好」'));
-  // 改了断言原文 = 会影响结论：owner 认了才重钉（只加不删的改动不用，见 case-edit 测试）
-  ok(dir, 'plan', 'recheck', 'D1', '--why', '断言写得更具体', '--by', 'owner', '--quote', '改得对');
+  // 改了断言原文：按自动批准标准记下（写理由），不找 owner
+  ok(dir, 'plan', 'recheck', 'D1', '--why', '断言写得更具体');
 
   let cs = cards(dir);
   const ask = cs.find(c => c.subject === 'plan_approval');
@@ -380,7 +380,7 @@ test('看板最新一轮能完整生成：能信几成、等你（待批的用�
   ok(dir, 'plan', 'add-case', 'D1', '--surface', 'S1', '--change', '首页加了问候语（窄屏也要完整）', '--reuse', 'c1', '--risk', '看不到问候', '--uncovered', '其他页');
   ok(dir, 'plan', 'approve', 'D1', '--by', 'owner', '--quote', '可以');
   // 批准之后中途加一条：只有它等批准
-  writeFileSync(join(dir, 'cases', 'c2.case.json'), JSON.stringify({ case: 'c2', title: '窄屏问候', platform: 'android', classifications: { carrier: ['page'] }, tree: [{ op: '打开首页', tags: { carrier: 'page' }, expect: [{ id: 'E1', assert: '窄屏上问候语完整' }] }] }));
+  writeFileSync(join(dir, 'cases', 'c2.case.json'), JSON.stringify({ case: 'c2', title: '窄屏问候', platform: 'android', classifications: { carrier: ['page'] }, tree: [{ op: '打开「首页」', tags: { carrier: 'page' }, expect: [{ id: 'E1', assert: '窄屏上问候语完整' }] }] }));
   ok(dir, 'plan', 'add-case', 'D1', '--surface', 'S2', '--change', '窄屏适配', '--reuse', 'c2', '--risk', '被截断', '--uncovered', '平板', '--why', '评审漏了窄屏');
   const rd = join(dir, 'runs', 'r1');
   mkdirSync(join(rd, 'evidence'), { recursive: true });

@@ -13,6 +13,12 @@ import { join, dirname } from 'node:path';
 export const planPath   = (SKILL, d) => join(SKILL, 'state', 'plans', `${d}.json`);
 export const blockerPath = (SKILL, d) => join(SKILL, 'state', 'blockers', `${d}.jsonl`);
 
+/** 一条用例挂在哪些改动面上：所有引用它的评审单一起算（评审「验到需求」的指纹按它算，谁来问都得同一个答案） */
+export function surfacesOfCase(SKILL, name) {
+  const dir = join(SKILL, 'state', 'plans'); let fs = []; try { fs = readdirSync(dir).filter(f => f.endsWith('.json')).sort(); } catch { return []; }
+  return fs.flatMap(f => { const D = f.replace(/\.json$/, ''); let p; try { p = JSON.parse(readFileSync(join(dir, f), 'utf8')); } catch { return []; }
+    return (p.surfaces || []).filter(s => [...(s.reuse || []), ...(s.new || [])].includes(name)).map(s => ({ id: `${D}:${s.id || s.title || ''}`, change: s.change || s.title || '' })); });
+}
 export function loadPlan(SKILL, demand) {
   const p = planPath(SKILL, demand);
   if (!existsSync(p)) return null;
@@ -56,11 +62,13 @@ export function driftedCases(CASES, plan) {
   return Object.entries(plan.fingerprints).filter(([k, v]) => v && now[k] && now[k] !== v).map(([k]) => k);
 }
 
-// ---- 用例改动分级：哪些改动事后通知 owner，哪些要 owner 认 ----
-// 执行中用例常要自己补（换到读得到那一层的观测、加判内容的判据）。每次都等 owner 批，验收就卡在等人；
-// 一律不问，又会有人悄悄删判据、改断言原文把结论改窄。所以按改动的性质分两档：
-//   notify = 只会让用例更严或只换了取证办法（加断言、加判据、加前提、换观测用的操作、改操作步骤和说明文字）：照常跑，事后通知 owner
-//   ack    = 会改结论或范围（删断言、改断言原文、删或改判据 / 前提、改适用范围、声明某个词不算效果、改成人判、只判有没有的说明、删平台）：owner 认了才跑
+// ---- 批准后的用例改动：按自动批准标准分级，不找 owner ----
+// 批准后的用例改动：owner 批过就作数，不再回头找他（他批的是「验什么」，「怎么判」他判断不了，让他认等于盲签）。
+// 改动由工具按自动批准标准（AUTO_RULES）批，执行者只需写清为什么改；防「悄悄判松」靠的是作废重测 + 复核，不是人再批一次：
+//   notify = 只会让用例更严或只换了取证办法（加断言、加判据、加前提、换观测用的操作、改步骤和说明、断言原文拆分）：直接通过
+//   judge  = 判法改了（删或改判据 / 前提、改成人判、只判有没有的说明、豁免检查）：通过；这几条断言的旧结论作废、按新判法重测，复核看得到改前改后
+//   scope  = 验什么变了（删断言、改断言原文、改适用范围、去掉平台、声明某个词不算效果）：写理由后通过；需求页上列给 owner 看（不挡事），改了原文的旧结论作废
+// 标准自己会变准：每次自动批准记下按哪条规则；之后复核驳回了这些断言的证据，就记成这条规则放过了不该放的（autoApproveStats），据此收紧
 // 底稿：批准 / 重钉时把用例内容存一份（state/plans/<需求>.snap/<用例>.json），之后拿现在的跟它比。没留底稿的（这个机制之前批的）分不出改了什么，按原来的规矩只显形。
 export const snapDir = (SKILL, d) => join(SKILL, 'state', 'plans', `${d}.snap`);
 export function saveSnapshots(SKILL, CASES, plan, names) {
@@ -74,41 +82,97 @@ const stepsOf = c => { const out = []; const walk = ns => { for (const n of ns |
 const J = x => JSON.stringify(x ?? null);
 // 一份读法（observe 或 observe.by 的某一端）里的判据 / 前提，按 pick 比
 const bindings = o => !o ? {} : o.by ? Object.fromEntries(Object.entries(o.by).map(([k, v]) => [k, v])) : { '': o };
-const ACK_KEYS = { applies: '适用范围', claims_off: '声明某个词不算效果', judge: '判定方式（机判 / 人判）', why_presence_only: '「只测有没有」的说明', quality_waive: '豁免的检查' };
+const SCOPE_KEYS = { applies: '适用范围', claims_off: '声明某个词不算效果' };
+const JUDGE_KEYS = { judge: '判定方式（机判 / 人判）', why_presence_only: '「只测有没有」的说明', quality_waive: '豁免的检查' };
+/** 一条断言「怎么判」的指纹：观测规格（读法、判据、前提）+ 判定方式。observe 判完记在结论上，
+ *  判法改了时拿它分出哪些结论是按旧判法得来的（只作废这些；按新判法刚测过的不白测） */
+// 判据上的人话（say）不算判法：补一句说明不该让旧结论作废
+const noSay = o => o == null ? null : JSON.parse(JSON.stringify(o, (k, v) => k === 'say' ? undefined : v));
+export const judgeSpec = e => createHash('sha1').update(J([noSay(e?.observe ?? null), e?.judge ?? null, e?.why_presence_only ?? null])).digest('hex').slice(0, 12);
+/** 这条结论是不是按断言现在的判法得来的。记了指纹的直接比；没记的老结论（指纹机制之前）看 observe 写的实际值里有没有点到现在每条判据读的值 */
+export function judgedByCurrent(v, e) {
+  if (!v?.observed) return false;                       // 手记的结论说不清按哪套判法
+  if (v.observed.spec) return v.observed.spec === judgeSpec(e);
+  // 没记指纹的老结论：观测用的操作都换了，肯定不是按现在的判法得来的（例：注入换成读真实事件）
+  { const cur = Object.values(bindings(e?.observe)).map(b => b?.op).filter(Boolean); if (v.observed.op && cur.length && !cur.includes(v.observed.op)) return false; }
+  const picks = Object.values(bindings(e?.observe)).flatMap(b => (b?.checks || []).map(c => c.pick));
+  return picks.length > 0 && String(v.actual || '').startsWith('[observe]') && picks.every(p => String(v.actual).includes(p));
+}
+/** 自动批准标准：每条改动归到一条规则，记进评审单的改动记录 */
+export const AUTO_RULES = {
+  A1: { tier: 'notify', title: '只加不删、只换取证办法：直接通过' },
+  A2: { tier: 'judge', title: '判法改了：通过，旧结论作废按新判法重测，复核看改前改后' },
+  A3: { tier: 'scope', title: '验什么变了：写理由后通过，需求页列给 owner 看' },
+  A4: { tier: 'notify', title: '断言原文拆成一句话 + 细节 / 修订记录，一字未改：直接通过' },
+};
+const TIER_RANK = { same: 0, notify: 1, judge: 2, scope: 3 };
 
-/** before / after 两份用例 → { tier: 'notify'|'ack'|'same', changes: [{ tier, what }] } */
+// 断言原文只是拆开搬家（一句话留在 assert，其余挪进 detail / history），意思没变：
+// 新的几段去掉空白后，每段都是原来全文里的一截，且正好拼满原文 —— 一个字没加、一个字没丢。
+// 新的一句话必须是原断言的开头：从中间挑一句（可能是被撤回的旧说法）当断言，是改了意思，算验的范围变了
+const flat = s => String(s || '').replace(/\s+/g, '');
+const histText = e => [].concat(e?.history || []).map(h => typeof h === 'string' ? h : h?.text || '');
+export function onlySplit(b, a) {
+  if (!flat(a.assert) || !flat(b.assert).startsWith(flat(a.assert))) return false;
+  let rest = flat([b.assert, b.detail, ...histText(b)].join(''));
+  const pieces = [a.assert, a.detail, ...histText(a)].map(flat).filter(Boolean).sort((x, y) => y.length - x.length);
+  for (const p of pieces) { const i = rest.indexOf(p); if (i < 0) return false; rest = rest.slice(0, i) + '\u0000' + rest.slice(i + p.length); }
+  return rest.replace(/\u0000/g, '') === '';
+}
+
+// 判法写成人能比的一句：读到的哪个值、要它怎样。给 owner 认改动时并排摆改前 / 改后 ——
+// 只说「删了或改了 1 条判据（read.km）」他没法判断改得对不对（实测：读法换了、意思没变，owner 看不懂要认什么）
+const PRED_WORD = { eq: '是', ne: '不是', gt: '大于', gte: '至少', lt: '小于', lte: '至多', nonempty: '有值', empty: '为空',
+  any_match: '有一条匹配', none_match: '没有一条匹配', all_match: '每条都匹配', none_eq: '都不是', count_gt: '条数大于', contains: '含有' };
+// 判据写进存储时可带一句人话（checks[].say，例：「did assembly succeed」这一行是 yes）：有就用它；没有才拿机器判据拼
+// 简单的正则说成人话：^x 以 x 开头、x$ 以 x 结尾、^x$ 是 x；带别的正则符号的照原样
+const reWords = x => { const m = /^(\^)?([^\\^$.*+?()[\]{}|]+)(\$)?$/.exec(String(x)); if (!m) return null; const v = m[2];
+  return m[1] && m[3] ? `是「${v}」` : m[1] ? `以「${v}」开头` : m[3] ? `以「${v}」结尾` : `含「${v}」`; };
+export const fmtCheck = c => { if (c.say) return String(c.say); const [k, x] = Object.entries(c.predicate || {})[0] || []; const what = String(c.pick || '').replace(/^read\./, '');
+  if (['any_match', 'all_match', 'none_match'].includes(k) && typeof x === 'string' && reWords(x)) return `读到的 ${what} ${{ any_match: '有一条', all_match: '每条都', none_match: '没有一条' }[k]}${reWords(x)}`;
+  return `读到的 ${what} ${PRED_WORD[k] || k || ''}${x === undefined || x === true ? '' : `「${typeof x === 'string' ? x : JSON.stringify(x)}」`}`; };
+/** before / after 两份用例 → { tier: 'same'|'notify'|'judge'|'scope', changes: [{ tier, rule, what, id?, reset?, assert?, before?, after? }], reset: [断言 id] }
+ *  before / after：判法改了时，改前、改后各怎么判（人话），给 owner 并排比 */
 export function classifyCaseEdit(before, after) {
-  const ch = [], add = (tier, what) => ch.push({ tier, what });
+  const ch = [], RULE = { notify: 'A1', judge: 'A2', scope: 'A3' };
+  const add = (tier, what, x = {}) => ch.push({ tier, rule: x.rule || RULE[tier], what, ...x });
   const B = expectsOf(before), A = expectsOf(after);
-  for (const id of B.keys()) if (!A.has(id)) add('ack', `删了断言 ${id}`);
+  for (const id of B.keys()) if (!A.has(id)) add('scope', `删了断言 ${id}`);
   for (const id of A.keys()) if (!B.has(id)) add('notify', `加了断言 ${id}`);
   for (const [id, a] of A) {
     const b = B.get(id); if (!b) continue;
-    if (String(a.assert || '') !== String(b.assert || '')) add('ack', `${id} 的断言原文改了`);
-    for (const [k, label] of Object.entries(ACK_KEYS)) if (J(a[k]) !== J(b[k])) add('ack', `${id} 的${label}改了`);
+    if (String(a.assert || '') !== String(b.assert || '')) {
+      if (onlySplit(b, a)) add('notify', `${id} 的断言原文拆成了一句话 + 技术细节 / 修订记录（合起来一字未改）`, { rule: 'A4' });
+      else add('scope', `${id} 的断言原文改了`, { id, reset: true, before: String(b.assert || ''), after: String(a.assert || '') });
+    }
+    for (const [k, label] of Object.entries(SCOPE_KEYS)) if (J(a[k]) !== J(b[k])) add('scope', `${id} 的${label}改了`, { id });
+    for (const [k, label] of Object.entries(JUDGE_KEYS)) if (J(a[k]) !== J(b[k])) add('judge', `${id} 的${label}改了`, { id, reset: true });
     const ob = bindings(b.observe), oa = bindings(a.observe);
     for (const side of new Set([...Object.keys(ob), ...Object.keys(oa)])) {
       const x = ob[side], y = oa[side], at = side ? `${id}（${side}）` : id;
-      if (x && !y) { add('ack', `${at} 的读法删了`); continue; }
+      if (x && !y) { add('judge', `${at} 的读法删了`, { id, reset: true }); continue; }
       if (!x && y) { add('notify', `${at} 加了读法`); continue; }
       if ((x.op || null) !== (y.op || null)) add('notify', `${at} 观测换成了操作 ${y.op}`);
       for (const kind of ['checks', 'guards']) {
         const label = kind === 'checks' ? '判据' : '前提';
         const bx = new Map((x[kind] || []).map(c => [c.pick + J(c.predicate), c])), ay = new Map((y[kind] || []).map(c => [c.pick + J(c.predicate), c]));
         const gone = [...bx.keys()].filter(k => !ay.has(k)), added = [...ay.keys()].filter(k => !bx.has(k));
-        if (gone.length) add('ack', `${at} 删了或改了 ${gone.length} 条${label}（${gone.map(k => bx.get(k).pick).join('、')}）`);
+        if (gone.length) add('judge', `${at} 删了或改了 ${gone.length} 条${label}（${gone.map(k => bx.get(k).pick).join('、')}）`,
+          { id, reset: true, assert: String(a.assert || ''), before: gone.map(k => fmtCheck(bx.get(k))).join('；'), after: added.map(k => fmtCheck(ay.get(k))).join('；') || '（删了，没有新的）' });
         if (added.length && !gone.length) add('notify', `${at} 加了 ${added.length} 条${label}`);
       }
     }
   }
   const pb = [].concat(before?.platform || before?.platforms || []), pa = new Set([].concat(after?.platform || after?.platforms || []));
-  const lost = pb.filter(x => !pa.has(x)); if (lost.length) add('ack', `去掉了平台 ${lost.join('、')}`);
+  const lost = pb.filter(x => !pa.has(x)); if (lost.length) add('scope', `去掉了平台 ${lost.join('、')}`);
+  if (after.unexecutable && !before.unexecutable) add('scope', `判成不可执行：${String(after.unexecutable.why || '').slice(0, 60)}`);
   if (J(stepsOf(before)) !== J(stepsOf(after))) add('notify', '操作步骤改了');
   if (!ch.length && J(before) !== J(after)) add('notify', '说明文字改了');
-  return { tier: ch.some(x => x.tier === 'ack') ? 'ack' : ch.length ? 'notify' : 'same', changes: ch };
+  const tier = ch.reduce((t, c) => TIER_RANK[c.tier] > TIER_RANK[t] ? c.tier : t, 'same');
+  return { tier: tier === 'same' && J(before) !== J(after) ? 'notify' : tier, changes: ch, reset: [...new Set(ch.filter(c => c.reset).map(c => c.id))] };
 }
 
-/** 批准后改过的用例逐条分级 → [{ case, tier: 'notify'|'ack'|'unknown', changes }]。unknown = 没留底稿 */
+/** 批准后改过的用例逐条分级 → [{ case, tier: 'notify'|'judge'|'scope'|'unknown', changes, reset }]。unknown = 没留底稿 */
 export function caseEdits(SKILL, CASES, plan) {
   return driftedCases(CASES, plan).map(name => {
     const before = loadSnap(SKILL, plan.demand, name);
@@ -171,12 +235,11 @@ export function gateRun(SKILL, c, CASES_DIR, demandId = null) {
     + `   ⛔ 这正是「同一个需求 N 条记录用例都不一样」的来源：用例集合必须在评审时定死。\n`
     + `   要加它，走评审单修订（会递增 revision，看板上就能分清「需求变更」与「用例漂移」）：\n`
     + `   acceptkit plan add-case ${demand} --surface <S-id> --case ${c.case} --why "<为什么现在才加>"`;
-  // 批准后改了会影响结论 / 范围的内容（删判据、改断言原文……）：owner 认了才跑。只加判据、换观测这类照常跑，事后通知
-  { const ed = caseEdits(SKILL, CASES_DIR, plan).find(x => x.case === c.case && x.tier === 'ack');
-    if (ed) return `用例 ${c.case} 批准后改了会影响结论的内容，owner 认了才能跑：${ed.changes.filter(x => x.tier === 'ack').map(x => x.what).join('；')}\n`
-      + `   看改了什么：acceptkit plan show ${demand}\n`
-      + `   owner 认了：acceptkit plan recheck ${demand} --case ${c.case} --by <他> --quote "<原话>" --why "<为什么改>"\n`
-      + `   不想等：把这几处改回去（只加不删的改动事后通知就行）`; }
+  // 批准后改了判法 / 验的范围：不找 owner，但执行者要先把改动记下（写为什么改），工具才作废旧结论、按自动批准标准放行。
+  // 不记就跑，新判法下的结论会和旧结论混在一起，看不出哪条是按哪套判法判的
+  { const ed = caseEdits(SKILL, CASES_DIR, plan).find(x => x.case === c.case && (x.tier === 'judge' || x.tier === 'scope'));
+    if (ed) return `用例 ${c.case} 批准后改了${ed.tier === 'scope' ? '验的范围' : '判法'}，先记下再跑（不用等 owner）：${ed.changes.filter(x => x.tier !== 'notify').map(x => x.what).join('；')}\n`
+      + `   acceptkit plan recheck ${demand} --case ${c.case} --why "<为什么改>"`; }
   // 评审单修订时新加的用例：只有它等批准，同一张单子上已批过的照常跑
   if (!approved.has(c.case)) return `用例 ${c.case} 是评审单 v${plan.revision} 新加的，Owner 还没批，不许开跑（本单其余 ${approved.size} 条已批过的照常跑）。\n`
     + `   看这次改了什么：acceptkit plan show ${demand}\n`

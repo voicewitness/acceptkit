@@ -16,7 +16,7 @@ process.emitWarning = function (w, ...rest) {
 };
 const { DatabaseSync } = await import('node:sqlite');
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const DDL = `
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS device_leases (
@@ -59,6 +59,12 @@ CREATE TABLE IF NOT EXISTS suggestions (
   first_item INTEGER, last_item INTEGER, dimension TEXT, level TEXT, kind TEXT, text TEXT, options TEXT, consult TEXT,
   status TEXT NOT NULL, proposed_at TEXT NOT NULL, decided_by TEXT, quote TEXT, decided_at TEXT,
   applied_ref TEXT, applied_at TEXT, retro TEXT, needs_retro INTEGER DEFAULT 0);
+-- 用例评审（core/case-review.mjs）：一次打包 = review_cards 一行（每项的指纹，提交时比对）；owner 判过不合格的原题进 review_canaries 当考题
+CREATE TABLE IF NOT EXISTS review_cards (
+  id TEXT PRIMARY KEY, at TEXT NOT NULL, demand TEXT, cases TEXT NOT NULL, rubric_version INTEGER NOT NULL, extractor_version INTEGER NOT NULL,
+  items TEXT NOT NULL, canaries TEXT);
+CREATE TABLE IF NOT EXISTS review_canaries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, dim TEXT NOT NULL, item TEXT NOT NULL, max_score INTEGER NOT NULL, source TEXT, quote TEXT);
 CREATE INDEX IF NOT EXISTS ix_assess_subject ON assessments(subject_kind, subject_id, phase);
 CREATE INDEX IF NOT EXISTS ix_items_assess ON assessment_items(assessment_id);
 CREATE UNIQUE INDEX IF NOT EXISTS ix_sugg_key ON suggestions(ikey);
@@ -74,6 +80,11 @@ export function openDb(root) {
   const db = new DatabaseSync(join(dir, 'acceptkit.db'));
   db.exec('PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;');
   db.exec(DDL);
+  // v3：评审项的分数、上限、指纹、复述等记在已有的 assessment_items 上（只加列不删）
+  const cols = new Set(db.prepare('PRAGMA table_info(assessment_items)').all().map(r => r.name));
+  for (const [c, t] of [['score', 'INTEGER'], ['cap', 'INTEGER'], ['item_fp', 'TEXT'], ['facts', 'TEXT'], ['extract', 'TEXT'], ['rulings', 'TEXT'], ['card_id', 'TEXT'], ['reason', 'TEXT']])
+    if (!cols.has(c)) db.exec(`ALTER TABLE assessment_items ADD COLUMN ${c} ${t}`);
+  db.exec('CREATE INDEX IF NOT EXISTS ix_items_ikey ON assessment_items(ikey)');
   db.prepare('INSERT OR REPLACE INTO meta(k, v) VALUES (?, ?)').run('schema_version', String(SCHEMA_VERSION));
   handles.set(root, db);
   return db;
@@ -158,6 +169,40 @@ export function latestAssessment(root, subject_kind, subject_id, phase, basis = 
   const r = { ...a, dims: JSON.parse(a.dims), stale: basis != null && a.basis !== basis };
   r.items = db.prepare('SELECT * FROM assessment_items WHERE assessment_id = ? ORDER BY id').all(a.id);
   return r;
+}
+// ---- 用例评审 ----
+export const getMeta = (root, k) => openDb(root).prepare('SELECT v FROM meta WHERE k = ?').get(k)?.v ?? null;
+export const setMeta = (root, k, v) => openDb(root).prepare('INSERT OR REPLACE INTO meta(k, v) VALUES (?, ?)').run(k, String(v));
+export function saveReviewCard(root, { id, demand, cases, items, canaries }) {
+  openDb(root).prepare('INSERT OR REPLACE INTO review_cards(id, at, demand, cases, rubric_version, extractor_version, items, canaries) VALUES (?,?,?,?,?,?,?,?)')
+    .run(id, new Date().toISOString(), demand || null, JSON.stringify(cases), 2, 1, JSON.stringify(items), JSON.stringify(canaries || []));
+}
+export function getReviewCard(root, id) {
+  const r = openDb(root).prepare('SELECT * FROM review_cards WHERE id = ?').get(id);
+  return r ? { ...r, cases: JSON.parse(r.cases), items: JSON.parse(r.items), canaries: JSON.parse(r.canaries || '[]') } : null;
+}
+export const listCanaries = root => openDb(root).prepare('SELECT * FROM review_canaries ORDER BY id').all();
+export const addCanary = (root, { dim, item, max_score, source, quote }) => Number(openDb(root).prepare('INSERT INTO review_canaries(dim, item, max_score, source, quote) VALUES (?,?,?,?,?)').run(dim, item, max_score, source || null, quote || null).lastInsertRowid);
+/** 一次提交里一条用例通过核对的评审项 → assessments 一行（phase=review，不互相取代：每项按 ikey 取最新）+ 每项一行 */
+export function saveReviewItems(root, { caseName, by, demand, card, rows, gate }) {
+  const db = openDb(root), at = new Date().toISOString();
+  db.exec('BEGIN');
+  try {
+    const id = Number(db.prepare('INSERT INTO assessments(subject_kind, subject_id, phase, rubric_version, at, by, basis, demand, score, gate, dims) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+      .run('case', caseName, 'review', 2, at, by, card, demand || null, Math.min(3, ...rows.map(r => r.score)), gate || '', '{}').lastInsertRowid);
+    const ins = db.prepare('INSERT INTO assessment_items(assessment_id, dimension, rule, target, level, finding, evidence, fix, ikey, score, cap, item_fp, facts, extract, rulings, card_id, reason) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
+    for (const r of rows) ins.run(id, r.dim, null, r.at, r.score < 2 ? 'block' : r.score < 3 ? 'warn' : 'ok', r.reason || '', JSON.stringify(r.evidence || []), r.fix || '', r.key, r.score, r.cap, r.fp, JSON.stringify(r.evidence || []), JSON.stringify(r.extract || null), JSON.stringify(r.rulings || []), card, r.reason || '');
+    db.exec('COMMIT');
+    return id;
+  } catch (e) { db.exec('ROLLBACK'); throw e; }
+}
+/** 一条用例每个评审项的最新记录：盲审和自评各取最新 → [{ ikey, score, item_fp, by, at, reason, fix, rulings }] */
+export function latestReviewItems(root, caseName) {
+  const rows = openDb(root).prepare('SELECT i.ikey, i.score, i.cap, i.item_fp, i.reason, i.fix, i.rulings, i.extract, i.dimension, i.card_id, a.by, a.at, i.id FROM assessment_items i JOIN assessments a ON a.id = i.assessment_id WHERE a.subject_kind = ? AND a.subject_id = ? AND a.phase = ? ORDER BY i.id DESC').all('case', caseName, 'review');
+  const seen = new Set(), out = [];
+  for (const r of rows) { const k = `${r.ikey}|${r.by === 'blind' ? 'b' : 's'}`; if (seen.has(k)) continue; seen.add(k);
+    out.push({ ...r, by: r.by === 'blind' ? 'blind' : r.by, rulings: JSON.parse(r.rulings || '[]'), extract: JSON.parse(r.extract || 'null') }); }
+  return out;
 }
 export const getSuggestion = (root, idOrKey) => openDb(root).prepare(typeof idOrKey === 'number' || /^\d+$/.test(String(idOrKey)) ? 'SELECT * FROM suggestions WHERE id = ?' : 'SELECT * FROM suggestions WHERE ikey = ?').get(idOrKey) || null;
 export function upsertSuggestion(root, s) {

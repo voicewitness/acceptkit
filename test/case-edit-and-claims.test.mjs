@@ -3,14 +3,14 @@
 //   ② 批准后的用例改动分级：只加不删的事后通知（照常跑），会改结论 / 范围的要 owner 认
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { effectClaims, claimWordsOf, uncoveredClaims, fmtMissing, observePointsOf } from '../core/claims.mjs';
 import { checkCase } from '../core/case-quality.mjs';
-import { classifyCaseEdit } from '../core/plan-gate.mjs';
+import { classifyCaseEdit, judgeSpec, judgedByCurrent } from '../core/plan-gate.mjs';
 
 const words = t => effectClaims(t).map(c => c.word);
 
@@ -55,50 +55,71 @@ test('Q26：说了上报的断言判据全只看有没有 → 拦；有一条判
   assert.equal(q({ assert: '统计上报发出', observe: presence }, 'Q27').length, 1, '逐条提示');
 });
 
-test('改动分级：加判据 / 换观测 → 事后通知；删判据、改断言原文、声明不算效果 → 要 owner 认', () => {
-  const base = caseOf({ assert: '上报发出', observe: { op: 'a', checks: [{ pick: 'read.x', predicate: { nonempty: true } }] } });
+test("自动批准：加判据 / 换观测 → 直接通过；删判据 → 判法改了（旧结论作废）；改断言原文、声明不算效果 → 验的范围变了；都不找 owner", () => {
+  const base = caseOf({ assert: "上报发出", observe: { op: "a", checks: [{ pick: "read.x", predicate: { nonempty: true } }] } });
   const clone = () => JSON.parse(JSON.stringify(base));
-  const more = clone(); more.tree[0].expect[0].observe.checks.push({ pick: 'read.y', predicate: { eq: 'US' } }); more.tree[0].expect[0].observe.op = 'b';
-  assert.equal(classifyCaseEdit(base, more).tier, 'notify');
-  const fewer = clone(); fewer.tree[0].expect[0].observe.checks = [];
-  assert.equal(classifyCaseEdit(base, fewer).tier, 'ack');
-  const reword = clone(); reword.tree[0].expect[0].assert = '判定产出 report 动作';
-  assert.equal(classifyCaseEdit(base, reword).tier, 'ack');
-  const off = clone(); off.tree[0].expect[0].claims_off = [{ word: '上报', why: 'w' }];
-  assert.equal(classifyCaseEdit(base, off).tier, 'ack');
-  assert.equal(classifyCaseEdit(base, clone()).tier, 'same');
+  const more = clone(); more.tree[0].expect[0].observe.checks.push({ pick: "read.y", predicate: { eq: "US" } }); more.tree[0].expect[0].observe.op = "b";
+  assert.equal(classifyCaseEdit(base, more).tier, "notify");
+  assert.equal(classifyCaseEdit(base, more).changes[0].rule, "A1");
+  const swap = clone(); swap.tree[0].expect[0].observe.checks = [{ pick: "read.line", predicate: { eq: "这次不是 KM 启动" } }];
+  const j = classifyCaseEdit(base, swap);
+  assert.equal(j.tier, "judge"); assert.deepEqual(j.reset, ["E1"]);
+  assert.equal(j.changes[0].before, "读到的 x 有值"); assert.equal(j.changes[0].after, "读到的 line 是「这次不是 KM 启动」", "改前改后写成人能比的话");
+  const reword = clone(); reword.tree[0].expect[0].assert = "判定产出 report 动作";
+  assert.equal(classifyCaseEdit(base, reword).tier, "scope");
+  const off = clone(); off.tree[0].expect[0].claims_off = [{ word: "上报", why: "w" }];
+  assert.equal(classifyCaseEdit(base, off).tier, "scope");
+  assert.equal(classifyCaseEdit(base, clone()).tier, "same");
+  // 判法改了只作废按旧判法得来的结论：记了指纹的比指纹；老结论看实际值里有没有点到现在读的值；手记的一律作废
+  const now = swap.tree[0].expect[0];
+  assert.ok(judgedByCurrent({ status: "pass", observed: { spec: judgeSpec(now) } }, now));
+  assert.ok(!judgedByCurrent({ status: "pass", observed: { spec: judgeSpec(base.tree[0].expect[0]) } }, now));
+  assert.ok(judgedByCurrent({ status: "pass", actual: "[observe] 成立；read.line = [\"这次不是 KM 启动\"]", observed: { at: "t" } }, now));
+  assert.ok(!judgedByCurrent({ status: "pass", actual: "[observe] 成立；read.x = [\"1\"]", observed: { at: "t" } }, now));
+  assert.ok(!judgedByCurrent({ status: "pass", actual: "看到了" }, now));
 });
 
 const BIN = join(resolve(dirname(fileURLToPath(import.meta.url)), '..'), 'bin', 'acceptkit.mjs');
 const ak = (dir, ...args) => spawnSync(process.execPath, [BIN, ...args], { cwd: dir, encoding: 'utf8', env: { ...process.env, ACCEPTKIT_PROJECT: dir, HOME: dir } });
 const ok = (dir, ...args) => { const r = ak(dir, ...args); assert.equal(r.status, 0, `${args.join(' ')}\n${r.stderr}`); return r; };
 
-test('改动分级（命令行）：只加不删的照常跑并留通知；改了断言原文的拦跑、出卡等 owner 认，认了才放', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'acceptkit-test-'));
-  for (const d of ['cases', 'runs', 'state/plans', 'knowledge', 'ops']) mkdirSync(join(dir, d), { recursive: true });
-  writeFileSync(join(dir, 'acceptkit.project.json'), JSON.stringify({ name: 't', gate: { allow: [] } }));
-  const cf = join(dir, 'cases', 'c1.case.json');
-  writeFileSync(cf, JSON.stringify({ case: 'c1', title: '首页问候语', platform: 'web', classifications: { carrier: ['page'] },
-    tree: [{ op: '打开首页', tags: { carrier: 'page' }, shows: ['你好'], expect: [{ id: 'E1', assert: '页面顶部显示「你好」' }] }] }));
-  ok(dir, 'plan', 'new', 'D1', '--title', '首页问候', '--platform', 'web');
-  ok(dir, 'plan', 'add-case', 'D1', '--surface', 'S1', '--change', '首页加了问候语', '--reuse', 'c1', '--risk', '看不到问候', '--uncovered', '其他页');
-  ok(dir, 'plan', 'approve', 'D1', '--by', 'owner', '--quote', '可以');
+test("自动批准（命令行）：批准后改判法不找 owner —— 先记下（写理由）才能跑，旧结论作废重测，改动记录写明按哪条规则", () => {
+  const dir = mkdtempSync(join(tmpdir(), "acceptkit-test-"));
+  for (const d of ["cases", "runs", "state/plans", "knowledge", "ops"]) mkdirSync(join(dir, d), { recursive: true });
+  writeFileSync(join(dir, "acceptkit.project.json"), JSON.stringify({ name: "t", gate: { allow: [] } }));
+  const cf = join(dir, "cases", "c1.case.json");
+  writeFileSync(cf, JSON.stringify({ case: "c1", title: "首页问候语", platform: "web", classifications: { carrier: ["page"] },
+    tree: [{ op: "打开首页", tags: { carrier: "page" }, shows: ["你好"], expect: [{ id: "E1", assert: "页面顶部显示「你好」", judge: "human", human_why: "人看" }] }] }));
+  ok(dir, "plan", "new", "D1", "--title", "首页问候", "--platform", "web");
+  ok(dir, "plan", "add-case", "D1", "--surface", "S1", "--change", "首页加了问候语", "--reuse", "c1", "--risk", "看不到问候", "--uncovered", "其他页");
+  ok(dir, "plan", "approve", "D1", "--by", "owner", "--quote", "可以");
 
-  // 只加一条断言：照常跑，recheck 记成事后通知
-  const c = JSON.parse(readFileSync(cf, 'utf8'));
-  c.tree[0].expect.push({ id: 'E2', assert: '问候语是黑色' }); writeFileSync(cf, JSON.stringify(c));
-  ok(dir, 'run', 'c1', '--demand', 'D1');
-  assert.match(ok(dir, 'plan', 'recheck', 'D1', '--why', '补颜色').stdout, /事后通知/);
+  // 只加一条断言：照常跑，记成直接通过
+  const c = JSON.parse(readFileSync(cf, "utf8"));
+  c.tree[0].expect.push({ id: "E2", assert: "问候语是黑色" }); writeFileSync(cf, JSON.stringify(c));
+  ok(dir, "run", "c1", "--demand", "D1");
+  assert.match(ok(dir, "plan", "recheck", "D1", "--why", "补颜色").stdout, /直接通过/);
 
-  // 改断言原文：拦跑、出卡
-  c.tree[0].expect[0].assert = '页面顶部显示问候语'; writeFileSync(cf, JSON.stringify(c));
-  assert.match(ak(dir, 'run', 'c1', '--demand', 'D1').stderr, /owner 认了才能跑：E1 的断言原文改了/);
-  const held = ok(dir, 'plan', 'recheck', 'D1', '--why', '放宽');
-  assert.match(held.stdout, /owner 认了才能跑/);
-  const card = JSON.parse(ok(dir, 'next', 'D1', '--json').stdout).cards.find(x => x.subject === 'case_edit');
-  assert.ok(card && /plan recheck D1 --case c1 --by <他>/.test(card.on_reply.argv || JSON.stringify(card.on_reply)));
-  assert.notEqual(ak(dir, 'plan', 'recheck', 'D1', '--why', 'x', '--by', 'agent', '--quote', '我觉得行').status, 0, '执行者不能自己认');
-  ok(dir, 'plan', 'recheck', 'D1', '--why', '放宽', '--by', 'owner', '--quote', '可以这么改');
-  ok(dir, 'run', 'c1', '--demand', 'D1');
-  assert.match(ok(dir, 'plan', 'show', 'D1').stdout, /owner 认了|（owner 认了）/);
+  // E1 记了通过，然后改判法（人判 → 机判）：不出 owner 卡，执行者先记下才能跑
+  const runId = readdirSync(join(dir, "runs"))[0];
+  const rp = join(dir, "runs", runId, "result.json"), r = JSON.parse(readFileSync(rp, "utf8"));
+  r.results.E1 = { status: "pass", actual: "看到了", evidence: [] }; writeFileSync(rp, JSON.stringify(r));
+  delete c.tree[0].expect[0].judge; delete c.tree[0].expect[0].human_why; writeFileSync(cf, JSON.stringify(c));
+  assert.match(ak(dir, "run", "c1", "--demand", "D1").stderr, /先记下再跑（不用等 owner）/);
+  const cs = JSON.parse(ok(dir, "next", "D1", "--json").stdout).cards;
+  assert.ok(!cs.some(x => x.kind === "attention" && x.subject === "case_edit"), "不找 owner");
+  assert.ok(cs.some(x => x.kind === "case_edit_due"), "执行者自己的活");
+  const rec = ok(dir, "plan", "recheck", "D1", "--why", "改成机判");
+  assert.match(rec.stdout, /判法改了 · 通过，旧结论作废重测/);
+  assert.match(rec.stdout, /E1（原 pass）/);
+  assert.equal(JSON.parse(readFileSync(rp, "utf8")).results.E1.status, "todo", "旧结论作废");
+  assert.notEqual(ak(dir, "plan", "recheck", "D1", "--why", "x", "--by", "owner", "--quote", "好").status, 0, "不再收 owner 认的参数");
+  ok(dir, "run", "c1", "--demand", "D1");
+  assert.match(ok(dir, "plan", "show", "D1").stdout, /自动批准 A2/);
+  // 需求页：不出现在「等你」里；单列「批准后的改动」，改前改后、作废了哪些、每条规则通过几次
+  const out = join(dir, "board.html");
+  assert.equal(spawnSync(process.execPath, [join(dirname(BIN), "..", "core", "dashboard.mjs"), out], { cwd: dir, encoding: "utf8", env: { ...process.env, ACCEPTKIT_PROJECT: dir, HOME: dir } }).status, 0);
+  const html = readFileSync(out, "utf8"), page = html.slice(html.indexOf("<section class=\"panel\" data-k=\"D1\""));
+  assert.match(page, /现在没有要你做的事/);
+  assert.match(page, /批准后的改动（按自动批准标准通过，不用你再批）[\s\S]*E1 的旧结论已作废[\s\S]*A2 判法改了[^<]*：通过 1 次/);
 });

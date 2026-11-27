@@ -17,7 +17,7 @@ function setup() {
   for (const d of ['cases', 'runs', 'state/plans', 'knowledge', 'ops']) mkdirSync(join(dir, d), { recursive: true });
   writeFileSync(join(dir, 'acceptkit.project.json'), JSON.stringify({ name: 't', gate: { allow: [] } }));
   writeFileSync(join(dir, 'cases', 'c1.case.json'), JSON.stringify({ case: 'c1', title: 't', platform: 'android',
-    tree: [{ nodeId: 'n1', op: '打开首页' }, { nodeId: 'n2', op: '打开列表' }, { nodeId: 'n3', op: '打开设置' }] }));
+    tree: [{ nodeId: 'n1', op: '打开「首页」' }, { nodeId: 'n2', op: '打开列表' }, { nodeId: 'n3', op: '打开设置' }] }));
   const r0 = ak(dir, 'run', 'c1', '--demand', 'D1', '--skip-plan-gate');
   assert.equal(r0.status, 0, r0.stderr);
   const id = readdirSync(join(dir, 'runs'))[0];

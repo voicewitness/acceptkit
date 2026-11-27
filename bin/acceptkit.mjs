@@ -168,6 +168,14 @@ async function doctor({ opt }) {
   // 旧版迁移把没有记录的需求首轮开轮时间写成了 1970-01-01（看板上就这么显示）
   {
     const R = await import('../core/rounds.mjs');
+    { const M = await import('../core/migrate-nodes.mjs'), r = M.migrateProject(root, { dry: !opt.fix });
+      if (!r.cases) ok('用例节点都是新形状（kind / nid）');
+      else if (opt.fix) ok(`用例节点迁移：${r.cases} 条用例、${r.nodes} 处（分组 ${r.groups} 个改成 kind，补 nid）；底稿 ${r.snaps} 份同步；评审单指纹重钉 ${r.repinned} 个${r.kept_drift ? `，${r.kept_drift} 个迁移前就已改过、保持「已改」` : ''}；原文件在 attic/`);
+      else bad(`${r.cases} 条用例还是旧的节点形状（group 键 / 没有 nid）`, 'acceptkit doctor --fix');
+      const D = await import('../core/store/db.mjs'), on = D.getMeta(root, 'review_gate_since');
+      if (on) ok(`评审门槛已接入（${on} 起，plan 批准和 run 前都要盲审过）`);
+      else if (opt.fix) { D.setMeta(root, 'review_gate_since', new Date().toISOString()); ok('评审门槛已接入：之后 plan 批准和 run 前，每条用例都要盲审过（acceptkit assess --pack / --apply --by blind）'); }
+      else bad('还没接入评审门槛：现在评审只提示不拦', 'acceptkit doctor --fix'); }
     if (opt.fix) { const f = R.fixEpochRounds(root); if (f.length) ok(`首轮开轮时间修正 ${f.length} 个需求：${f.join('，')}`); }
     else if (existsSync(join(root, 'state', 'rounds')) && readdirSync(join(root, 'state', 'rounds')).some(f => /"opened_at":\s*"1970-01-01/.test(readFileSync(join(root, 'state', 'rounds', f), 'utf8'))))
       bad('有需求的首轮开轮时间是 1970-01-01（旧版迁移留下的）', 'acceptkit doctor --fix');
@@ -494,8 +502,11 @@ async function configCmd({ pos, opt }) {
 // 操作库的读写（core/ops.mjs）。新发现的平台做法从这里写回去，写入时校验；手改的文件用 ops check 查。
 const OPS_USAGE = `用法：
   acceptkit ops [<id>]                          列表 / 看某条
-  acceptkit ops set <id> --platform P [--title … --why … --kind observe|act] [--observes <层>[,<层>]]
+  acceptkit ops set <id> --platform P [--title … --why … --kind observe|act] [--observes <层>[,<层>]] [--input real|mock-global|injected]
         --observes   观测读的是哪一层：decision / diag / ui / network / report / crash / state / log / source / perf
+        --clear-human 清掉操作级的人看步骤（改成各端各写：--platform P --human …）
+        --human      人看的步骤（可给多个，一步一个）：进入「…」页、点击「…」…，可用 {param.x}；看板上这个操作的引用点开就是它
+        --input      这个操作喂给被测系统的输入：real（真实路径触发）/ mock-global（只 mock 全局信号）/ injected（构造好的输入直接交给判定入口）
         [--host H]   只在宿主 H 上成立的做法（不带 = 该平台所有宿主通用）
         [--how … --entry … --evidence … --exec … --switches … --steps … --caveats … --pitfalls …]
         [--json '<配方 JSON>'] [--replace] [--guess | --verified "<实测记录>"] [--source …]
@@ -527,7 +538,7 @@ async function opsCmd({ pos, opt }) {
       if (blocks) process.exit(1);
       return;
     }
-    if (!['set', 'confirm', 'verify', 'rm'].includes(sub)) {
+    if (!['set', 'confirm', 'verify', 'rm', 'extract'].includes(sub)) {
       const o = O.loadOps(P.root)[sub] || die(`操作库里没有 ${sub}（新增：acceptkit ops set ${sub} --platform P --title … --why … --how …）`);
       console.log(`■ ${sub} —— ${o.title}\n  为什么：${o.why}`);
       for (const [plat, r] of Object.entries(o.platforms || {})) {
@@ -535,6 +546,52 @@ async function opsCmd({ pos, opt }) {
         for (const [k, v] of Object.entries(r)) if (k !== 'state') console.log(`    ${k}: ${Array.isArray(v) ? v.map(x => typeof x === 'object' ? JSON.stringify(x) : x).join('\n      ') : typeof v === 'object' ? JSON.stringify(v) : v}`);
       }
       if (o.notes) console.log(`\n  备注：${o.notes}`);
+      return;
+    }
+    if (sub === 'extract') {
+      // 从历史用例自动提操作集（core/op-extract.mjs）：同样的操作只留一份；父子两步常一起出现的提成组合操作（引用这两个操作）
+      const { extractOps } = await import('../core/op-extract.mjs');
+      const cdir = join(P.root, 'cases'), files = readdirSync(cdir).filter(f => f.endsWith('.case.json'));
+      const cases = files.map(f => { try { return JSON.parse(readFileSync(join(cdir, f), 'utf8')); } catch { return null; } }).filter(Boolean);
+      const ops = O.loadOps(P.root), min = Number(opt.min || 2);
+      const x = extractOps(cases, ops, { min });
+      const platOf = Object.fromEntries(cases.map(c => [c.case, String(c.platform || 'android').split(/[,/]/)[0].replace('both', 'android')]));
+      let made = 0, attached = 0;
+      if (opt.apply) {
+        for (const l of x.leaves) {
+          if (!l.existing) {
+            const plats = [...new Set(l.at.map(a => platOf[a.case]).filter(p => ['android', 'ios', 'web', 'harmony'].includes(p)))];
+            for (const pf of plats.length ? plats : ['android'])
+              O.writeOp(P.root, l.id, { title: l.title, why: `从历史用例自动提取：${new Set(l.at.map(a => a.case)).size} 条用例用到`, human: l.human, platform: pf,
+                recipe: l.cmd ? { steps: [{ do: l.title, cmd: l.cmd }], state: 'confirmed', source: 'ops extract' } : { how: l.title, state: 'confirmed', source: 'ops extract' } });
+            made++;
+          }
+          // 用例里这些步骤挂上 op_id（原文不动），记下从哪提的
+          const byCase = new Map(); for (const a of l.at) (byCase.get(a.case) || byCase.set(a.case, []).get(a.case)).push(a.node);
+          for (const [cn, nodes] of byCase) {
+            const f = join(cdir, `${cn}.case.json`); let raw; try { raw = JSON.parse(readFileSync(f, 'utf8')); } catch { continue; }
+            let touched = false;
+            const walk = (ns, p) => (ns || []).forEach((n, i) => { const id = `${p}${i + 1}`; if (nodes.includes(id) && !n.op_id) { n.op_id = l.id; touched = true; attached++; (raw.extracted ||= []).push({ at: new Date().toISOString(), node: id, op: l.id }); } walk(n.children, `${id}.`); });
+            walk(raw.tree, 'n'); if (touched) writeFileSync(f, JSON.stringify(raw, null, 2) + '\n');
+          }
+        }
+        const all = O.loadOps(P.root);
+        for (const cb of x.combos) {
+          if (all[cb.id]) continue;
+          const pf = platOf[cb.cases[0]] || 'android';
+          O.writeOp(P.root, cb.id, { title: `${all[cb.a]?.title || cb.a} → ${all[cb.b]?.title || cb.b}`, why: `从历史用例自动提取：${cb.cases.length} 条用例里这两步连着做`, platform: pf,
+            recipe: { steps: [{ use: cb.a }, { use: cb.b }], state: 'confirmed', source: 'ops extract' } });
+          made++;
+        }
+      }
+      const ret = { kind: 'ops_extract', applied: !!opt.apply, made, attached, leaves: x.leaves.map(l => ({ id: l.id, existing: l.existing, title: l.title, cmd: l.cmd, uses: l.at.length, cases: new Set(l.at.map(a => a.case)).size })),
+        combos: x.combos, skipped: x.skipped, vague_repeats: x.vagueRepeats.slice(0, 20) };
+      if (opt.json) { console.log(JSON.stringify(ret)); return; }
+      console.log(`历史用例 ${cases.length} 条：能提成操作的 ${x.leaves.length} 个（复用操作库已有 ${x.leaves.filter(l => l.existing).length}），组合操作 ${x.combos.length} 个${opt.apply ? `；新建 ${made} 个、挂上 ${attached} 处步骤` : '（加 --apply 写入）'}`);
+      for (const l of x.leaves) console.log(`  ${l.existing ? '↺' : '+'} ${l.id}「${l.title.slice(0, 40)}」 ${new Set(l.at.map(a => a.case)).size} 条用例 / ${l.at.length} 处`);
+      for (const cb of x.combos) console.log(`  ⊕ ${cb.id} = ${cb.a} → ${cb.b}（${cb.cases.length} 条用例）`);
+      console.log(`  没提的：说不清 ${x.skipped.vague}、没填的模板 ${x.skipped.template}、在构造输入的 ${x.skipped.literal} —— 先 acceptkit clarify 改清楚`);
+      if (x.vagueRepeats.length) console.log(`  重复出现但说不清的步骤（改清楚后才能提）：\n${x.vagueRepeats.slice(0, 8).map(v => `    ${v.cases.length} 条用例「${String(v.text).slice(0, 40)}」`).join('\n')}`);
       return;
     }
     const id = pos[1] || die(OPS_USAGE);
@@ -546,7 +603,7 @@ async function opsCmd({ pos, opt }) {
       return O.recipeKey(pf, opt.host ? String(opt.host) : null);
     };
     if (sub === 'set') {
-      const META = new Set(['platform', 'host', 'title', 'why', 'kind', 'observes', 'json', 'replace', 'guess', 'absent', 'unlock', 'project']);
+      const META = new Set(['platform', 'host', 'title', 'why', 'kind', 'observes', 'input', 'reads', 'human', 'clear-human', 'json', 'replace', 'guess', 'absent', 'unlock', 'project']);
       const recipe = opt.json ? JSON.parse(String(opt.json)) : {};
       for (const [k0, v] of Object.entries(opt)) {
         if (META.has(k0)) continue;
@@ -558,7 +615,8 @@ async function opsCmd({ pos, opt }) {
       // 只改操作本身（--observes / --title / --why / --kind）：配方一个字也不碰，也不校验配方里的存量字段。
       // 以前这里也会把配方的 state 改成「已确认」、source 改成「用户设置」：批量登记 observes 时，推测的配方被抬成了已确认、出处全被抹掉
       const opOnly = !opt.absent && !opt.guess && !opt.replace && !Object.keys(recipe).length;
-      const platform = opOnly ? null : keyOf();
+      // 只改人看步骤但给了 --platform：写在那一端（两端共用的操作，iOS 用例不显示 Android 的做法）
+      const platform = opOnly && !(opt.human && opt.platform) ? null : keyOf();
       const cur = platform ? O.loadOps(P.root)[id]?.platforms?.[platform] : null;
       if (opt.absent) {
         if (Object.keys(recipe).length) die('--absent 表示这个平台还做不了，不能同时写做法');
@@ -570,9 +628,9 @@ async function opsCmd({ pos, opt }) {
         // 出处是这份配方从哪来的：只在原来没有、这次也没给 --source 时补默认
         if (!recipe.source && (!cur || cur.absent || !cur.source || opt.replace)) recipe.source = '用户设置';
       }
-      const r = O.writeOp(P.root, id, { title: opt.title && String(opt.title), why: opt.why && String(opt.why), kind: opt.kind && String(opt.kind), observes, platform, recipe, replace: !!opt.replace,
+      const r = O.writeOp(P.root, id, { title: opt.title && String(opt.title), why: opt.why && String(opt.why), kind: opt.kind && String(opt.kind), observes, input: opt.input && String(opt.input), reads: opt.reads && String(opt.reads), human: opt.human ? [].concat(opt.human).map(String) : null, clearHuman: !!opt['clear-human'], platform, recipe, replace: !!opt.replace,
         absent: opt.absent ? { blocker: String(opt.absent), unlock: opt.unlock ? String(opt.unlock) : '' } : null, hosts: hostIds });
-      if (opOnly) { console.log(`✓ 更新 ${id}（只改了操作本身${observes ? `：读的是 ${observes.join(' / ')}` : ''}；配方没动）`); return; }
+      if (opOnly) { console.log(`✓ 更新 ${id}（只改了操作本身${observes ? `：读的是 ${observes.join(' / ')}` : ''}${opt.input ? `；喂的输入：${opt.input}` : ''}${opt.reads ? `；读的是：${opt.reads}` : ''}；配方没动）`); return; }
       const st = r.op.platforms[platform];
       console.log(`✓ ${r.created ? '新增' : '更新'} ${id} [${platform}] ${st.absent ? '缺实现' : O.STATE_LABEL[st.state]}${st.state === 'guess' ? `（确认后才用：acceptkit ops confirm ${id} --platform ${opt.platform}${opt.host ? ` --host ${opt.host}` : ''}）` : ''}`);
       const rest = O.opProblems(id, r.op, hostIds).filter(x => x.platform !== platform);
@@ -769,6 +827,10 @@ async function serveCmd({ pos, opt }) {
   const sweepB = () => { const ch = spawn(process.execPath, [join(REPO_ROOT, 'bin', 'acceptkit.mjs'), 'browser', 'sweep'], { stdio: ['ignore', 'pipe', 'pipe'] });
     let o = ''; ch.stdout.on('data', d => { o += d; }); ch.stderr.on('data', d => { o += d; });
     ch.on('close', () => { if (/⏹/.test(o)) console.log(`[${new Date().toISOString()}] ${o.trim()}`); }); };
+  // 定期优化包：每天问一次每个项目，距上一份满 7 天就打一份（只摆数据和上下文，不调模型；处理它的是 next 里的 tune_due 卡片）
+  const tune = () => { for (const p of s.projects) spawn(process.execPath, [join(REPO_ROOT, 'bin', 'acceptkit.mjs'), 'tune', 'build', '--if-due'], { stdio: 'ignore', env: { ...process.env, ACCEPTKIT_PROJECT: p.root } }); };
+  setInterval(tune, 24 * 3600e3).unref?.();
+  setTimeout(tune, 5 * 60e3).unref?.();
   setInterval(() => { sweep(); sweepB(); }, 10 * 60e3).unref?.();
   setTimeout(() => { sweep(); sweepB(); }, 60e3).unref?.();
 }

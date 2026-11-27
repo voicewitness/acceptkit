@@ -41,6 +41,8 @@ const RULE_DIM = {
   Q20: 'observable', Q21: 'observable', Q22: 'observable', Q26: 'observable', Q27: 'observable',
   Q04: 'control', Q05: 'control', Q23: 'control', Q24: 'control', Q08: 'control', Q11: 'control', Q07: 'control',
   Q06: 'safety',
+  // 输入来源：注入 / mock 的断言在「输入可造」这一维扣分（注入只验了判定那一段）
+  Q31: 'input', Q32: 'input', Q33: 'input', Q34: 'input', Q37: 'clarity', Q38: 'clarity',
   Q09: 'clarity', Q10: 'clarity', Q12: 'clarity', Q15: 'clarity', Q16: 'clarity',
 };
 export const dimOfRule = r => RULE_DIM[r] || 'clarity';

@@ -8,7 +8,7 @@
 //       → run_needed → stalled
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import { loadPlan, planCases, approvedCases, planDelta, checkPlan, readBlockers, returnedPending, caseEdits } from './plan-gate.mjs';
+import { surfacesOfCase, loadPlan, planCases, approvedCases, planDelta, checkPlan, readBlockers, returnedPending, caseEdits } from './plan-gate.mjs';
 import { loadDemands } from './demand-registry.mjs';
 import { loadOps, doableOn } from './ops.mjs';
 import { loadRounds, repoSnapshot, demandRecords, resolveState, noShotHolders, shotInRound } from './rounds.mjs';
@@ -19,6 +19,13 @@ import { normalizePlatforms, RUNTIME_PLATFORMS } from './platform.mjs';
 import { readConfig } from './project.mjs';
 import { claimWordsOf } from './claims.mjs';
 import * as C from './cards.mjs';
+import { loadCache, journalOf } from './replay.mjs';
+import { caseInputs } from './input-source.mjs';
+import { loadConfigSets } from './configsets.mjs';
+import { nonRealSteps, loadProposals } from './trigger-consult.mjs';
+import { loadAsks } from './ask-gate.mjs';
+import * as CR from './case-review.mjs';
+import { latestReviewItems, getMeta } from './store/db.mjs';
 import * as ANDROID from '../adapters/android/device.mjs';
 import { smokeSpec, smokeState, smokeCaseId } from './smoke.mjs';
 
@@ -203,6 +210,9 @@ function runCards(root, cfg, D, { id, dir, r }, blockers, allBlockers, carried =
   // 占着的设备停了 / 重启过：通知占用它的运行，先核对再往下做（engine liveAddress 同一口径；只核对记过开机号的占用）
   const drift = left && deviceDrift(r);
   if (drift) out.push(C.deviceChangedCard(id, r.device.key, drift));
+  // 有执行缓存、这个运行还没回放也还没动过手：先回放（省掉重复的准备和导航），差别大工具自己退回
+  if (todo.length && !r.replay) { const cache = loadCache(root, r.case);
+    if (cache && cache.from_run !== id && !journalOf(root, id).some(e => ['adb', 'shot', 'observe'].includes(e.argv[0]))) out.push(C.replayDueCard(id, cache)); }
   for (const n of stepTodo) out.push(C.stepTodoCard(id, n, web));
   for (const e of todo) out.push(C.expectTodoCard(id, e, answered.get(e.id) || null));
   // 记了结论、证据不全：同一份判据（assertionGaps）—— 报告列缺口、看板不算通过、这里让执行者先补齐再送盲审
@@ -264,12 +274,48 @@ export function nextCards(root, D, opts = {}) {
     const scope = approved.size ? delta.added : [...planCases(plan)];
     const via = { ui: 0, cli: [] };
     for (const name of scope) { const c = caseOf(root, name); if (c) walk(c.tree, n => { for (const e of n.expect || []) { if ((e.via || 'ui') === 'ui') via.ui++; else via.cli.push({ case: name, id: e.id, via: e.via, why: e.why_not_ui || '' }); } }); }
-    attention.push(C.planApprovalCard(D, plan, delta, approved.size, via));
+    // 也让 owner 看到每条断言是怎么触发的：真实路径 / 只 mock 全局 / 直接注入 / 说不清 —— 批的不只是验什么，还有用什么方式测
+    const trig = { real: 0, 'mock-global': 0, injected: 0, unknown: 0, list: [] }, ops0 = loadOps(root);
+    for (const name of scope) { const c = caseOf(root, name); if (!c || ['probe', 'smoke'].includes(c.kind)) continue;
+      for (const x of caseInputs(c, ops0, loadConfigSets(root))) { trig[x.from]++; if (x.from === 'injected' || x.from === 'unknown') trig.list.push({ case: name, id: x.id, from: x.from, alt: x.research?.alt }); } }
+    attention.push(C.planApprovalCard(D, plan, delta, approved.size, via, trig));
   }
 
-  // 批准后改了会影响结论的用例：等 owner 认（只加不删的改动不出卡，plan recheck 记下即可）
-  { const held = caseEdits(root, join(root, 'cases'), plan).filter(x => x.tier === 'ack');
-    if (held.length) attention.push(C.caseEditCard(D, held)); }
+  // 批准后改了判法 / 验的范围、还没记下的用例：执行者自己的活（写为什么改），不找 owner
+  { const due = caseEdits(root, join(root, 'cases'), plan).filter(x => x.tier === 'judge' || x.tier === 'scope');
+    if (due.length) own.push(C.caseEditDueCard(D, due)); }
+  // 用例评审（docs/case-review.md）：没盲审 / 过期 / 只有自评 / 低于门槛的 → 执行者打包交盲审、照 fix 改；跑过后还是 2 分的（能照着做、照着看得出）→ 照这次执行实际做的补到 3
+  // 这里不搜被测代码（界面字状态不进指纹），上限由 run / plan 的门槛现算
+  if (getMeta(root, 'review_gate_since')) { const ops = loadOps(root), sets = loadConfigSets(root), due = [], rerun = [];
+    for (const name of planCases(plan)) { const c = caseOf(root, name); if (!c || c.kind === 'smoke') continue;
+      const ctx = { ops, sets, platform: CR.reviewPlatform(c), inputs: new Map(caseInputs(c, ops, sets).map(x => [x.id, x.from])),
+        surfaces: surfacesOfCase(root, name) };
+      const runs = latestRuns(root, D).filter(x => x.r.case === name), last = runs.at(-1);
+      const st = CR.reviewState(CR.caseCard(c, ctx), latestReviewItems(root, name), { mode: c.kind === 'probe' ? 'probe' : 'run', liveCaps: false, lastRunAt: last ? (last.r.started_at || last.r.created_at || null) : null });
+      if (st.status === 'pass') continue;
+      const bad = st.items.filter(i => !['ok', 'warn'].includes(i.state));
+      if (st.items.some(i => i.state === 'ran')) { const actions = journalOf(root, last.id).filter(e => e.exit === 0 && !['next', 'read', 'context', 'consult', 'steps', 'report'].includes(e.argv[0])).map(e => e.argv.filter(a => a !== last.id).join(' '));
+        rerun.push({ case: name, run: last.id, items: bad.filter(i => i.state === 'ran'), actions }); }
+      if (bad.some(i => i.state !== 'ran')) due.push({ case: name, status: st.status, items: bad.filter(i => i.state !== 'ran') });
+    }
+    if (due.length) own.push(C.caseReviewCard(D, due));
+    if (rerun.length) own.push(C.caseRereviewCard(D, rerun)); }
+  // 用例评审时就查触发方式：不是真实触发的步骤（注入 / 说不清）→ 执行者 consult 读代码、提建议；测法建议等 owner 定；他同意了还没改的 → 执行者去改
+  { const ops = loadOps(root), props = loadProposals(root), items = [];
+    for (const name of planCases(plan)) { const c = caseOf(root, name); if (!c || ['probe', 'smoke'].includes(c.kind)) continue;
+      for (const s of nonRealSteps(c, ops)) {
+        const mine = props.filter(p => p.case === name && p.node === s.id);
+        // 已经研究过（写了结论）、或有测法建议在等 owner / 他已同意：不再催查
+        if (s.decl?.research?.verdict || mine.some(p => p.status !== 'rejected')) continue;
+        items.push({ case: name, node: s.id, op: String(s.n.op || ''), from: s.from });
+      }
+      const adopted = props.filter(p => p.case === name && p.status === 'adopted' && nonRealSteps(c, ops).some(s => s.id === p.node));
+      if (adopted.length) own.push(C.triggerAdoptedCard(D, adopted));
+    }
+    for (const p of props.filter(p => p.status === 'proposed' && (p.demand === D || (!p.demand && planCases(plan).has(p.case))))) attention.push(C.triggerProposalCard(D, p));
+    if (items.length) own.push(C.triggerConsultCard(D, items)); }
+  // 提问台账：待答的合成一张卡
+  { const open = loadAsks(root, D).filter(x => x.status === 'open'); if (open.length) attention.push(C.asksCard(D, open)); }
   // 写得 owner 定不了的不算「等你定」，是执行者的待办（与看板同口径）
   for (const f of (plan.findings || []).filter(awaitingOwner)) {
     const bad = findingProblems(f);

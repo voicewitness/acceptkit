@@ -12,12 +12,18 @@ import { RESEARCH_STEPS } from './claims.mjs';
 
 const ak = s => `acceptkit ${s}`;
 const reply = (command, argv) => ({ command, argv: ak(argv) });
+import { RESEARCH_REAL } from './input-source.mjs';
 const clip = (s, n) => { const t = String(s ?? '').replace(/\s+/g, ' ').trim(); return t.length > n ? t.slice(0, n) + '…' : t; };
 
 /** 卡片种类与顺序：next 按这个顺序排；看板 / 手册引用同一份 */
 export const CARD_KINDS = {
   attention: '有事等人：原样交给用户，与它无关的卡片照常做；用户回了先跑 on_reply 记下原话',
   plan_draft: '评审单还没写完或没过检查',
+  replay_due: '这条用例有执行缓存（上次跑通的动作）：先 replay 放一遍，跟上次差别大工具会自己作废缓存、退回待测',
+  case_review_due: '用例评审没过：打评审包交新上下文盲审，照 fix 改到每项 ≥ 2 分',
+  case_rereview_due: '跑过之后还是 2 分的项（能照着做 / 照着看得出）：照这次执行实际做的补到 3，或判不可执行',
+  case_edit_due: '批准后改了判法或验的范围、还没记下：写清为什么改（plan recheck --why），不找 owner',
+  trigger_consult: '用例评审时：步骤不是真实触发（直接注入 / 说不清）—— consult 读被测代码找线索、提建议交 owner 定，不直接放行',
   finding_unclear: '待定 finding 写得 owner 定不了：执行者先补写',
   blocker_own: '自己的能力缺口：补上，或写清后告知用户（不用等回答）',
   blocker_unasked: '要用户答的阻塞还没写成他能拍板的问题：执行者先补写',
@@ -69,14 +75,16 @@ export function planReturnedCard(D, plan) {
   return { kind: 'plan_draft', demand: D, title: `owner 退回了评审单 v${plan.revision}`, detail: [`他的意见：${clip(plan.returned.quote, 300)}`],
     note: `照意见改评审单（${ak(`plan add-case ${D} …`)} 等；改了会升版本），再请他批。意见里有要回答的问题，先回答他`, read: `plan/${D}` };
 }
-export function planApprovalCard(D, plan, delta = null, approvedN = 0, via = null) {
+export function planApprovalCard(D, plan, delta = null, approvedN = 0, via = null, trig = null) {
   const change = delta && approvedN ? [delta.added.length && `新加 ${delta.added.length} 条用例（${delta.added.slice(0, 6).join('、')}${delta.added.length > 6 ? ' 等' : ''}）`,
     delta.removed.length && `摘掉 ${delta.removed.length} 条（${delta.removed.slice(0, 6).join('、')}）`].filter(Boolean).join('，') : '';
   return { kind: 'attention', subject: 'plan_approval', demand: D,
     title: approvedN ? `评审单 v${plan.revision} 有改动等批准（已批过的 ${approvedN} 条照常在测）` : `评审单 v${plan.revision} 自检通过，等批准`,
     ...(delta && approvedN ? { added: delta.added, removed: delta.removed } : {}),
     ...(via ? { via: { ui: via.ui, cli: via.cli.length }, detail: [`这次要批的断言：${via.ui} 条在界面上验（看读到结论那一刻的 app 截图）${via.cli.length ? `，${via.cli.length} 条用命令行验` : '，全部在界面上验'}`,
-      ...via.cli.slice(0, 12).map(x => `${x.case} ${x.id} 用${({ log: '日志', diag: '诊断命令', debugger: '调试器', cli: '命令行' })[x.via] || x.via}验：${clip(x.why, 120)}`)] } : {}),
+      ...via.cli.slice(0, 12).map(x => `${x.case} ${x.id} 用${({ log: '日志', diag: '诊断命令', debugger: '调试器', cli: '命令行' })[x.via] || x.via}验：${clip(x.why, 120)}`),
+      ...(trig ? [`怎么触发：${trig.real} 条真实路径，${trig['mock-global']} 条只 mock 全局信号，${trig.injected} 条直接注入（只验了判定那一段），${trig.unknown} 条说不清`,
+        ...trig.list.slice(0, 12).map(x => `${x.case} ${x.id} ${x.from === 'injected' ? '直接注入' : '说不清怎么触发'}${x.alt ? `；查到的真实测法：${clip(x.alt, 80)}` : ''}`)] : [])] } : {}),
     question: approvedN
       ? `需求 ${D}「${clip(plan.title, 60)}」的用例评审单改到了 v${plan.revision}：${change || '用例没变'}。已批过的 ${approvedN} 条照常在测，只有这次的改动等你看；同意的话回一句批准的话。`
       : `需求 ${D}「${clip(plan.title, 60)}」的用例评审单 v${plan.revision} 已经自检通过，请你看一下要测的范围，同意的话回一句批准的话。`,
@@ -87,15 +95,78 @@ export function planApprovalCard(D, plan, delta = null, approvedN = 0, via = nul
     read: `plan/${D}` };
 }
 
-/** 批准后改了会影响结论 / 范围的用例内容：owner 认了才跑（plan-gate classifyCaseEdit） */
-export function caseEditCard(D, edits) {
-  const lines = edits.map(x => `${x.case}：${x.changes.filter(c => c.tier === 'ack').map(c => c.what).join('；')}`);
-  return { kind: 'attention', subject: 'case_edit', demand: D, cases: edits.map(x => x.case),
-    title: `${edits.length} 条用例批准后改了会影响结论的内容，等 owner 认（${edits.map(x => x.case).slice(0, 4).join('、')}）`,
-    detail: lines,
-    question: `需求 ${D} 有 ${edits.length} 条用例在批准后改了会影响结论或范围的地方：${clip(lines.join('；'), 400)}。这些改动你认不认？认的话回一句同意的话；不认的话执行者把它们改回去。`,
-    note: `先把每条改动为什么要改讲清楚（${ak(`plan show ${D}`)} 里有逐条清单），交给 owner。他认了先跑 on_reply 记原话；不认就把改动改回去。只加判据、换观测这类只加不删的改动不用等他，${ak(`plan recheck ${D} --why "…"`)} 直接记下`,
-    on_reply: reply('plan_recheck', `plan recheck ${D} --case ${edits.map(x => x.case).join(',')} --by <他> --quote "<原话>" --why "<为什么改>" --json`),
+/** 批准后改了判法 / 验的范围、还没记下的用例：执行者写清为什么改，工具按自动批准标准放行（不找 owner） */
+export function caseEditDueCard(D, edits) {
+  return { kind: 'case_edit_due', demand: D, cases: edits.map(x => x.case),
+    title: `${edits.length} 条用例批准后改了判法或验的范围，还没记下（${edits.map(x => x.case).slice(0, 4).join('、')}）`,
+    detail: edits.map(x => `${x.case}：${x.changes.filter(c => c.tier !== 'notify').map(c => c.what).join('；')}`).map(l => clip(l, 200)),
+    note: `${ak(`plan recheck ${D} --case ${edits.map(x => x.case).join(',')} --why "<为什么改>"`)}：按自动批准标准记下，改了判法的断言旧结论作废、按新判法重测`,
+    read: `plan/${D}` };
+}
+
+/** 用例评审时：不是真实触发的步骤（直接注入 / 说不清）。items = [{ case, node, op, from }] */
+export function triggerConsultCard(D, items) {
+  const cases = [...new Set(items.map(x => x.case))];
+  return { kind: 'trigger_consult', demand: D, cases,
+    title: `${items.length} 个步骤不是真实触发（直接注入或说不清），评审前要查清真实情况下怎么触发（${cases.slice(0, 4).join('、')}${cases.length > 4 ? ' 等' : ''}）`,
+    detail: items.slice(0, 12).map(x => clip(`${x.case} ${x.node}「${x.op}」：${x.from === 'injected' ? '直接注入' : '说不清怎么触发'}`, 160)),
+    steps: RESEARCH_REAL,
+    note: `逐条用例 ${ak('consult <用例>')}：工具在被测代码里找手写字段在哪算出来、调试 / 工具代码和项目脚本里哪里碰到它们；`
+      + `你顺着往上追到真实入口，写成测法建议交 owner 定（${ak('consult <用例> --node <节点> --propose --real … --evidence … --how … --catches … [--prep …]')}）。`
+      + `其实是真实操作、只是没写清的：节点上写 input: { from: "real" }，或挂登记过 --input real 的 op_id。`
+      + `追不到任何入口、也补不出来：这一步写 input.research = { tried, alt, verdict: "none" }，再登记 finding 交 owner 定要不要接受只验判定那一段的风险`,
+    read: `plan/${D}` };
+}
+/** 执行者写好了测法建议：owner 不看代码也能定改不改 */
+export function triggerProposalCard(D, p) {
+  return { kind: 'attention', subject: 'trigger_proposal', demand: D, proposal: p.id,
+    title: `${p.id} 等 owner 定：${p.case} 的 ${p.node} 要不要改成真实触发`,
+    question: clip([`用例 ${p.case} 的 ${p.node} 现在不是真实触发，只验了判定那一段。`,
+      `真实情况下：${p.real}`, `代码依据：${p.evidence.join('；')}`, `建议改成：${p.how}`,
+      p.prep ? `开测前要先：${p.prep}` : '不用先补东西，现在就能这么测。', `改了以后能多验到：${p.catches}`, '要不要改？'].join('\n'), 900),
+    options: [`1. 改 => 执行者照建议${p.prep ? '先补好入口，' : ''}把这一步换成真实触发、改用例，原来注入得出的结论不再作数`,
+      `2. 不改 => 这一步继续用注入，只算低分证据：「${clip(p.catches, 60)}」这一段没人验`],
+    note: '把 question 和 options 原样交给用户。他一回复，先跑 on_reply 记下原话',
+    on_reply: reply('consult_decide', `consult decide ${p.id} --adopt|--reject --by <他> --quote "<原话>" --json`),
+    read: `plan/${D}` };
+}
+/** owner 同意改，用例里那一步还不是真实触发：执行者照建议改 */
+export function triggerAdoptedCard(D, ps) {
+  return { kind: 'trigger_consult', demand: D, cases: [...new Set(ps.map(p => p.case))],
+    title: `owner 同意改成真实触发的 ${ps.length} 处，用例还没改（${ps.map(p => p.id).join('、')}）`,
+    detail: ps.map(p => clip(`${p.id} ${p.case} ${p.node}：${p.how}${p.prep ? `（先：${p.prep}）` : ''}`, 160)),
+    note: `照建议${ps.some(p => p.prep) ? '先补好入口，再' : ''}建成操作并标真实触发（${ak('ops set <op> --platform P --how … --input real')}），把那一步挂上这个 op_id，${ak(`plan recheck ${D} --why "<照哪条测法建议改的>"`)} 记下`,
+    read: `plan/${D}` };
+}
+
+/** 等 owner 答的提问：一张汇总卡，不让执行者每轮重复列 */
+export function asksCard(D, xs) {
+  return { kind: 'attention', subject: 'asks', demand: D, asks: xs.map(x => x.id),
+    title: `待 owner 答 ${xs.length} 条（${xs.map(x => x.id).join('、')}）`,
+    question: xs.map(x => [`${x.id}：${x.question}`, `  来龙去脉：${clip(x.context, 200)}`, ...x.options.map((o, i) => `  ${i + 1}. ${o}`), `  推荐：${clip(x.recommend, 120)}`,
+      ...(x.not_mine ? [`  （执行者越过了「${clip(x.overrode_text || x.overrode || '', 60)}」：${clip(x.not_mine, 100)}）`] : [])].join('\n')).join('\n\n'),
+    note: '把 question 原样交给用户，一次交全部，别逐轮重复列。他答了哪条就先跑 on_reply 记下原话',
+    on_reply: reply('ask_answer', `ask answer ${D} <Qn> --by <他> --quote "<原话>" [--option <序号>] --json`),
+    read: `plan/${D}` };
+}
+
+const REVIEW_STATE = { missing: '没评', stale: '用例改过要重评', draft: '只有自评', low: '低于门槛' };
+/** 用例评审没过：打包交盲审（新上下文的子 agent 只看评审包），照每项的 fix 改 */
+export function caseReviewCard(D, items) {
+  return { kind: 'case_review_due', demand: D, cases: items.map(x => x.case),
+    title: `${items.length} 条用例评审没过（不过不能批准、不能跑）：${items.map(x => x.case).slice(0, 4).join('、')}`,
+    detail: items.flatMap(x => [`${x.case}：${x.items.length} 项`, ...x.items.filter(i => i.state === 'low').slice(0, 4).map(i => `  ${i.pos || i.at} ${i.dim} ${i.score} 分：${clip(i.reason || '', 100)}${i.fix ? ` → ${clip(i.fix, 120)}` : ''}`),
+      `  ${Object.entries(x.items.reduce((m, i) => (m[i.state] = (m[i.state] || 0) + 1, m), {})).map(([k, v]) => `${REVIEW_STATE[k] || k} ${v}`).join(' · ')}`]),
+    note: `低于门槛的先照 fix 改；然后 ${ak(`assess --pack --plan ${D} --changed --json`)} 打包，交新上下文的子 agent 只看包评，结果写成 jsonl：${ak('assess --apply <文件> --by blind --json')}`,
+    read: `plan/${D}` };
+}
+/** 跑过之后还是 2 分的项：照这次执行实际做的补到 3。actions = 那次执行实际跑过的动作（执行日志） */
+export function caseRereviewCard(D, items) {
+  return { kind: 'case_rereview_due', demand: D, cases: items.map(x => x.case),
+    title: `${items.length} 条用例跑过了还有 2 分的项：照实际做的补到 3，或判不可执行`,
+    detail: items.flatMap(x => [`${x.case}（${x.run}）：${x.items.map(i => `${i.pos || i.at} ${i.dim}`).join('、')}`,
+      ...(x.actions.length ? ['  这次执行实际做了：', ...x.actions.slice(0, 10).map(a => `    ${clip(a, 140)}`)] : [])]),
+    note: `${ak('clarify <用例> --json')} 看那次执行的事实，写回后重新打包盲审（assess --pack --changed）。做不了的整条：${ak('clarify <用例> --unexecutable --why "…"')}`,
     read: `plan/${D}` };
 }
 
@@ -240,6 +311,10 @@ export function stepTodoCard(run, node, web) {
       + `；需要经验：${ak(`context ${run} --node ${node.nodeId}`)}`,
     read: `run/${run}/step/${node.nodeId}` };
 }
+export function replayDueCard(run, cache) {
+  return { kind: 'replay_due', run, title: `先回放执行缓存（上次跑通的 ${cache.steps.length} 步，来自 ${cache.from_run}）`,
+    note: `${ak(`replay ${run}`)}：照缓存放一遍，机判的断言工具判；跟上次差别大会自己作废缓存、把回放判出的结论退回待测，再照 next 正常做` };
+}
 export function expectTodoCard(run, e, answer = null) {
   return { kind: 'expect_todo', run, expect: e.id, assert: clip(e.assert || e.title, 160),
     title: `${e.id} 还没有结论${answer ? '（阻塞项用户已答复）' : ''}`,
@@ -311,7 +386,7 @@ export function evidenceGapCard(run, ids, gaps, nonUi = {}) {
       ...reroute.map(id => `${id} 是界面上的断言，可它的读法 ${nonUi[id].op} 走的是 ${nonUi[id].exec} 通道，不截图 —— 重跑也补不上。给它登记一个在 app 页面上读值的配方（ops set，写清进哪一页、读画面上哪几个字；app 自带的调试页也算），把用例的 observe.op 换过去再 observe`),
       ...(file.length ? [`${file.join(' ')} 声明了命令行验证，证据却是你交来的文件：把采集命令（日志命令、调试器脚本）登记成操作库配方（ops set … --platform P --how …），由 observe 亲自去跑`] : []),
       ...(none.length ? [`${none.join(' ')} 一份证据都没有：重跑 observe`] : []),
-      ...(wide.length ? [`${wide.join(' ')} 的断言说了弹窗 / 拦截 / 上报这类效果，观测只读到了更浅的一层（例：判定里的动作名），也没经盲审逐条核过：三选一 —— 收窄断言，只说观测读到的那一层（改了断言原文，要 owner 认）；或补一条读那一层的观测（ops set <op> --observes ui|network|report …，只加观测是事后通知）；这个词在断言里讲的是某个部件（「上报环里的记录」）不是效果，在断言上写 claims_off: [{ word, why }]（要 owner 认）。项目里还没有读这一层的操作时，别卡着等人：${RESEARCH_STEPS.map((x, i) => `${'①②③④'[i]} ${x}`).join(' ')}。只是补盲审：${ak('reviewq --pack')}，审核人逐条写出每条主张在证据哪里`] : []),
+      ...(wide.length ? [`${wide.join(' ')} 的断言说了弹窗 / 拦截 / 上报这类效果，观测只读到了更浅的一层（例：判定里的动作名），也没经盲审逐条核过：三选一 —— 收窄断言，只说观测读到的那一层（改了断言原文：plan recheck 写理由，旧结论作废重测）；或补一条读那一层的观测（ops set <op> --observes ui|network|report …，只加观测直接通过）；这个词在断言里讲的是某个部件（「上报环里的记录」）不是效果，在断言上写 claims_off: [{ word, why }]（要 owner 认）。项目里还没有读这一层的操作时，别卡着等人：${RESEARCH_STEPS.map((x, i) => `${'①②③④'[i]} ${x}`).join(' ')}。只是补盲审：${ak('reviewq --pack')}，审核人逐条写出每条主张在证据哪里`] : []),
       `不知道去哪看、找不到能看到结论的入口：${ak(`consult ${run} --expect ${ids[0]}`)} 按判据面给出常见取证入口和要问清的业务问题，先照着查，查不到再拿它的问题草稿问人`,
       '缺证据不是验不了：不要改记 blocked。截图 / 采集本身失败是取证手段的问题，记 apparatus 再重试；同一条连续 3 次还补不上，才 blockers --raise 问用户',
       ...(shot.length || reroute.length ? ['界面上确实看不到（找过 app 自带的调试页也没有）：改用例，给它写 via 和 why_not_ui，下一版评审单会让用户过目'] : [])],

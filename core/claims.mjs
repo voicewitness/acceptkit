@@ -66,7 +66,7 @@ export const RESEARCH_STEPS = [
   '回到被测系统里查：这一层的出口在哪（源码里搜上报 / 拦截 / 崩溃收集的入口），什么情况下会走到，带哪些字段',
   '写成能读到它的操作，登记它读的是哪一层：acceptkit ops set <操作> --observes <层>；项目对这一层的说法写进配置：acceptkit config add quality.observePoints \'{"layer":"<层>","means":"本项目里指什么、在哪看"}\'',
   '回填用例：观测换成这个操作，判据写到字段和取值（不只「有没有」）',
-  '查到的事实记进知识：acceptkit know add --heading 取证 …；用例改完 acceptkit plan recheck <需求> --why "…"（只加判据、换观测口的事后通知 owner；改了断言原文、删了判据的要 owner 认）',
+  '查到的事实记进知识：acceptkit know add --heading 取证 …；用例改完 acceptkit plan recheck <需求> --why "…"（按自动批准标准记下：只加判据、换观测口的直接通过；改了断言原文、删改了判据的写理由、旧结论作废重测）',
 ];
 
 /** 原文里的效果主张 → [{ word, covers, at }]，同一个词只报一次。off = 断言自己声明不主张的词（expect.claims_off） */

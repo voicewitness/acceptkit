@@ -26,9 +26,9 @@ function project() {
   writeFileSync(join(dir, 'cases', 'c1.case.json'), JSON.stringify({ case: 'c1', title: '设置页退出登录', platform: 'web',
     classifications: { carrier: ['page'] },
     tree: [
-      { op: '打开设置页', op_id: 'open-settings', tags: { carrier: 'page' }, shows: ['退出登录'],
+      { op: '打开「设置」页', op_id: 'open-settings', tags: { carrier: 'page' }, shows: ['退出登录'],
         expect: [{ id: 'E1', assert: '设置页上有「退出登录」按钮' }],
-        children: [{ op: '点退出登录', tags: { carrier: 'page' }, danger: { kind: 'logout', confirm: 'owner' },
+        children: [{ op: '点击「退出登录」', tags: { carrier: 'page' }, danger: { kind: 'logout', confirm: 'owner' },
           expect: [{ id: 'E2', assert: '回到登录页' }] }] },
     ] }));
   writeFileSync(join(dir, 'knowledge', 'notes.md'), [

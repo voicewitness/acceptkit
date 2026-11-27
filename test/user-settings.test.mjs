@@ -106,7 +106,7 @@ test('--project 写在命令前面也认', () => {
   assert.equal(r.status, 0, r.stderr); assert.match(r.stdout, /gate\.allow/);
 });
 
-test('link：按上下文给报告地址 —— 不给就是最近一次运行，打开自己的管理页面；需求停在最新一轮；网址模板来自配置', async () => {
+test('link：按上下文给报告地址 —— 不给就是最近一次运行，打开自己的管理页面；需求落到需求页；网址模板来自配置', async () => {
   const dir = project({
     'runs/r1/result.json': { case: 'c1', run: 'r1', session: 's-D1', demand: { id: 'D1' } },
     'runs/r1/run.md': '# 报告',
@@ -133,7 +133,7 @@ test('link：按上下文给报告地址 —— 不给就是最近一次运行�
   } finally { ak(dir, 'serve', 'stop'); }
   assert.equal(ak(dir, 'config', 'set', 'dashboard.url', 'http://h/boards?run={key}').status, 0);
   assert.equal(ak(dir, 'config', 'set', 'dashboard.url', 'h/boards').status, 1);
-  assert.equal(JSON.parse(ak(dir, 'link', 'D1', '--json').stdout).url, 'http://h/boards?run=round%3AD1%3AR2');
+  assert.equal(JSON.parse(ak(dir, 'link', 'D1', '--json').stdout).url, 'http://h/boards?run=D1');   // 需求只有一个地址：需求页
   assert.equal(JSON.parse(ak(dir, 'link', 'c2', '--json').stdout).url, 'http://h/boards?run=case%3Ac2');
   ak(dir, 'config', 'set', 'dashboard.url', 'http://h/b?run={run}');
   assert.equal(JSON.parse(ak(dir, 'link', 'D1', '--json').stdout).url, 'http://h/b?run=r1', '按运行定位的看板：需求取它最近一次运行');

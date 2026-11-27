@@ -74,6 +74,18 @@ function patchPaths(patch) {
   return [...String(patch || '').matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm)].map(m => m[1].trim());
 }
 
+// 停的那一刻最后一条回复（宿主没直接给就读会话记录的尾巴）：停钩子要看执行者是不是在聊天里直接问 owner
+function lastAssistantText(p) {
+  if (!p) return '';
+  try { const L = readFileSync(p, 'utf8').trim().split('\n').slice(-60).reverse();
+    for (const l of L) { let j; try { j = JSON.parse(l); } catch { continue; }
+      const m = j.message || j; if ((j.type || m.role) !== 'assistant') continue;
+      const t = (Array.isArray(m.content) ? m.content : [m.content]).map(x => typeof x === 'string' ? x : x?.type === 'text' ? x.text : '').join('\n').trim();
+      if (t) return t; }
+  } catch { /* 读不了就当没有 */ }
+  return '';
+}
+
 /** 宿主 stdin 的 JSON → { host, event, native, kind, tool, texts[], cwd, stop_active, loop, session } */
 export function normalize(host, raw = {}) {
   const H = HOSTS[host];
@@ -89,6 +101,7 @@ export function normalize(host, raw = {}) {
     texts = [ti.file_path, ti.path, ti.target_file, raw.file_path].filter(Boolean);
     if (!texts.length && ti.command) texts = patchPaths(ti.command);   // codex apply_patch：路径在补丁正文里
   } else if (event === 'prompt') texts = [raw.prompt].filter(Boolean);
+  else if (event === 'stop') texts = [raw.last_assistant_message || lastAssistantText(raw.transcript_path)].filter(Boolean);
   return { host, event, native, kind, tool, texts: texts.map(String),
     cwd: raw.cwd || (raw.workspace_roots || [])[0] || process.cwd(),
     stop_active: raw.stop_hook_active === true, loop: Number(raw.loop_count || 0),

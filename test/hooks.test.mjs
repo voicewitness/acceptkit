@@ -14,8 +14,8 @@ function setup() {
   const dir = mkdtempSync(join(tmpdir(), 'acceptkit-hook-proj-'));
   for (const d of ['cases', 'runs', 'state/plans', 'knowledge', 'ops']) mkdirSync(join(dir, d), { recursive: true });
   writeFileSync(join(dir, 'acceptkit.project.json'), JSON.stringify({ name: 'demo', gate: { allow: [{ value: 'avd:Demo_API33', kind: 'device', note: '验收用的模拟器' }] } }));
-  writeFileSync(join(dir, 'cases', 'c1.case.json'), JSON.stringify({ case: 'c1', title: '首页问候', platform: 'web', classifications: { carrier: ['page'] },
-    tree: [{ op: '打开首页', tags: { carrier: 'page' }, expect: [{ id: 'E1', assert: '顶部显示你好' }] }] }));
+  writeFileSync(join(dir, 'cases', 'c1.case.json'), JSON.stringify({ case: 'c1', title: '首页问候', platform: 'web', input: 'real', classifications: { carrier: ['page'] },
+    tree: [{ op: '打开「首页」', tags: { carrier: 'page' }, expect: [{ id: 'E1', assert: '顶部显示你好' }] }] }));
   mkdirSync(join(home, '.config', 'acceptkit'), { recursive: true });
   writeFileSync(join(home, '.config', 'acceptkit', 'config.json'), JSON.stringify({ projects: [dir] }));
   // PATH 里不放 adb：测试不碰真设备

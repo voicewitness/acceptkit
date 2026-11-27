@@ -225,7 +225,7 @@ test('设置：按固定路径读取；缺必需动作拒写、推测不执行�
 });
 
 test('用例质量：新增用例不达标不能批准、不能开跑；存量问题记债不拦；改出来的新问题要拦；豁免要写理由', () => {
-  const BAD = { ...CASE, case: 'c2', tree: [{ op: '读产物', tags: { carrier: 'web' }, expect: [
+  const BAD = { ...CASE, case: 'c2', input: 'real', tree: [{ op: '运行 `cat evidence/out.json`', tags: { carrier: 'web' }, expect: [
     { id: 'E1', assert: '产物里 ok 为 true', observe: CASE.tree[0].expect[0].observe, via: 'cli', why_not_ui: '产物是一个文件，页面上不显示' },
     { id: 'E2', assert: '正常' }] }] };
   // 存量项目：c1 有问题（E2/E3 都是降级判定，没问题；这里给它加一条没有判定方式的断言作为存量债）
@@ -234,7 +234,7 @@ test('用例质量：新增用例不达标不能批准、不能开跑；存量�
   assert.equal(ak(dir, 'validate', 'c1').status, 0, '没登记基线时只提示不拦');
   assert.match(ak(dir, 'doctor', '--fix').stdout, /已登记用例质量基线：1 条存量用例/);
   let r = ak(dir, 'validate', 'c1');
-  assert.equal(r.status, 0, r.stderr); assert.match(r.stdout, /存量质量债 4 处/);
+  assert.equal(r.status, 0, r.stderr); assert.match(r.stdout, /存量质量债 10 处/);   // 4 条断言、没有结论树：Q29；操作那一步没说怎么触发：Q31；用例不清晰（步骤 1 处、机判预期没写人怎么看 3 处）：Q37
   // 改存量用例：新加一条没有判定方式的断言 → 只拦新问题
   LEGACY.tree[0].expect.push({ id: 'E10', assert: '另一条人工看的断言' });
   writeFileSync(join(dir, 'cases', 'c1.case.json'), JSON.stringify(LEGACY));

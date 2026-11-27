@@ -15,17 +15,26 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 // 证据有效性机制（record 当下校验 / 逐份复核 / observe 机判）—— 见 evidence-gate.mjs 头注释
 import { checkAtRecord, addPending, reviewItems, reviewGaps, applyReview, reviewPacket, orphanImages, evFingerprint, fpCurrent,
-         claimGaps, VERDICTS, rkey, pick, evalPredicate, fmtPred, validateObserve, extractJSON, guardsOf,
+         claimGaps, walkClaims, VERDICTS, rkey, pick, evalPredicate, fmtPred, validateObserve, extractJSON, guardsOf,
          bindingOf, hasBindings, bindingPlatforms,
          apparatusHits, logApparatus } from './evidence-gate.mjs';
 // 流水线闸（用例评审 / 阻塞当场上报 / 报告只讲过与不过）—— 见 plan-gate.mjs 头注释
-import { loadPlan, savePlan, planPath, planCases, gateRun, checkPlan, caseFingerprints, driftedCases, approvedCases, planDelta, caseEdits, saveSnapshots,
+import { surfacesOfCase, loadPlan, savePlan, planPath, planCases, gateRun, checkPlan, caseFingerprints, driftedCases, approvedCases, planDelta, caseEdits, saveSnapshots, judgeSpec, judgedByCurrent,
          raiseBlocker, readBlockers, writeBlockers, unreportedFor, closeBlockersFor, scopeFingerprint } from './plan-gate.mjs';
 // 平台适用性（声明 + 按操作库算）与需求登记表（需求↔用例的关系只在评审单里）
 import { runAction } from './settings.mjs';
 import { loadOps as loadOpsAt, opRecipe as opRecipeAt, doableOn } from './ops.mjs';
 import { resolveHost, hostOfCase, caseHosts, hostApp, deviceHosts } from './hosts.mjs';
-import { evaluate as qualityOf, formatFindings, standardSummary, QUESTIONS, checkCase } from './case-quality.mjs';
+import * as RP from './replay.mjs';
+import { caseInputs, stepInput, countsAsReal, RESEARCH_REAL, INPUTS } from './input-source.mjs';
+import * as TC from './trigger-consult.mjs';
+import * as CR from './case-review.mjs';
+import * as AG from './ask-gate.mjs';
+import { caseClarity, executedSince, CLARITY_LABEL, commandOf, CONCRETE_STEP, STRUCT_IN_TEXT, emptySlots, expandHuman, expandRefs, fillHuman } from './clarity.mjs';
+import { stepCandidates } from './step-consult.mjs';
+import { saveReviewCard, getReviewCard, saveReviewItems, latestReviewItems, listCanaries, addCanary, getMeta, setMeta } from './store/db.mjs';
+import { loadConfigSets, writeConfigSet, effectiveConfig, configDiff, ITEM_KINDS } from './configsets.mjs';
+import { evaluate as qualityOf, formatFindings, standardSummary, QUESTIONS, checkCase, splitAssert } from './case-quality.mjs';
 import { uncoveredClaims, claimWordsOf, fmtMissing } from './claims.mjs';
 import * as AS from './assess.mjs';
 import { PLATFORMS, RUNTIME_PLATFORMS, PLATFORM_LABEL, platformOfUdid, applicability, fmtApplicability, runtimePlatform, normalizePlatforms, platformValue, expectPlatforms } from './platform.mjs';
@@ -96,7 +105,8 @@ const die = m => { if (JSON_MODE) throw new Refused(m); console.error('acceptkit
 // decide 的 --by 是拍板的人；写成执行者自己就是自签（曾有执行者 decide --by executor 按默认落定）
 const SELF_DECIDER = /^\s*(executor|agent|claude|codex|assistant|bot)\b|^\s*(执行者|自己|我\s*$)/i;
 const KNOWN_FLAGS = new Set([
-  'demand','demand-title','run','session','title','case','expect','status','actual','actual-file',
+  'add-node','canary-add','max','config-unset','no-config-unset','capture','remove-expect','remove-node','move-under','precondition-set','precondition-rm','how','because-from','because-step','because-input','role','demand-ref','reads','via','why-not-ui','kind','config','no-config','add-expect','assert','observe-op','checks','twin-of','steps','apply','see','say','param','op-id','to-op','human','unexecutable','item','replace','question','context','not-mine','propose','adopt','reject','repo','node','real','how','prep','catches',
+  'demand','demand-title','if-due','run','session','title','case','expect','status','actual','actual-file',
   'evidence','quote','reset-quotes','supersede','note','finding','step','blocked-kind','unlock','since',
   'review-note','by','verdict','item','next','all','list','count','regen-case','record','set','source',
   'raise','ack','answer','backfill','resolve','by-me','skip-plan-gate','id','text','what','detail','kind',
@@ -104,7 +114,7 @@ const KNOWN_FLAGS = new Set([
   'from-file','force','json','limit','offset','grep','yes','dry-run','try','parallel','prev','tag','why','desc',
   'surface','host','origin','demand-desc','allow-page','port','allow-obscured','include-probes','label',
   'reuse','new','ops','change','risk','covered','uncovered','cost','suggest','what','detail','settle',
-  'pack','prune','apply','todo','reopen',
+  'pack','prune','apply','walk','walk-done','seen','notes','todo','reopen',
   // 装置故障（取证手段自己坏了）：分类 / 登记 / 字面量读数放行
   'failure-of','fix','where','allow-literal',
   // 执行者收口 finding（plan settle）
@@ -337,11 +347,11 @@ function validate(c) {
     }
   });
   // 主张：标题/摘要里说出口的每句话都要落到断言上（否则标题里承诺的行为可能根本没有断言去验）
-  for (const cl of c.claims || []) {
+  walkClaims(c.claims, ({ cl }) => {
     if (!cl.text) errs.push('claims 有一条缺 text');
-    if (!(cl.proved_by || []).length) errs.push(`claim「${cl.text}」缺 proved_by`);
+    if (!(cl.proved_by || []).length && !(cl.children || []).length) errs.push(`claim「${cl.text}」既没有 proved_by 也没有下一层 children`);
     for (const id of cl.proved_by || []) if (!seen.has(id)) errs.push(`claim「${cl.text}」的 proved_by ${id} 不是本用例的断言`);
-  }
+  });
   return errs;
 }
 
@@ -363,7 +373,21 @@ function loadResult(run) {
   if (!existsSync(p)) die(`run 无 result.json：${p}（先 acceptkit run）`);
   return JSON.parse(readFileSync(p, 'utf8'));
 }
-function saveResult(run, r) { writeFileSync(resultPath(run), JSON.stringify(r, null, 2)); }
+// 存结论时顺手记时间线：运行第一次落盘记开始，每条断言的结论（状态或实际值）一变就记这一刻、是机判还是手记。
+// 用时、重复跑在哪儿花时间（acceptkit timing / tune）都从这里算 —— 以前没记，只能拿证据文件的修改时间去猜
+function saveResult(run, r) {
+  const p = resultPath(run), now = new Date().toISOString(), ev = [];
+  let old = null; try { old = JSON.parse(readFileSync(p, 'utf8')); } catch { /* 第一次落盘 */ }
+  if (!old) { r.created_at ??= now; ev.push({ at: now, kind: 'created' }); }
+  for (const [id, v] of Object.entries(r.results || {})) {
+    const o = old?.results?.[id];
+    if (!v || ((o?.status || 'todo') === v.status && (o?.actual || '') === (v.actual || ''))) continue;
+    v.at = now;
+    ev.push({ at: now, id, status: v.status, how: process.env.ACCEPTKIT_REPLAY ? 'replay' : v.observed?.at && Math.abs(Date.parse(now) - Date.parse(v.observed.at)) < 120e3 ? 'observe' : 'record' });
+  }
+  if (ev.length) r.timeline = [...(r.timeline || []), ...ev].slice(-3000);
+  writeFileSync(p, JSON.stringify(r, null, 2));
+}
 // 断言有了结论（pass / fail / na）：本运行、以及同一用例更早运行上卡这条断言的阻塞，由工具关掉（record 和 observe 共用）
 function closeBlockersOn(run, r, c, id, status) {
   const seqOf = x => { try { return JSON.parse(readFileSync(resultPath(x), 'utf8')).run_seq || 0; } catch { return Infinity; } };
@@ -530,7 +554,7 @@ function cmdNew({ pos }) {
 // 用例质量：新增 / 改过的用例按 core/case-quality.mjs 的标准检查；项目特有规则来自 pack.qualityRules
 // 带上操作库：Q21（界面上验的断言要用界面通道读）要看配方的 exec。以前这里不传，validate / plan check / run 前检查
 // 从来不跑 Q21 —— 实测一个需求里十几条界面断言配着 shell 配方，看板上一直「证据不全」，没有任何检查提示过。
-const caseQuality = c => qualityOf(ROOT, c, { packRules: PACK.qualityRules || [], extraKeys: CFG.quality?.extraKeys, cfg: CFG.quality || {}, hosts: CFG.hosts || {}, ops: loadOps() });
+const caseQuality = c => qualityOf(ROOT, c, { packRules: PACK.qualityRules || [], extraKeys: CFG.quality?.extraKeys, cfg: CFG.quality || {}, hosts: CFG.hosts || {}, ops: loadOps(), cfgSets: loadConfigSets(ROOT) });
 
 function cmdValidate({ pos }) {
   const c = loadCase(pos[0] || die('用法：acceptkit validate <case>'));
@@ -542,6 +566,95 @@ function cmdValidate({ pos }) {
   if (q.block.length) { console.error(`❌ ${q.block.length} 处不达标，不能进评审单批准、不能开跑（确属例外：在断言上写 quality_waive）`); process.exit(1); }
   const exp = allExpects(c); let nodes = 0; walk(c.tree, () => nodes++);
   console.log(`✅ ${c.case} 合法：${nodes} 节点 / ${exp.length} 断言 / ${Object.keys(c.classifications || {}).length} 切面`);
+}
+
+// 整理一条用例给人读的那一层：断言原文里堆着的修订记录机械挪进 history（一字不改，批准后改也直接通过），
+// 再看结论树缺不缺。结论树每层叫什么是写用例的人的事：工具只按操作树列出骨架和还没挂上的断言，不替他起名
+function cmdTidy({ pos, opt }) {
+  const c = loadCase(pos[0] || die('用法：acceptkit tidy <case> [--write]'));
+  const path = c._path, raw = readFileSync(path, 'utf8');
+  let split = 0; const still = [];
+  walk(c.tree, n => { n.expect = (n.expect || []).map(e => { const x = splitAssert(e); if (x) split++; const y = x || e;
+    if (checkCase({ case: c.case, tree: [{ op: '', expect: [y] }] }).some(f => f.rule === 'Q28')) still.push(`${y.id}「${String(y.assert).slice(0, 40)}${String(y.assert).length > 40 ? '…' : ''}」`);
+    return y; }); });
+  const lines = [`用例 ${c.case}：${allExpects(c).length} 条断言，${split} 条的修订记录挪进了 history（一字不改）`];
+  if (still.length) lines.push(`还不是一句人话的 ${still.length} 条 —— 要写用例的人改写：assert 换成「功能坏了这条会不会失败」的一句话，旧正文整段挪进 detail（改写是改意思：批准后改要 plan recheck 写理由，旧结论作废重测）：`, ...still.slice(0, 12).map(x => '   · ' + x), ...(still.length > 12 ? [`   … 另 ${still.length - 12} 条`] : []));
+  const q29 = checkCase(c).filter(f => f.rule === 'Q29' || f.rule === 'Q30');
+  if (q29.length) {
+    lines.push('结论树：', ...q29.map(f => `   · ${f.rule} ${f.at}：${f.msg}`));
+    if (!(c.claims || []).length) {
+      // 骨架按操作树第一层分组（只有一个根时往下一层）—— 只是起点，分组名留空，由写用例的人填「这一组要证明什么」
+      const top = (c.tree || []).length === 1 && (c.tree[0].children || []).length ? c.tree[0].children : (c.tree || []);
+      const ids = n => [...(n.expect || []), ...(n.children || []).flatMap(k => ids(k))].map(e => e.id);
+      lines.push('   骨架（按操作树分组，text 留空待填；同一类的几组可以合并成一层）：',
+        JSON.stringify(top.filter(n => ids(n).length).map(n => ({ text: '', proved_by: ids(n), _op: String(n.op || '').slice(0, 30) })), null, 1).split('\n').map(l => '   ' + l).join('\n'));
+    }
+  }
+  if (opt.write && split) {
+    const indent = (/^\{\n([ \t]+)"/.exec(raw) || [, '  '])[1];
+    const { _path, ...out } = c; writeFileSync(path, JSON.stringify(out, null, indent) + '\n');
+    lines.push(`已写回 ${path}`);
+  } else if (split) lines.push('（没写文件：加 --write 写回）');
+  console.log(lines.join('\n'));
+}
+
+// 执行缓存回放：照这条用例上次跑通的动作放一遍，放完跟基准比；差别大就作废缓存、把回放判出的结论退回待测，按正常流程重跑核对
+function cmdReplay({ pos }) {
+  const run = pos[0] || die('用法：acceptkit replay <运行>');
+  if (!existsSync(resultPath(run))) die(`没有运行 ${run}`);
+  const r0 = loadResult(run), cache = RP.loadCache(ROOT, r0.case);
+  if (!cache) die(`用例 ${r0.case} 还没有执行缓存（跑通过一次之后自动建）：照 next 正常做`);
+  if (r0.replay) die(`运行 ${run} 已经回放过（${r0.replay.ok ? '通过' : '差别大，缓存已作废'}）：照 next 做`);
+  if (cache.from_run === run) die('不能拿缓存来源的运行自己回放');
+  const before = new Set(Object.entries(r0.results || {}).filter(([, v]) => v?.status !== 'todo').map(([id]) => id));
+  const t0 = Date.now();
+  console.log(`↻ 回放 ${r0.case} 的执行缓存（来自 ${cache.from_run}，${cache.steps.length} 步）`);
+  const res = RP.replay(ROOT, run, cache, argv => { const s = Date.now();
+    const x = spawnSync(process.execPath, [process.argv[1], ...argv], { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', env: { ...process.env, ACCEPTKIT_REPLAY: run } });
+    console.log(`   ${x.status === 0 ? '✓' : '✗'} ${argv.join(' ').slice(0, 140)}`); if (x.status !== 0) console.log(`     ${String(x.stderr || x.stdout).trim().split('\n').slice(-3).join('\n     ')}`);
+    return { status: x.status, ms: Date.now() - s }; });
+  const r = loadResult(run), cmp = RP.compare(cache, res.done, r), ms = Date.now() - t0;
+  r.replay = { from: cache.from_run, at: new Date().toISOString(), ms, ok: !cmp.big, reasons: cmp.reasons };
+  if (cmp.big) {
+    RP.dropCache(ROOT, r.case, run, cmp.reasons, r);
+    // 回放判出来的结论不能算数：退回待测，正常流程重新判（之后 settleCheck 比一次，分出是被测物真变了还是缓存的毛病）
+    for (const [id, v] of Object.entries(r.results || {})) if (!before.has(id) && v?.status !== 'todo')
+      r.results[id] = { status: 'todo', actual: '', evidence: [], reset: { at: r.replay.at, prev: v.status, why: '执行缓存回放跟上次差别大，回放判出的结论不算数，按正常流程重测核对' } };
+    saveResult(run, r);
+    console.log(`⚠️ 跟上次差别大，缓存已作废、回放判出的结论退回待测：\n   · ${cmp.reasons.join('\n   · ')}\n   按正常流程重跑核对：照 next 做`);
+    return;
+  }
+  saveResult(run, r);
+  RP.logCache(ROOT, { kind: 'replayed', case: r.case, run, ms, steps: cache.steps.length });
+  const left = Object.values(r.results || {}).filter(v => v?.status === 'todo').length;
+  console.log(`✓ 回放完，跟上次一致（${Math.round(ms / 1000)} 秒）。${left ? `还有 ${left} 条要自己判（手记的那些）：照 next 做` : '全部断言都有结论了：照 next 做复核'}`);
+}
+
+// 用时：按需求 / 用例 / 断言（core/timing.mjs）。不给需求看全项目
+async function cmdTiming({ pos, opt }) {
+  const T = await import('./timing.mjs');
+  const t = T.timingReport(ROOT, { demand: pos[0] || null });
+  if (opt.json) { console.log(JSON.stringify({ ...t, demands: t.demands, cases: t.cases.slice(0, Number(opt.limit) || 50), asserts: t.asserts.slice(0, Number(opt.limit) || 50) })); return; }
+  console.log(T.fmtTiming(t, Number(opt.limit) || 15));
+}
+// 定期优化包：看板服务每周打一份（tune build），处理它的会话照包里的上下文做，做完 tune done 记下
+async function cmdTune({ pos, opt }) {
+  const T = await import('./timing.mjs');
+  const sub = pos[0] || 'show';
+  if (sub === 'build') {
+    if (opt['if-due'] && !T.tuneDue(ROOT)) return;   // 看板服务每天问一次：没到期就不打
+    const { json, md, pack } = T.tuneBuild(ROOT); console.log(`✓ 优化包 ${pack.id}：${md}\n  （同内容的机器版：${json}）`); return; }
+  if (sub === 'done') {
+    const id = pos[1] || die('用法：acceptkit tune done <包日期> --note "<做了什么、没做什么、为什么>"');
+    if (!opt.note || opt.note === true) die('tune done 要带 --note：下一份包对照着看这次处理的效果');
+    try { T.tuneDone(ROOT, id, String(opt.note)); } catch (e) { die(e.message); }
+    console.log(`✓ 优化包 ${id} 记为处理完`); return;
+  }
+  if (sub !== 'show') die('用法：acceptkit tune [show | build [--if-due] | done <包日期> --note "…"]');
+  const ps = T.tunePacks(ROOT);
+  if (!ps.length) { console.log('还没有优化包：acceptkit tune build'); return; }
+  for (const p of ps.slice(-5)) console.log(`${p.done ? '✓' : '·'} ${p.id}  ${p.md}${p.done ? `  处理完：${p.done.note}` : '  未处理'}`);
+  if (T.tuneDue(ROOT)) console.log(`距上一份已超过 ${T.TUNE_EVERY_DAYS} 天：acceptkit tune build`);
 }
 
 // 运行挂错了需求（例如用 --skip-plan-gate 开在别的需求名下）时改挂回去。
@@ -630,6 +743,10 @@ function createRun(c, opt = {}) {
       + `\n修好后重跑 acceptkit run ${c.case}`);
   }
   if (!isProbe) { const q = caseQuality(c); if (q.block.length) die(`用例质量不达标，不能开跑：\n${formatFindings(c.case, q)}`); }
+  // 评审门槛（docs/case-review.md）：每项都要有盲审、没过期、≥ 2 分；首次跑也要过，不认 --skip-plan-gate。probe 只看能照着做、照着看得出
+  { const g = reviewGate(c.case, { mode: isProbe ? 'probe' : 'run', demand: demandId }); if (g) die(g); }
+  // 开跑时的评审状态记进这次运行：报告时评审没过或已过期（跑的时候用例和评审对不上）就不能出 PASS
+  const reviewAtRun = (() => { try { const st = reviewStatusOf(c.case, { demand: demandId, mode: isProbe ? 'probe' : 'run' }); return { status: st.status, fps: createHash('sha256').update(st.items.map(i => i.fp).join(',')).digest('hex').slice(0, 12), gate: !!getMeta(ROOT, 'review_gate_since') }; } catch { return null; } })();
   // 关联性：同 case 的历史 run 挂成链。run_seq=第几次跑；prev_run=上一次跑的 id。
   const priors = priorRunsForCase(c.case, opt.run || null);
   const runSeq = priors.length + 1;
@@ -663,7 +780,7 @@ function createRun(c, opt = {}) {
   // 默认按「日期 + 需求」归并；同一天为同一需求做第二轮验收，用 --session 显式区分。
   const session = opt.session ? String(opt.session) : `${run.slice(0, 10)}-${demandId}`;
   const dreg = knownDemands().get(demandId);
-  saveResult(run, { case: c.case, run, run_seq: runSeq, prev_run: prevRun, session,
+  saveResult(run, { case: c.case, run, run_seq: runSeq, prev_run: prevRun, session, ...(reviewAtRun ? { review: reviewAtRun } : {}),
                     demand: { id: demandId, title: dreg?.title || loadPlan(ROOT, demandId)?.title || demandId },
                     platform: runtimePlatform(c, null) || null,   // both 用例在 device claim 时才定
                     case_ref: c._path.replace(ROOT + '/', ''), meta: Object.keys(build).length ? { build } : {}, results, steps,
@@ -842,6 +959,9 @@ function cmdRecord({ pos, opt: given }) {
     if (ev.length) cur.evidence = [...new Set([...(cur.evidence || []), ...ev])];
     supersede(r, `step:${sid}`, cur, asList(opt.supersede));
     if (opt.note) cur.note = String(opt.note);
+    // 这一步真实产生的值（例：点进的直播间 id）：判据里写 {step.<这一步>.<名>} 引用，不写死
+    for (const kv of [].concat(opt.capture || []).map(String)) { const i = kv.indexOf('='); if (i < 1) die(`--capture 写成 名=值（写了 ${kv}）`);
+      (cur.captured ||= {})[kv.slice(0, i)] = kv.slice(i + 1); }
     // 步骤的 note 同样会把「我连错了设备」写成过程描述 —— 同一道闸
     classifyFailure({ run, r, scope: `step:${sid}`, slot: cur, text: cur.note || '', status: 'step', opt });
     const pend = addPending(r, `step:${sid}`, ev);
@@ -1767,6 +1887,18 @@ function execObserve(recipe, params, dir, udid, ctx = {}) {
   return fn(recipe, params, dir, udid, ctx, HELPERS);
 }
 
+const CAPTURE_REF = /\{step\.([A-Za-z0-9.]+?)\.([A-Za-z_][\w-]*)\}/g;
+function resolveCaptures(o, r, c, run, id) {
+  if (!o) return o;
+  const pos = new Map(); walk(c.tree, (n, path, nodeId) => { pos.set(nodeId, nodeId); if (n.nid) pos.set(n.nid, nodeId); });
+  const missing = [];
+  const sub = v => typeof v === 'string' ? v.replace(CAPTURE_REF, (m, ref, k) => { const at = pos.get(ref), got = at && r.steps?.[at]?.captured?.[k];
+    if (got == null) { missing.push({ ref: at || ref, k }); return m; } return String(got); })
+    : Array.isArray(v) ? v.map(sub) : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, sub(x)])) : v;
+  const out = sub(o);
+  if (missing.length) die(`${id} 的判据要用这次运行里步骤记下的真实值，还没记：\n${missing.map(x => `   acceptkit record ${run} --step ${x.ref} --capture ${x.k}=<这一步真实产生的值> --evidence <截图或产物>`).join('\n')}`);
+  return out;
+}
 function observeOne(run, r, c, id, opt) {
   const e = allExpects(c).find(x => x.id === id) || die(`断言 ${id} 不在用例里`);
   // 适用版本范围先于观测：被测包不在范围里的断言没有被测对象，观测只会拿别的东西来判。
@@ -1799,7 +1931,7 @@ function observeOne(run, r, c, id, opt) {
   // 一条断言一个目的、各端一份翻译：按本轮平台取那一支。
   // 该平台没译 ⇒ **na**（这条在这一端不适用/还没译），不是 fail 也不是 blocked ——
   // 把「还没译」记成 fail 会读成产品缺陷，记成 blocked 会读成装置坏了，两种都误导。
-  const o = bindingOf(o0, plat);
+  const o = resolveCaptures(bindingOf(o0, plat), r, c, run, id);
   if (o === null) {
     const have = bindingPlatforms(o0).join(' / ') || '（空）';
     console.error(`⏭️  ${id}：${plat} 上还没有这条断言的读法（已译：${have}）—— 记 na，不是 fail`);
@@ -1967,7 +2099,7 @@ function observeOne(run, r, c, id, opt) {
   const stale = (cur.evidence || []).filter(x => !evs.includes(x));
   cur.evidence = [...new Set([...evs, ...(cur.evidence || []).filter(x => !stale.includes(x))])];
   if (stale.length) { cur.superseded = [...new Set([...(cur.superseded || []), ...stale])]; for (const x of stale) delete r.reviews?.[rkey(id, x)]; }
-  cur.observed = { op: usedOp, exec: usedRecipe?.exec || null, at: new Date().toISOString(), offline: !!opt['from-file'], strength,
+  cur.observed = { op: usedOp, exec: usedRecipe?.exec || null, at: new Date().toISOString(), offline: !!opt['from-file'], strength, spec: judgeSpec(e),
                    ...(ladder.length > 1 ? { ladder } : {}) };
   if (status === 'blocked') cur.blocked_kind = badG?.gd.blocked_kind || 'capability'; else delete cur.blocked_kind;
   // 前提不成立判 blocked 时也要进阻塞台账（否则 observe 判的 blocked 会绕过台账，直到 report 才被闸撞出来）
@@ -2061,6 +2193,9 @@ function cmdReport({ pos }) {
     for (const x of rr.evidence || []) { const k = imageKind(runDir(run), x); if (k && !ASSERT_IMAGE_KINDS.has(k)) gapBadImage.push(`${e.id}:${x}(${k})`); }
   }
   if (verdict === 'PASS' && (gapUnreviewed.length || gapRejected.length || gapClaims.length)) verdict = 'PARTIAL';
+  // 评审：开跑时没过（项目接入门槛之后），或用例在跑的过程中改了、评审对不上 —— 结论不能算 PASS
+  const reviewGap = res.review?.gate && (res.review.status !== 'pass' ? `开跑时用例评审${CR.STATUS_LABEL[res.review.status] || res.review.status}` : null);
+  if (verdict === 'PASS' && reviewGap) { verdict = 'PARTIAL'; res.verdict_notes = [...[].concat(res.verdict_notes || []).filter(x => !/^评审：/.test(x)), `评审：${reviewGap}，判定降为 PARTIAL`]; console.error(`⚠️ ${reviewGap}：判定降为 PARTIAL`); }
   // 证据体检闸门：①断言级 pass/fail 必须有证据；②fail 必须有截图；
   // ③ 执行过的操作节点必须有过程证据 —— 只查断言级的话，全 pass 的 run
   //    只在末尾留几张图也能 gaps=0（evidence 应是全过程，不是最后一步）。
@@ -2827,6 +2962,12 @@ function cmdRound({ pos, opt }) {
 }
 
 const [cmd, ...rest] = process.argv.slice(2);
+// 执行日志：带运行号的命令原样记进 runs/<运行>/journal.jsonl（退出码、耗时），执行缓存从这里抽（core/replay.mjs）。
+// 记在进程退出时：die / 正常结束 / 抛错都记得到；回放放出来的命令带 ACCEPTKIT_REPLAY，建缓存时不算
+{ const t0 = Date.now(), argv0 = process.argv.slice(2);
+  process.on('exit', code => { try { RP.journalAppend(ROOT, argv0, { exit: code ?? 0, ms: Date.now() - t0, replay: process.env.ACCEPTKIT_REPLAY || null });
+    // 日志写完再看要不要建缓存：最后那条命令也得进缓存
+    if (!code && !process.env.ACCEPTKIT_REPLAY) for (const m of RP.afterCommand(ROOT, argv0)) process.stderr.write(m + '\n'); } catch { /* 缓存是加速，坏了不挡命令 */ } }); }
 const args = { pos: rest.filter(a => !a.startsWith('--')), opt: parseArgs(rest).opt };
 
 
@@ -3847,6 +3988,7 @@ function cmdShotAndroid({ pos, opt }, run, udid) {
                  at: new Date().toISOString(), label, file: `shots/${base}.png`,
                  bytes: statSync(png).size, obscuring_check: obsRec, checks,
                  page_title_on_screen: obs.page_title || null,   // 从本次层级读的，不是人写的
+                 ...(texts?.length ? { screen_texts: texts.filter(Boolean).map(t => String(t).slice(0, 200)).slice(0, 500) } : {}),
                  ...(allow ? { allow_obscured_reason: allow } : {}),
                  ...(opt.step ? { step: String(opt.step) } : {}), ...(opt.expect ? { expect: String(opt.expect) } : {}),
                  ...(opt.note ? { note: String(opt.note) } : {}) };
@@ -4016,6 +4158,14 @@ function planQuality(plan) {
     if (q.block.length) errs.push(`用例 ${name} 质量不达标（${rules(q.block)}）：acceptkit validate ${name}`);
     if (q.warn.length) warns.push(`用例 ${name} 质量提示 ${q.warn.length} 处（${rules(q.warn)}）`);
   }
+  // 改动面级：这一面引用的用例合起来，有注入、没有一条经真实路径触发 —— 这条改动在真实路径上一次都没被触发过（Q32 的改动面版）
+  const ops = loadOps();
+  for (const s of plan.surfaces || []) {
+    const xs = [...(s.reuse || []), ...(s.new || [])].map(tryLoadCase).filter(c => c && !['probe', 'smoke'].includes(c.kind))
+      .flatMap(c => caseInputs(c, ops, loadConfigSets(ROOT)));
+    if (xs.some(x => x.from === 'injected') && !xs.some(countsAsReal))
+      errs.push(`${s.id}「${(s.change || '').slice(0, 24)}」的 ${xs.length} 条断言没有一条经真实路径触发：这条改动在真实路径上一次都没触发过。consult 这几条用例的注入步骤（acceptkit consult <用例>），按代码线索提建议交 owner 定`);
+  }
   return { errs, warns };
 }
 
@@ -4130,6 +4280,8 @@ function cmdPlan({ pos }) {
     }
     const f = { id: `F${plan.findings.length + 1}`, ...fields, at: new Date().toISOString(), decided_by: null, decision: null };
     if (!f.decide) die('缺 --decide：要 owner 定什么（一句问句）');
+    { const g = AG.askCheck(ROOT, demand, `${f.what || ''} ${f.decide}`, { plan, blockers: readBlockers(ROOT, demand), notMine: opt['not-mine'] });
+      if (!g.ok) die(`这件事不该问 owner：${g.msg}`); if (g.overrode) f.not_mine = String(opt['not-mine']); }
     const bad = findingProblems(f);
     if (bad.length) die(`这条 finding owner 读不懂 / 定不了，先补：\n   · ${bad.join('\n   · ')}${usage}`);
     plan.findings.push(f);
@@ -4231,7 +4383,9 @@ function cmdPlan({ pos }) {
     const ref = opt.ref ? String(opt.ref) : null;
     if (kind === 'superseded' && !ref) die('superseded 要给 --ref <接手的那条 Fxx> —— owner 要知道该去读哪条');
     if (ref) {
-      const r = (plan.findings || []).find(x => x.id === ref) || die(`${demand} 里没有 ${ref}`);
+      // 引用提问台账（Qn）：要 owner 定的那半转成了提问
+      const q = /^Q\d+$/.test(ref) ? AG.loadAsks(ROOT, demand).find(x => x.id === ref) : null;
+      const r = q ? { at: q.at } : (plan.findings || []).find(x => x.id === ref) || die(`${demand} 里没有 ${ref}（finding 编号 Fn，或提问编号 Qn：acceptkit ask list ${demand}）`);
       if (ref === fid) die('--ref 不能指向自己');
       if (kind === 'superseded' && Date.parse(r.at || 0) < Date.parse(f.at || 0)) die(`${ref} 比 ${fid} 早，不能取代它`);
     }
@@ -4316,6 +4470,11 @@ function cmdPlan({ pos }) {
       const why = String(sf.why || '').split(/\n/)[0].trim();
       if (why) L.push(`　为什么这些够：${why}`);
       if ((placeholders || []).length) L.push(`　🚨 其中 ${placeholders.length} 条还是**模板占位**（标题/断言里留着模板文字），等于这一面实际没有判据：${placeholders.join(', ')}`);
+      // 怎么触发：批的不只是验什么，还有用什么方式测。注入的只验了判定那一段，说不清的不算真实
+      { const ops = loadOps(), t = { real: 0, 'mock-global': 0, injected: 0, unknown: 0 };
+        cs.filter(x => x.ok).forEach(x => { try { caseInputs(loadCase(x.name), ops, loadConfigSets(ROOT)).forEach(y => t[y.from]++); } catch { /* 读不了的用例上面已列 */ } });
+        const n = t.real + t['mock-global'] + t.injected + t.unknown;
+        if (n) L.push(`　怎么触发：${t.real} 条走真实路径，${t['mock-global']} 条只 mock 全局信号，${t.injected} 条直接注入（只验了判定那一段），${t.unknown} 条说不清${t.injected && !t.real && !t['mock-global'] ? ' —— 🚨 这一面在真实路径上一次都没触发过' : ''}`); }
       L.push('');
     }
     L.push(`## 三、挑几条展开（让上面那些话落地）`);
@@ -4415,10 +4574,10 @@ function cmdPlan({ pos }) {
     const edits = caseEdits(ROOT, CASES, plan);
     if (edits.length) {
       console.log(`\n  ↻ ${edits.length} 条用例在批准后被改过内容 —— acceptkit plan recheck ${demand} --why ".."：`);
-      for (const x of edits) console.log(`   ${x.tier === 'ack' ? '⏸ 要 owner 认' : x.tier === 'unknown' ? '· 分不出（没留底稿）' : '· 事后通知'}  ${x.case}${x.changes.length ? '：' + x.changes.map(c => c.what).join('；') : ''}`);
+      for (const x of edits) console.log(`   ${{ judge: '· 判法改了（记下后旧结论作废重测）', scope: '· 验的范围变了（记下后需求页列给 owner 看）', unknown: '· 分不出（没留底稿）' }[x.tier] || '· 直接通过'}  ${x.case}${x.changes.length ? '：' + x.changes.map(c => c.what).join('；') : ''}`);
     }
     { const recent = (plan.notices || []).slice(-10);
-      if (recent.length) { console.log(`\n  最近的用例改动（已记下）：`); for (const n of recent) console.log(`   ${n.at.slice(0, 16).replace('T', ' ')} ${n.case}${n.acked_by ? `（${n.acked_by} 认了）` : '（事后通知）'}：${n.changes.join('；') || '—'} —— ${n.why}`); } }
+      if (recent.length) { console.log(`\n  最近的用例改动（已记下）：`); for (const n of recent) console.log(`   ${n.at.slice(0, 16).replace('T', ' ')} ${n.case}${n.acked_by ? `（${n.acked_by} 认了）` : n.rules?.length ? `（自动批准 ${n.rules.join(' ')}）` : '（事后通知）'}：${n.changes.join('；') || '—'} —— ${n.why}`); } }
     if (warns.length) { console.log(`\n  ⚠️  ${warns.length} 处提示：`); for (const w of warns) console.log(`   · ${w}`); }
     if ((plan.surfaces || []).some(s => (s.new || []).length)) { console.log(`\n  评审时逐条问新建用例（机器判断不了）：`); for (const q of QUESTIONS) console.log(`   ? ${q}`); }
     { const ag = planAssessGate(plan, 'tool');
@@ -4447,7 +4606,7 @@ function cmdPlan({ pos }) {
     plan.approved_by = by; plan.approved_at = new Date().toISOString(); plan.approved_quote = quote;
     delete plan.returned;   // 批了就不再是「退回待改」
     plan.fingerprints = caseFingerprints(CASES, plan);   // 钉住用例内容，之后改了要显形；键 = 批过的用例
-    saveSnapshots(ROOT, CASES, plan, Object.keys(plan.fingerprints));   // 留底稿：之后改了能分出是事后通知还是要 owner 认
+    saveSnapshots(ROOT, CASES, plan, Object.keys(plan.fingerprints));   // 留底稿：之后改了能分出按哪条自动批准规则记
     savePlan(ROOT, plan);
     recordApproval(ROOT, { kind: 'plan', subject: demand, by, quote, detail: { revision: plan.revision, added, removed, assessments: Object.fromEntries(ag.res.map(a => [a.case, { id: a.id, score: a.total, gate: a.gate }])) } });
     console.log(`✅ ${demand} 评审单 v${plan.revision} 已批准（${by}）—— 现在可以 acceptkit run 了`);
@@ -4460,37 +4619,39 @@ function cmdPlan({ pos }) {
     // 🔴 **不清空批准**。用例是有唯一 id 的资产，需求 ref 的是 id，
     //    一个需求的用例只评审一次；改测试取值属于资产内容修订，不是需求范围变更。
     //    这里只做三件事：升 revision、把「谁在什么时候为什么改的」记进 history、重钉指纹。
-    // 改动分两档（plan-gate classifyCaseEdit）：只加不删的事后通知 owner、直接重钉；会改结论 / 范围的要 owner 本人认（--by --quote）
+    // 批准后的改动按自动批准标准（plan-gate AUTO_RULES）记下，不找 owner：他批的是「验什么」，批过就作数。
+    // 执行者写清为什么改；判法或断言原文改了的，最新一轮里这几条的旧结论作废、按新判法重测（防判松靠重测 + 复核）
     const only = opt.case ? new Set(String(opt.case).split(',')) : null;
     const edits = caseEdits(ROOT, CASES, plan).filter(x => !only || only.has(x.case));
     if (!edits.length) { console.log(`✅ ${demand}: 用例内容与批准时一致，没有改动`); return; }
-    if (!opt.why) die(`${edits.length} 条用例在批准后被改过：${edits.map(x => x.case).join(', ')}\n   重新钉指纹必须带 --why "<为什么改>"`);
-    const by = opt.by ? String(opt.by) : null, quote = opt.quote ? String([].concat(opt.quote).join(' ')) : null;
-    const ownerOk = by && quote && !SELF_DECIDER.test(by);
-    if (by && SELF_DECIDER.test(by)) die(`--by ${by} 是执行者自己。会影响结论的改动只能由 owner 本人认：把 plan show ${demand} 里的改动交给他，他同意后记他的名字和原话`);
-    const pin = edits.filter(x => x.tier !== 'ack' || ownerOk), held = edits.filter(x => x.tier === 'ack' && !ownerOk);
-    if (pin.length) {
-      plan.revision += 1;
-      plan.history.push({ revision: plan.revision, at: new Date().toISOString(), by,
-                          change: `用例内容更新：${pin.map(x => x.case).join(', ')} —— ${opt.why}` });
-      // 事后通知：只加不删的改动 owner 不用先批，但要看得到（plan show / 看板）
-      plan.notices = [...(plan.notices || []), ...pin.map(x => ({ at: new Date().toISOString(), case: x.case, tier: x.tier, why: String(opt.why),
-        changes: x.changes.map(c => c.what), ...(x.tier === 'ack' ? { acked_by: by, quote } : {}) }))].slice(-200);
-      if (pin.some(x => x.tier === 'ack')) recordApproval(ROOT, { kind: 'case_edit', subject: demand, by, quote, detail: { cases: pin.filter(x => x.tier === 'ack').map(x => ({ case: x.case, changes: x.changes })) } });
-      // 只重钉批过的那些：指纹的键就是「批过哪些」，在这里扩进新加的用例等于替 Owner 批了它们
-      const keep = Object.keys(plan.fingerprints), now = caseFingerprints(CASES, plan, keep);
-      for (const x of pin) if (keep.includes(x.case)) plan.fingerprints[x.case] = now[x.case];
-      saveSnapshots(ROOT, CASES, plan, pin.map(x => x.case).filter(n => keep.includes(n)));
-      savePlan(ROOT, plan);
-      console.log(`↻ ${demand} 升到 v${plan.revision}：${pin.length} 条用例的改动已记下`);
-      for (const x of pin) console.log(`   ${x.tier === 'ack' ? `✅ owner 认了` : x.tier === 'unknown' ? '· 批准时没留底稿，分不出改了什么' : '· 事后通知'}  ${x.case}${x.changes.length ? '：' + x.changes.map(c => c.what).join('；') : ''}`);
+    if (!opt.why) die(`${edits.length} 条用例在批准后被改过：${edits.map(x => x.case).join(', ')}\n   记下改动必须带 --why "<为什么改>"`);
+    const why = String(opt.why), now = new Date().toISOString();
+    const resets = [];
+    for (const x of edits) {
+      if (!(x.reset || []).length) continue;
+      const latest = existsSync(RUNS) ? readdirSync(RUNS).map(d => { let r = null; try { r = JSON.parse(readFileSync(join(RUNS, d, 'result.json'), 'utf8')); } catch { /* 不是运行目录 */ } return r && !r.superseded_by && r.case === x.case && (r.demand?.id || r.demand) === demand ? { d, r } : null; })
+        .filter(Boolean).sort((p, q) => (q.r.run_seq || 0) - (p.r.run_seq || 0))[0] : null;
+      if (!latest) continue;
+      const voided = [], now0 = new Map(); walk(loadCase(x.case).tree, n => { for (const e of n.expect || []) now0.set(e.id, e); });
+      // 只作废按旧判法得来的：执行者常常先改判法、按新判法测过了才来记，那些结论不该白测
+      for (const id of x.reset) { const v = latest.r.results?.[id]; if (!v || v.status === 'todo' || judgedByCurrent(v, now0.get(id))) continue;
+        latest.r.results[id] = { status: 'todo', actual: '', evidence: [], reset: { at: now, prev: v.status, why: `批准后改了判法或断言原文（${why}）：旧结论作废，按新判法重测` } }; voided.push(`${id}（原 ${v.status}）`); }
+      if (voided.length) { saveResult(latest.d, latest.r); resets.push(`${x.case} 运行 ${latest.d}：${voided.join(' ')}`); }
     }
-    if (held.length) {
-      console.log(`\n⏸ ${held.length} 条改了会影响结论 / 范围的内容，owner 认了才能跑：`);
-      for (const x of held) console.log(`   ${x.case}：${x.changes.filter(c => c.tier === 'ack').map(c => c.what).join('；')}`);
-      console.log(`   把这几处交给 owner；他同意后：acceptkit plan recheck ${demand} --case ${held.map(x => x.case).join(',')} --by <他> --quote "<原话>" --why "<为什么改>"`);
-      console.log(`   不想等：改回去，只做加判据、换观测这类只加不删的改动`);
-    }
+    plan.revision += 1;
+    plan.history.push({ revision: plan.revision, at: now, by: null, change: `用例内容更新（自动批准）：${edits.map(x => x.case).join(', ')} —— ${why}` });
+    plan.notices = [...(plan.notices || []), ...edits.map(x => ({ at: now, case: x.case, tier: x.tier, why,
+      rules: [...new Set(x.changes.map(c => c.rule).filter(Boolean))], changes: x.changes.map(c => c.what), reset: x.reset || [],
+      judged: x.changes.filter(c => c.before).map(c => ({ id: c.id, before: c.before, after: c.after })) }))].slice(-200);
+    // 只重钉批过的那些：指纹的键就是「批过哪些」，在这里扩进新加的用例等于替 Owner 批了它们
+    const keep = Object.keys(plan.fingerprints), fp = caseFingerprints(CASES, plan, keep);
+    for (const x of edits) if (keep.includes(x.case)) plan.fingerprints[x.case] = fp[x.case];
+    saveSnapshots(ROOT, CASES, plan, edits.map(x => x.case).filter(n => keep.includes(n)));
+    savePlan(ROOT, plan);
+    const TIER_CN = { notify: '直接通过', judge: '判法改了 · 通过，旧结论作废重测', scope: '验的范围变了 · 通过，需求页列给 owner 看', unknown: '批准时没留底稿，分不出改了什么' };
+    console.log(`↻ ${demand} 升到 v${plan.revision}：${edits.length} 条用例的改动按自动批准标准记下（不找 owner）`);
+    for (const x of edits) console.log(`   · ${TIER_CN[x.tier] || x.tier}  ${x.case}${x.changes.length ? '：' + x.changes.map(c => c.what).join('；') : ''}`);
+    if (resets.length) { console.log('   作废的旧结论（按新判法重测）：'); for (const l of resets) console.log(`     ${l}`); }
     return;
   }
   die(`未知子命令 ${sub}（new|show|review|check|approve|return|add-case|finding|decide|bounce|settle|recheck）`);
@@ -4522,6 +4683,8 @@ function cmdBlockers({ pos }) {
     const ids = String(opt.set).split(',').map(s => s.trim()).filter(Boolean);
     const group = ids.map(id => all.find(x => x.id === id) || die(`没有 ${id}`));
     // 要 owner 拍板的问题（finding-quality.mjs blockerAskProblems）：问句、为什么要问你、选项 + 后果、推荐
+    if (opt.ask) { const g = AG.askCheck(ROOT, demand, String(opt.ask), { plan: loadPlan(ROOT, demand), blockers: all.filter(b => !ids.includes(b.id)), notMine: opt['not-mine'] });
+      if (!g.ok) die(`这件事不该问 owner：${g.msg}`); }
     if (opt.ask || opt['why-you'] || opt.option || opt.recommend) for (const x of group) {
       const a = (x.ask ||= {});
       if (opt.ask) a.question = String(opt.ask);
@@ -4724,6 +4887,8 @@ function consultOf(run, eid) {
   return { kind: 'consult', run, case: r.case, expect: eid, demand: D, status: v.status || 'todo', situation, gaps,
     assert: e.assert, via: e.via || 'ui', ...(e.why_not_ui ? { why_not_ui: e.why_not_ui } : {}), ...(b ? { blocker: b.id, unlock: cut(b.unlock || '') } : {}),
     faces: k.faces, surfaces: k.surfaces, questions: k.questions, knowledge, owner_ask: k.owner_ask,
+    // 输入来源：注入 / mock 的断言，先研究真实触发（研究卡同一套查法）
+    input: (x => ({ from: x?.from || 'unknown', ...(x && x.from !== 'real' ? { research: RESEARCH_REAL, done: x.research || null, consult: `acceptkit consult ${c.case} --node ${x.node}` } : {}) }))(caseInputs(c, loadOps(), loadConfigSets(ROOT)).find(y => y.id === eid)),
     next: [
       '先自己答：照 surfaces 逐个查，能查到的入口登记成操作库配方（ops set <id> --platform P --how … --source …），再 observe',
       `查到的业务事实写进知识，下次 consult 会带出：${`acceptkit know add "<事实>" --heading 取证 --source "<哪查到的>"`}`,
@@ -4731,6 +4896,8 @@ function consultOf(run, eid) {
     ] };
 }
 function cmdConsult({ pos, opt }) {
+  // 用例评审时：consult <用例> [--node nX] 查触发方式（不用等开跑）；consult decide <T> 记 owner 改不改
+  if (pos[0] === 'decide' || (pos[0] && !existsSync(resultPath(String(pos[0]))) && tryLoadCase(String(pos[0])))) return cmdConsultTrigger(pos, opt);
   const run = pos[0], eid = opt.expect;
   if (!run || !eid || eid === true) die('用法：acceptkit consult <运行> --expect <E> [--json]');
   const k = consultOf(String(run), String(eid));
@@ -4742,8 +4909,483 @@ function cmdConsult({ pos, opt }) {
   L.push('', '通识问题：'); k.questions.forEach((q, i) => L.push(`  ${i + 1}. ${q}`));
   L.push('', `项目里的相关知识（${k.knowledge.length}）：`); if (!k.knowledge.length) L.push('  没有检索到');
   for (const x of k.knowledge) L.push(`  ${x.ref} ${x.text}`);
+  L.push('', `触发方式：${INPUTS[k.input.from] || '说不清怎么触发'}${k.input.consult ? ` —— 不是真实触发，查代码线索、提建议：${k.input.consult}` : ''}`);
   L.push('', '下一步：'); k.next.forEach(n => L.push(`  - ${n}`));
   console.log(mask(ROOT, L.join('\n')));
+}
+
+// ── consult 的触发方式用法（用例评审时）：acceptkit consult <用例> [--node nX] ──
+// 一步不是真实触发：在被测代码里找线索 → 执行者往上追到真实入口、写测法建议（--propose）→ owner 定改不改（consult decide）
+function demandsOfCase(name) {
+  const dir = join(ROOT, 'state', 'plans'); let fs = []; try { fs = readdirSync(dir).filter(f => f.endsWith('.json')); } catch { return []; }
+  return fs.map(f => f.replace(/\.json$/, '')).filter(D => { try { return planCases(loadPlan(ROOT, D)).has(name); } catch { return false; } });
+}
+function consultTrigger(caseName, opt) {
+  const c = loadCase(caseName), ops = loadOps();
+  const Ds = opt.demand ? [String(opt.demand)] : demandsOfCase(c.case);
+  let repos = [...asList(opt.repo).map(s => { const [name, ...p] = s.split('='); return { name, path: p.join('=') }; }),
+    ...Ds.flatMap(D => loadRounds(ROOT, D)?.repos || [])].filter((r, i, a) => r.path && existsSync(r.path) && a.findIndex(x => x.path === r.path) === i);
+  let borrowed = null;
+  if (!repos.length) {
+    const plats = new Set(normalizePlatforms(c));
+    const others = readdirSync(join(ROOT, 'state', 'plans')).filter(f => f.endsWith('.json')).map(f => f.replace(/\.json$/, ''))
+      .filter(D => { try { const p = loadPlan(ROOT, D); return !p.platform || plats.has(p.platform); } catch { return false; } })
+      .flatMap(D => (loadRounds(ROOT, D)?.repos || []).map(r => ({ ...r, from: D })));
+    // 只借一个需求的：最近登记过被测仓、仓还在的那个（借好几个需求的会把新旧版本的代码混在一起）
+    const mt = D => { try { return statSync(join(ROOT, 'state', 'rounds', `${D}.json`)).mtimeMs; } catch { return 0; } };
+    const live = others.filter(r => existsSync(r.path)), pick = [...new Set(live.map(r => r.from))].sort((a, b) => mt(b) - mt(a))[0];
+    repos = live.filter(r => r.from === pick); borrowed = repos.length ? repos.map(r => `${r.name}←${r.from}`) : null;
+  }
+  const steps = opt.node ? [TC.findStep(c, String(opt.node)) || die(`用例 ${c.case} 里没有节点 ${opt.node}（编号见 acceptkit steps ${c.case}）`)].map(x => ({ ...x, ...stepInput(x.n, ops, typeof c.input === 'string' ? { from: c.input } : c.input) }))
+    : TC.nonRealSteps(c, ops);
+  const props = TC.loadProposals(ROOT).filter(p => p.case === c.case);
+  const items = steps.map(s => {
+    const anchors = TC.anchorsOf(s.n), sources = repos.length ? TC.traceSources(repos, TC.literalValues(s.n)) : [];
+    return { node: s.id, op: s.n.op, from: s.from, by: s.by, fields: s.fields, anchors,
+      sources, // 追到了发出点就不再铺字段命中清单：链比清单有用，清单在大仓上也慢
+      leads: repos.length && !sources.length ? TC.codeLeads(repos, anchors) : null, scripts: TC.projectScripts(ROOT, anchors), real_ops: TC.realOps(ops, anchors),
+      proposals: props.filter(p => p.node === s.id) };
+  });
+  return { kind: 'consult_trigger', case: c.case, demands: Ds, repos: repos.map(r => r.name), ...(borrowed ? { borrowed } : {}), steps: items, research: RESEARCH_REAL,
+    next: [
+      ...(repos.length ? (borrowed ? [`这个需求没登记被测仓，借用了同平台其他需求登记的（${borrowed.join(' ')}）；版本不对就登记这个需求自己的：acceptkit round repos ${Ds[0] || '<需求>'} --repo <名>=<路径>`] : [])
+        : [`项目里没有任何同平台的被测仓可读：acceptkit round repos ${Ds[0] || '<需求>'} --repo <名>=<路径>（或这次临时 --repo <名>=<路径>）`]),
+      '这张卡要你交出东西：每个不是真实触发的步骤，写一份测法建议（--propose），或者写明追不到（input.research verdict=none）。只把线索转述给用户不算做完',
+      '线索只是起点：组装点是手写字段在生产代码里算出来的地方，从它往上追调用方，追到用户动作、真实请求，或调试 / 工具代码、项目脚本里能碰到的入口',
+      `追到了就写测法建议交 owner 定：acceptkit consult ${c.case} --node <节点> --propose --real "<真实情况下什么产生这个输入>" --evidence "<文件:行 这里是什么>" [--evidence …] --how "<换成怎么测>" --catches "<能多验到哪一段>" [--prep "<开测前要先补什么、多大工作量>"]${Ds[0] ? ` --demand ${Ds[0]}` : ''}`,
+      '追不到任何入口、也补不出来：在这一步写 input.research = { tried, alt, verdict: "none" }，登记 finding 交 owner 定要不要接受只验判定那一段的风险',
+    ] };
+}
+function cmdConsultTrigger(pos, opt) {
+  if (pos[0] === 'decide') {
+    const id = pos[1] || die('用法：acceptkit consult decide <T> --adopt|--reject --by <他> --quote "<原话>"');
+    if (!opt.adopt === !opt.reject) die('要么 --adopt 要么 --reject');
+    let p; try { p = TC.decideProposal(ROOT, String(id), { adopt: !!opt.adopt, by: opt.by && String(opt.by), quote: opt.quote && String(opt.quote) }); } catch (e) { die(e.message); }
+    if (JSON_MODE) return p;
+    console.log(`✓ ${p.id} ${p.status === 'adopted' ? '改成真实触发' : '不改'}（${p.decided_by}：「${p.quote}」）`);
+    if (p.status === 'adopted') console.log(`  接着：${p.prep ? `先${p.prep}；` : ''}把它登记成操作并标真实触发（acceptkit ops set <op> --platform P --how … --input real），用例 ${p.case} 的 ${p.node} 挂上这个 op_id，plan recheck --why 记下`);
+    return;
+  }
+  const caseName = String(pos[0]);
+  if (opt.steps) {
+    // 步骤咨询（core/step-consult.mjs）：从提测内容 + 项目操作集推出明确的操作步骤；--apply 把明确的那些写回（记下来源），拿不准的列候选
+    const c = loadCase(caseName), ops = loadOps(), Ds = opt.demand ? [String(opt.demand)] : demandsOfCase(c.case);
+    const surface = Ds.flatMap(D => (loadPlan(ROOT, D)?.surfaces || []).filter(s => [...(s.reuse || []), ...(s.new || [])].includes(c.case)).map(s => [s.change, s.why, s.risk].filter(Boolean).join(' '))).join(' ').slice(0, 1500);
+    const items = stepCandidates(c, ops, { surface });
+    let applied = 0;
+    if (opt.apply) {
+      const raw = JSON.parse(readFileSync(c._path, 'utf8'));
+      const nodes = new Map(), exps = new Map();
+      (function w(ns, p) { (ns || []).forEach((n, i) => { const id = `${p}${i + 1}`; nodes.set(id, n); (n.expect || []).forEach(e => exps.set(e.id, e)); w(n.children, `${id}.`); }); })(raw.tree, 'n');
+      for (const it of items.filter(x => x.pick)) {
+        const cand = it.candidates.find(x => x.op === it.pick);
+        if (it.type === 'step') { const n = nodes.get(it.at); if (!n || n.op_id) continue;
+          (raw.clarified ||= []).push({ at: new Date().toISOString(), via: 'consult --steps', what: `node ${it.at} → 操作 ${it.pick}`, before: { op: n.op } });
+          // 原文是机器的计划（JSON / 模板）：原样留进 note，这一步写成操作的人话
+          if (STRUCT_IN_TEXT.test(String(n.op || '')) || emptySlots(n)) { n.note = [n.note, String(n.op)].filter(Boolean).join('\n'); n.op = ops[it.pick].title; }
+          n.op_id = it.pick; applied++; }
+        else { const e = exps.get(it.at); if (!e || [].concat(e.see || []).length) continue;
+          (raw.clarified ||= []).push({ at: new Date().toISOString(), via: 'consult --steps', what: `expect ${it.at} ← 操作 ${it.pick} 的人看步骤`, before: { see: null } });
+          e.see = cand.human; applied++; }
+      }
+      if (applied) writeFileSync(c._path, JSON.stringify(raw, null, 2) + '\n');
+    }
+    const after = caseClarity(opt.apply ? JSON.parse(readFileSync(c._path, 'utf8')) : c, ops);
+    const ret = { kind: 'consult_steps', case: c.case, surface: surface.slice(0, 300), items, applied, status: after.status, left: after.steps.length + after.expects.length,
+      next: ['明确的（pick）可以 --apply 写回；拿不准的照 candidates 挑一个：acceptkit clarify <用例> --node <nX> --op-id <操作> / --expect <E> --see …；都不对就照提测内容自己写，或 consult <用例> 查真实触发'] };
+    if (JSON_MODE) return ret;
+    console.log(`步骤咨询 · ${c.case}（提测内容：${surface ? surface.slice(0, 60) + '…' : '评审单里没找到'}）`);
+    for (const it of items) console.log(`■ ${it.at} ${it.type === 'step' ? '步骤' : '预期'}：${it.msg.slice(0, 60)}\n  ${it.candidates.length ? it.candidates.map(x => `${x.op === it.pick ? '✓' : '·'} ${x.op}「${x.title}」[${x.score}]${x.input === 'injected' ? '（注入）' : ''}`).join('  ') : '没有候选：照提测内容自己写，或先给相关操作补人看步骤'}`);
+    console.log(`${opt.apply ? `写回 ${applied} 处，` : ''}现在：${after.status === 'clear' ? '清晰' : `还有 ${after.steps.length + after.expects.length} 处不清晰`}`);
+    return;
+  }
+  if (opt.propose) {
+    let p; try { p = TC.addProposal(ROOT, { demand: opt.demand && String(opt.demand), caseName: loadCase(caseName).case, node: String(opt.node || die('--propose 要配 --node')), real: opt.real && String(opt.real), evidence: [].concat(opt.evidence || []).map(String), how: opt.how && String(opt.how), prep: opt.prep && String(opt.prep), catches: opt.catches && String(opt.catches) }); } catch (e) { die(e.message); }
+    if (JSON_MODE) return p;
+    console.log(`✓ 测法建议 ${p.id} 已记下，等 owner 定改不改（next 会出 attention 卡片）`); return;
+  }
+  const k = consultTrigger(caseName, opt);
+  if (JSON_MODE) return k;
+  const L = [`触发方式咨询 · ${k.case}${k.demands.length ? `（${k.demands.join(' ')}）` : ''} · 读的被测仓：${k.borrowed ? `${k.borrowed.join(' ')}（借用）` : k.repos.join(' ') || '没有'}`];
+  if (!k.steps.length) L.push('', '每一步都已说清是真实触发或只 mock 全局信号，没有要查的');
+  for (const s of k.steps) {
+    L.push('', `■ ${s.node}「${clipText(s.op, 80)}」：${s.from === 'unknown' ? '说不清怎么触发' : INPUTS[s.from] || s.from}${s.by === 'literal' ? '（文字里手写了输入字段）' : ''}`);
+    if (s.fields.length) L.push(`  手写字段：${s.fields.join('、')}`);
+    L.push(`  锚点：${s.anchors.join('、') || '（这一步没有可搜的名字：在节点上写清喂的是什么，或挂 op_id）'}`);
+    if (s.sources.length) {
+      L.push('  真实代码里哪里产生同样的取值（从发出点往上追，[入口] = 界面 / 工具 / 入口类代码，真实触发多半就在这）：');
+      for (const x of s.sources) L.push(`    「${x.value}」 ${x.chain.map(c => `${c.entry ? '[入口] ' : ''}${c.repo}:${c.file}:${c.line}${c.fn ? ` ${c.fn}()` : ''}`).join('  ←  ')}`);
+    }
+    if (s.leads) {
+      L.push(`  组装点（生产代码，按命中锚点数排）：${s.leads.assembly.length ? '' : '没找到'}`);
+      s.leads.assembly.forEach(f => L.push(`    ${f.repo}:${f.file} [${f.anchors.join(',')}]  ${f.lines[0] || ''}`));
+      L.push(`  工具 / 调试代码里的入口：${s.leads.tools.length ? '' : '没找到'}`);
+      s.leads.tools.forEach(f => L.push(`    ${f.repo}:${f.file} [${f.anchors.join(',')}]  ${f.lines[0] || ''}`));
+      if (s.leads.tests) L.push(`  测试代码里命中 ${s.leads.tests} 处（不说明真实路径，没列）`);
+    }
+    if (s.scripts.length) L.push(`  项目脚本：${s.scripts.map(x => `${x.file}[${x.anchors.join(',')}]`).join('  ')}`);
+    if (s.real_ops.some(o => o.anchors.length)) L.push(`  已登记的真实触发操作：${s.real_ops.filter(o => o.anchors.length).map(o => `${o.op}（${o.title}）`).join('；')}`);
+    s.proposals.forEach(p => L.push(`  测法建议 ${p.id} [${({ proposed: '等 owner 定', adopted: '同意改', rejected: '不改' })[p.status]}]：${p.how}`));
+  }
+  L.push('', '查法：'); k.research.forEach((x, i) => L.push(`  ${i + 1}. ${x}`));
+  L.push('', '下一步：'); k.next.forEach(n => L.push(`  - ${n}`));
+  console.log(mask(ROOT, L.join('\n')));
+}
+
+// ════════════ ask：要 owner 回答的事只有这一个入口（core/ask-gate.mjs）════════════
+const ASK_USAGE = '用法：acceptkit ask <需求> --question "…" --kind behavior|others|irreversible|risk --context "…" --why-you "…" --option "做法 => 后果" --option … --recommend "…" [--not-mine "…"]\n       acceptkit ask answer <需求> <Q> --by <他> --quote "<原话>" [--option <序号>] | withdraw <需求> <Q> --why "…" | list <需求>';
+function cmdAsk({ pos, opt }) {
+  const sub = ['answer', 'withdraw', 'list'].includes(pos[0]) ? pos[0] : 'new';
+  const D = String((sub === 'new' ? pos[0] : pos[1]) || die(ASK_USAGE));
+  if (sub === 'list') { const xs = AG.loadAsks(ROOT, D); if (JSON_MODE) return { demand: D, asks: xs };
+    if (!xs.length) { console.log(`${D} 没有提过问`); return; }
+    for (const x of xs) console.log(`${x.id} [${({ open: '待答', answered: '已答', withdrawn: '已撤回' })[x.status]}] ${x.question}${x.answer ? ` → 「${x.answer.quote}」（${x.answer.by}）` : ''}`); return; }
+  if (sub === 'answer') { let x; try { x = AG.answerAsk(ROOT, D, String(pos[2] || die(ASK_USAGE)), { by: opt.by && String(opt.by), quote: opt.quote && String(opt.quote), option: opt.option }); } catch (e) { die(e.message); }
+    if (SELF_DECIDER.test(String(opt.by))) die(`--by ${opt.by} 是执行者自己：答复只记 owner 本人`);
+    if (JSON_MODE) return x; console.log(`✓ ${x.id} 已答：「${x.answer.quote}」`); return; }
+  if (sub === 'withdraw') { let x; try { x = AG.withdrawAsk(ROOT, D, String(pos[2] || die(ASK_USAGE)), opt.why); } catch (e) { die(e.message); }
+    if (JSON_MODE) return x; console.log(`✓ ${x.id} 已撤回：${x.withdrawn.why}`); return; }
+  const a = { question: opt.question && String(opt.question), kind: opt.kind && String(opt.kind), context: opt.context && String(opt.context), why_you: opt['why-you'] && String(opt['why-you']),
+    options: [].concat(opt.option || []).map(String), recommend: opt.recommend && String(opt.recommend) };
+  const g = AG.askCheck(ROOT, D, `${a.question || ''} ${a.context || ''}`, { plan: loadPlan(ROOT, D), blockers: readBlockers(ROOT, D), notMine: opt['not-mine'] });
+  if (!g.ok) { if (JSON_MODE) return { kind: 'ask_refused', why: g.why, ref: g.ref, text: g.text, message: g.msg }; die(`这件事不该问 owner：${g.msg}`); }
+  const bad = AG.askShapeProblems(a);
+  if (bad.length) die(`owner 拿到这个问题定不了，先补：\n   · ${bad.join('\n   · ')}`);
+  const x = AG.addAsk(ROOT, D, { ...a, ...(g.overrode ? { not_mine: String(opt['not-mine']), overrode: g.overrode, ...(g.overrode_text ? { overrode_text: g.overrode_text } : {}) } : {}) });
+  if (JSON_MODE) return x;
+  console.log(`✓ 已记下 ${x.id}，等 owner 答。回复和状态汇报里只写「${x.id}」和待答几条，不要复述问题；next 会出一张汇总卡给他`);
+}
+
+// ════════════ clarify：跑过的用例改清晰（core/clarity.mjs）════════════
+// 不靠卡片上一段话让执行者手改用例：工具从那次运行里取出每一步、每条预期的事实（这一步跑过的命令、截的图、观测打开的页和读到的值）当候选，
+// 执行者照事实写成人话，用这条命令写回；工具核对写得够不够具体、有没有空值，不够就拒收并说怎么改；每次写回记下来源运行和改前的样子。
+const CLARIFY_USAGE = '用法：acceptkit clarify <用例> [--run <运行>] --json            看哪里不清晰、那次执行的事实\n'
+  + '       acceptkit clarify <用例> --node <nX> --op "进入「…」页，点击「…」" [--param 名=值 …] [--op-id <操作>] [--run <运行>]\n'
+  + '       acceptkit clarify <用例> --expect <E> --see "进入「…」页" --see "看「…」这一行是不是 …" [--run <运行>]\n'
+  + '       acceptkit clarify <用例> --unexecutable --why "<为什么做不了，至少 10 字>" [--run <运行>]';
+function clarifyFacts(c, runId) {
+  if (!runId || !existsSync(resultPath(runId))) return null;
+  const r = loadResult(runId), journal = RP.journalOf(ROOT, runId);
+  const act = e => e.exit === 0 && !['next', 'read', 'context', 'consult', 'steps', 'report', 'clarify', 'timing'].includes(e.argv[0]);
+  const byNode = id => journal.filter(e => act(e) && e.argv.some((a, i) => (a === '--step' || a === '--node') && e.argv[i + 1] === id)).map(e => e.argv.filter(a => a !== runId).join(' '));
+  return { run: runId, steps: r.steps || {}, results: r.results || {}, byNode, all: journal.filter(act).map(e => e.argv.filter(a => a !== runId).join(' ')) };
+}
+function cmdClarify({ pos, opt }) {
+  const c = loadCase(String(pos[0] || die(CLARIFY_USAGE))), ops = loadOps();
+  const runs = existsSync(RUNS) ? readdirSync(RUNS).filter(d => { try { return JSON.parse(readFileSync(join(RUNS, d, 'result.json'), 'utf8')).case === c.case; } catch { return false; } }).sort() : [];
+  const runId = opt.run ? String(opt.run) : runs.at(-1) || null;
+  const raw = JSON.parse(readFileSync(c._path, 'utf8'));
+  const stamp = (what, before) => { (raw.clarified ||= []).push({ at: new Date().toISOString(), run: runId, what, before }); };
+  const save = () => { writeFileSync(c._path, JSON.stringify(raw, null, 2) + '\n'); const k = caseClarity(raw, ops);
+    return { kind: 'clarify', case: c.case, status: k.status, left: [...k.steps, ...k.expects], ...(k.status === 'unclear' ? { note: `还有 ${k.steps.length + k.expects.length} 处不清晰：acceptkit clarify ${c.case} --json 看事实` } : { note: `改完了：acceptkit plan recheck <需求> --case ${c.case} --why "跑过后改清晰"` }) }; };
+  // 节点认位置编号（n1.2）也认稳定 id（nid）：位置编号挪了节点就变，评审记录和改法命令用的是 nid
+  const findNode = id => { let hit = null; (function w(ns, p) { (ns || []).forEach((n, i) => { const pos = `${p}${i + 1}`; if (pos === id || n.nid === id) hit = n; w(n.children, `${pos}.`); }); })(raw.tree, 'n'); return hit; };
+  const findExp = id => { let hit = null; (function w(ns) { (ns || []).forEach(n => { (n.expect || []).forEach(e => { if (e.id === id) hit = e; }); w(n.children); }); })(raw.tree); return hit; };
+  if (opt.unexecutable) {
+    const why = String(opt.why || '').trim(); if (why.length < 10) die('判不可执行要写清为什么做不了（--why，至少 10 字）：例「这一步在真实世界里没有入口，业务方确认（finding F12）」');
+    stamp('unexecutable', raw.unexecutable || null); raw.unexecutable = { why, at: new Date().toISOString(), run: runId };
+    const out = save(); if (JSON_MODE) return out; console.log(`✓ ${c.case} 判成不可执行；这是验的范围变了，plan recheck 时写理由，需求页会列给 owner`); return;
+  }
+  // 删一条断言：验的范围变了（plan recheck 时写理由、列给 owner），删前的样子留底；别的断言 input.real_twin 指向它的一并清掉
+  if (opt['remove-expect']) {
+    const id = String(opt['remove-expect']), why = String(opt.why || '').trim();
+    if (why.length < 6) die('删断言要写 --why（为什么删）：删断言是验的范围变了，理由会列给 owner');
+    let gone = null;
+    (function w(ns) { (ns || []).forEach(n => { const i = (n.expect || []).findIndex(e => e.id === id); if (i >= 0) { gone = n.expect[i]; n.expect.splice(i, 1); } w(n.children); }); })(raw.tree);
+    if (!gone) die(`用例 ${c.case} 里没有断言 ${id}`);
+    stamp(`删断言 ${id}：${why}`, { expect: gone });
+    (function w(ns) { (ns || []).forEach(n => { (n.expect || []).forEach(e => { if (e.input && typeof e.input === 'object' && e.input.real_twin === id) { stamp(`${e.id} 的 real_twin（指向已删的 ${id}）清掉`, { input: { ...e.input } }); delete e.input.real_twin; } }); w(n.children); }); })(raw.tree);
+    const out = save(); if (JSON_MODE) return out; console.log(`✓ 删了 ${id}（删前的样子留在改动记录里）；plan recheck 时写理由`); return;
+  }
+  // 删一个节点：只删空的（它和子孙都没有预期）—— 走不到的分支、条件恒真留下的空壳；带预期的先逐条 --remove-expect，删验的范围要单独讲理由
+  // 挪节点：把一支（连同下面的预期）挂到另一步下面，成为它的最后一个子节点 —— 例：分组标题和产生结果的那一步平级时，挪到那一步下面
+  // 加一步：挂在某一步下面（成为它的最后一个子节点），或用 root 加在最外层；新节点分配新的 nid（避开用过和删掉的）
+  if (opt['add-node']) {
+    const under = String(opt['add-node']), text = String(opt.op || '').trim(); if (!text) die('--add-node 要配 --op "<这一步：在哪 + 做什么 + 输入什么>"');
+    const dest = under === 'root' ? null : (findNode(under) || die(`用例 ${c.case} 里没有节点 ${under}`));
+    const used = new Set([].concat(raw.retired_nids || [])); (function w(ns) { (ns || []).forEach(n => { if (n.nid) used.add(n.nid); w(n.children); }); })(raw.tree);
+    let nid; for (let i = 0; ; i++) { nid = 's' + createHash('sha256').update(`${c.case}|add|${under}|${text}|${i}`).digest('hex').slice(0, 4); if (!used.has(nid)) break; }
+    const node = { nid, kind: 'action', op: text, ...(opt['op-id'] ? { op_id: String(opt['op-id']) } : {}) };
+    if (opt['op-id'] && !ops[String(opt['op-id'])]) die(`操作 ${opt['op-id']} 不存在`);
+    if (opt.param) node.params = Object.fromEntries([].concat(opt.param).map(String).map(x => { const i = x.indexOf('='); if (i < 1) die(`--param 写成 名=值（写了 ${x}）`); return [x.slice(0, i), x.slice(i + 1)]; }));
+    stamp(`加一步 ${nid}（在 ${under} 下面）`, null);
+    if (dest) (dest.children ||= []).push(node); else raw.tree.push(node);
+    const out = save(); if (JSON_MODE) return out; console.log(`✓ 加了一步 ${nid}（在 ${under} 下面）；下面的预期 / 子步骤用 --move-under 挪过来`); return;
+  }
+  // 预期挪到另一步下：because 指的那一步跟着换成新位置，不然 E1 的因果会指到旧步骤
+  // 改断言的说法（不改意思）：例如「喂命中事件」改成真实操作后的说法、去掉示例 id。原句留在改动记录里，--why 说清意思没变
+  // 写回的文字里有 U+FFFD（替换字符）：多半是上游拼接截断了多字节字，写进去就成了谁都读不懂的乱码 —— 拒收
+  { const bad = Object.entries(opt).filter(([, v]) => [].concat(v).some(x => typeof x === 'string' && x.includes('\uFFFD'))).map(([k]) => '--' + k);
+    if (bad.length) die(`${bad.join('、')} 里有乱码字符（U+FFFD）：先把原文改对再写回`); }
+  if (opt.expect && opt.assert && !opt['add-expect'] && !opt['observe-op']) {
+    const e = (function f(ns) { for (const n of ns || []) { const x = (n.expect || []).find(e => e.id === String(opt.expect)) || f(n.children); if (x) return x; } return null; })(raw.tree) || die(`没有预期 ${opt.expect}`);
+    const why = String(opt.why || '').trim(); if (why.length < 6) die('改断言说法要写 --why：为什么意思没变');
+    const text = String(opt.assert).trim(); if (!text) die('--assert 不能为空');
+    stamp(`预期 ${e.id} 改说法：${why}`, { assert: e.assert });
+    e.assert = text;
+    const out = save(); if (JSON_MODE) return out; console.log(`✓ ${e.id} 断言改了说法（原句在改动记录里）`); return;
+  }
+  if (opt.expect && opt['move-under']) {
+    const id = String(opt.expect), to = String(opt['move-under']);
+    let parent = null; (function w(ns) { for (const n of ns || []) { if ((n.expect || []).some(e => e.id === id)) parent = n; w(n.children); } })(raw.tree);
+    const dest = findNode(to); if (!parent) die(`用例 ${c.case} 里没有预期 ${id}`); if (!dest) die(`用例 ${c.case} 里没有节点 ${to}`);
+    const i = parent.expect.findIndex(e => e.id === id), e = parent.expect[i];
+    stamp(`预期 ${id} 挪到 ${to} 下面`, { from: parent.nid || null, to });
+    parent.expect.splice(i, 1); if (!parent.expect.length) delete parent.expect;
+    if (e.because?.from === 'step' && dest.nid) e.because.step = dest.nid;
+    (dest.expect ||= []).push(e);
+    const out = save(); if (JSON_MODE) return out; console.log(`✓ 预期 ${id} 挪到 ${to} 下面${e.because?.from === 'step' ? '（because 指向的步骤已改成新位置，理由要不要改自己看）' : ''}`); return;
+  }
+  if (opt.node && opt['move-under']) {
+    const from = String(opt.node), to = String(opt['move-under']);
+    if (to === from || to.startsWith(from + '.')) die(`不能把 ${from} 挪到它自己下面`);
+    let parent = null, idx = -1;
+    (function w(ns, p) { (ns || []).forEach((n, i) => { const pos = `${p}${i + 1}`; if (pos === from || n.nid === from) { parent = ns; idx = i; } w(n.children, `${pos}.`); }); })(raw.tree, 'n');
+    const dest = findNode(to);
+    if (!parent) die(`用例 ${c.case} 里没有节点 ${from}`); if (!dest) die(`用例 ${c.case} 里没有节点 ${to}`);
+    const moved = parent[idx];
+    stamp(`节点 ${from} 挪到 ${to} 下面`, { from, to });
+    (dest.children ||= []).push(moved); parent.splice(idx, 1);
+    const out = save(); if (JSON_MODE) return out; console.log(`✓ ${from} 挪到 ${to} 下面（节点编号会变，clarify <用例> 看新编号）`); return;
+  }
+  if (opt['remove-node']) {
+    const id = String(opt['remove-node']), why = String(opt.why || '').trim();
+    if (why.length < 6) die('删节点要写 --why（例：条件恒真，F 支走不到）');
+    let parent = null, idx = -1;
+    (function w(ns, p) { (ns || []).forEach((n, i) => { const pos = `${p}${i + 1}`; if (pos === id || n.nid === id) { parent = ns; idx = i; } w(n.children, `${pos}.`); }); })(raw.tree, 'n');
+    if (!parent) die(`用例 ${c.case} 里没有节点 ${id}`);
+    const exps = []; (function w(n) { (n.expect || []).forEach(e => exps.push(e.id)); (n.children || []).forEach(w); })(parent[idx]);
+    if (exps.length) die(`${id} 下面还有预期 ${exps.join('、')}：先逐条 clarify --remove-expect（删验的范围要讲理由），再删节点`);
+    stamp(`删节点 ${id}：${why}`, { node: parent[idx] });
+    { const gone = []; (function w(n) { if (n.nid) gone.push(n.nid); (n.children || []).forEach(w); })(parent[idx]); if (gone.length) raw.retired_nids = [...new Set([...[].concat(raw.retired_nids || []), ...gone])]; }
+    parent.splice(idx, 1);
+    const out = save(); if (JSON_MODE) return out; console.log(`✓ 删了空节点 ${id}（后面的兄弟节点编号会前移；删前的样子留在改动记录里）`); return;
+  }
+  // 节点种类：动作 / 分组。分组只是标题（下面挂子步骤或预期），不能带操作、参数、触发声明 ——
+  // 带着它们改成分组，挂在下面的预期就会从「注入」变成看上去的「真实」（触发来源跳过分组）
+  if (opt.node && opt.kind) {
+    const n = findNode(String(opt.node)) || die(`用例 ${c.case} 里没有节点 ${opt.node}`), k = String(opt.kind);
+    if (!['action', 'group'].includes(k)) die('--kind 只能是 action / group');
+    if (k === 'group' && !(n.children || []).length && !(n.expect || []).length) die(`${opt.node} 下面既没有子步骤也没有预期：不是分组标题`);
+    if (k === 'group' && (n.op_id || n.params || n.input || n.data)) die(`${opt.node} 挂着操作 / 参数 / 触发声明：它是一步动作，不能改成分组（先把动作拆成单独一步）`);
+    stamp(`node ${opt.node} 种类 → ${k}`, { kind: n.kind || null });
+    n.kind = k;
+    const out = save(); if (JSON_MODE) return out; console.log(`✓ ${opt.node} → ${k === 'group' ? '分组标题' : '动作'}`); return;
+  }
+  if (opt.node && (opt.config || opt['no-config'])) {
+    const n = findNode(String(opt.node)) || die(`用例 ${c.case} 里没有节点 ${opt.node}`), sets = loadConfigSets(ROOT);
+    const add = asList(opt.config), drop = new Set(asList(opt['no-config']));
+    const miss = add.filter(id => !sets[id]); if (miss.length) die(`没有配置集 ${miss.join(' ')}（acceptkit configset show）`);
+    stamp(`node ${opt.node} 配置集`, { config: n.config || null });
+    n.config = [...new Set([...[].concat(n.config || []).filter(id => !drop.has(id)), ...add])]; if (!n.config.length) delete n.config;
+    const out = save(); if (JSON_MODE) return out; console.log(`✓ ${opt.node} 的配置集：${(n.config || []).join(' ') || '（无）'}`); return;
+  }
+  const viaOf = () => { if (!opt.via) return null; const via = String(opt.via);
+    if (!['ui', 'log', 'diag', 'debugger', 'cli'].includes(via)) die('--via 只能是 ui / log / diag / debugger / cli');
+    if (via !== 'ui' && String(opt['why-not-ui'] || '').trim().length < 6) die('--via 不是 ui 要写 --why-not-ui：界面上为什么看不到（先找过 app 自带的调试页）');
+    return via === 'ui' ? { via } : { via, why_not_ui: String(opt['why-not-ui']) }; };
+  // 改一条预期自己声明的触发来源：步骤换成真实触发后，预期上残留的「注入」声明要跟着改，否则 Q32/Q33 仍按注入算
+  // 因果：这条预期的结果从哪来。step = 链上哪一步的什么输入（input 要是那一步原文里的字）；state = 验启动 / 配置后的状态；artifact = 静态产物
+  if (opt.expect && opt['because-from']) {
+    const e = findExp(String(opt.expect)) || die(`没有断言 ${opt.expect}`), from = String(opt['because-from']), why = String(opt.why || '').trim();
+    if (!['step', 'state', 'artifact'].includes(from)) die('--because-from 只能是 step / state / artifact');
+    if (!why) die('写 --why：为什么这个输入（或这个状态）会产生这条预期要看的结果');
+    let b = { from, why };
+    if (from === 'step') {
+      const ref = String(opt['because-step'] || die('--because-from step 要给 --because-step <nX 或 nid>：链上哪一步'));
+      // 按 id 在要写回的那份树（raw）上找：c 是读进来校验用的另一份，对象不是同一个
+      const x = CR.walk({ tree: raw.tree }).find(y => (y.n.expect || []).some(z => z.id === e.id)), st = [...x.chain, x].find(y => y.ref === ref || y.pos === ref);
+      if (!st || CR.kindOf(st.n) !== 'action') die(`${ref} 不是 ${opt.expect} 链上的动作（链上：${[...x.chain, x].filter(y => CR.kindOf(y.n) === 'action').map(y => y.pos).join('、') || '没有动作'}）`);
+      const input = String(opt['because-input'] || die('--because-from step 要给 --because-input "<那一步输入了什么，原文里的字>"'));
+      { const src = [st.n.op || '', ...Object.entries(st.n.params || {}).flatMap(([k, v]) => { const s = typeof v === 'string' ? v : JSON.stringify(v); return [s, `${k}=${s}`]; }), ...(st.n.op_id ? fillHuman(expandHuman(ops, st.n.op_id, new Set(), CR.reviewPlatform(c)), st.n.params || {}) : [])];
+        const nz = s => String(s).replace(/[「」『』“”"'\s]/g, '').toLowerCase();
+        if (!src.some(x => nz(x).includes(nz(input)))) die(`--because-input「${input}」不是 ${ref} 那一步（文字 / 参数 / 操作步骤）里的字：写那一步真正输入了什么`); }
+      b = { from, step: st.n.nid || st.pos, input, why };
+    }
+    stamp(`expect ${opt.expect} because → ${from}`, { because: e.because ?? null }); e.because = b;
+    if (opt.role) { if (!['claim', 'control', 'precondition'].includes(String(opt.role))) die('--role 只能是 claim / control / precondition'); e.role = String(opt.role); }
+    const out = save(); if (JSON_MODE) return out; console.log(`✓ ${opt.expect} 的结果来自：${from === 'step' ? `${b.step}「${b.input}」` : from}`); return;
+  }
+  if (opt.expect && opt.role && !opt['observe-op'] && !opt.see) {
+    const e = findExp(String(opt.expect)) || die(`没有断言 ${opt.expect}`), role = String(opt.role);
+    if (!['claim', 'control', 'precondition'].includes(role)) die('--role 只能是 claim / control / precondition');
+    stamp(`expect ${opt.expect} role → ${role}`, { role: e.role ?? null }); e.role = role; if (opt['demand-ref']) e.demand_ref = String(opt['demand-ref']);
+    const out = save(); if (JSON_MODE) return out; console.log(`✓ ${opt.expect} 是${{ claim: '验需求本身', control: '对照', precondition: '前置检查' }[role]}`); return;
+  }
+  // 前置条件：一条一项 { text, op_id? , manual?: { why } }。要么有操作能建立，要么写明人工确认的理由（评审 C2）；改前的样子留底
+  if (opt['precondition-set'] != null || opt['precondition-rm'] != null) {
+    const pres = [].concat(raw.preconditions || []).map(p => typeof p === 'string' ? { text: p } : p);
+    const why = String(opt.why || '').trim(); if (!why) die('写 --why：为什么这样改 / 删这条前置');
+    if (opt['precondition-rm'] != null) { const i = Number(opt['precondition-rm']);
+      if (!Number.isInteger(i) || !pres[i]) die(`没有第 ${opt['precondition-rm']} 条前置（共 ${pres.length} 条，从 0 数）`);
+      stamp(`删前置 #${i}：${why}`, { precondition: pres[i] }); pres.splice(i, 1); }
+    else { const k = String(opt['precondition-set']), i = k === 'new' ? pres.length : Number(k);
+      if (k !== 'new' && (!Number.isInteger(i) || !pres[i])) die(`没有第 ${k} 条前置（共 ${pres.length} 条，从 0 数；加一条写 new）`);
+      const text = String(opt.text || pres[i]?.text || '').trim(); if (!text) die('写 --text：这条前置是什么');
+      const how = String(opt.how || ''), m = how.match(/^op:(.+)$/);
+      if (!(m || how === 'manual')) die('--how 只能是 op:<操作 id> 或 manual');
+      if (m && !ops[m[1]]) die(`操作 ${m[1]} 不存在`);
+      const next = { text, ...(m ? { op_id: m[1] } : { manual: { why } }) };
+      stamp(k === 'new' ? `加前置 #${i}` : `改前置 #${i}：${why}`, { precondition: pres[i] ?? null }); pres[i] = next; }
+    raw.preconditions = pres;
+    const out = save(); if (JSON_MODE) return out; console.log(`✓ 前置条件 ${pres.length} 条`); return;
+  }
+  // 撤掉沿链继承来的配置集（例：反臂「撤掉 mock 后冷启动」挂在「mock 成关」下面，要把那份 mock 去掉）
+  if (opt.node && (opt['config-unset'] || opt['no-config-unset'])) {
+    const n = findNode(String(opt.node)) || die(`用例 ${c.case} 里没有节点 ${opt.node}`);
+    const add = [].concat(opt['config-unset'] || []).map(String), rm = [].concat(opt['no-config-unset'] || []).map(String);
+    const sets = loadConfigSets(ROOT); for (const id of add) if (!sets[id]) die(`配置集 ${id} 没有登记`);
+    const why = String(opt.why || '').trim(); if (add.length && !why) die('写 --why：为什么这一步要撤掉它（例：这一臂验撤掉 mock 后的行为）');
+    stamp(`node ${opt.node} 撤掉继承的配置集 ${add.join(',')}${rm.length ? ` / 取消撤掉 ${rm.join(',')}` : ''}`, { config_unset: n.config_unset ?? null });
+    n.config_unset = [...new Set([...[].concat(n.config_unset || []).filter(x => !rm.includes(x)), ...add])]; if (!n.config_unset.length) delete n.config_unset;
+    const out = save(); if (JSON_MODE) return out; console.log(`✓ ${opt.node} 起不再生效：${[].concat(n.config_unset || []).join('、') || '（无）'}`); return;
+  }
+  // 一步自己声明触发来源：没挂操作、或者注入是观测操作代做的（界面上没有能照着点的一步）—— 声明写在步骤上，评审时看得到理由
+  if (opt.node && opt.input && !opt['op-id'] && !opt.op) {
+    const n = findNode(String(opt.node)) || die(`用例 ${c.case} 里没有节点 ${opt.node}`), from = String(opt.input);
+    if (!['real', 'mock-global', 'injected'].includes(from)) die('--input 只能是 real / mock-global / injected');
+    if (CR.kindOf(n) === 'group') die(`${opt.node} 是分组标题，不是一步：触发来源写在它下面的动作上`);
+    const why = String(opt.why || '').trim(); if (!why) die('写 --why：为什么是这种触发（注入的写为什么造不出真实输入）');
+    stamp(`node ${opt.node} 触发来源 → ${from}`, { input: n.input ?? null }); n.input = { from, why };
+    const out = save(); if (JSON_MODE) return out; console.log(`✓ ${opt.node} 触发来源：${from}`); return;
+  }
+  if (opt.expect && opt.input && !opt['observe-op'] && !opt.see) {
+    const e = findExp(String(opt.expect)) || die(`没有断言 ${opt.expect}`), from = String(opt.input);
+    if (!['real', 'mock-global', 'injected'].includes(from)) die('--input 只能是 real / mock-global / injected');
+    if (from !== 'real' && String(opt.why || '').trim().length < 6) die(`--input ${from} 要写 --why：为什么不能真实触发`);
+    stamp(`expect ${opt.expect} 触发来源 → ${from}`, { input: e.input ?? null });
+    const prev = e.input && typeof e.input === 'object' ? e.input : {};
+    e.input = from === 'real' ? { from } : { ...prev, from, why: String(opt.why) };
+    const out = save(); if (JSON_MODE) return out; console.log(`✓ ${opt.expect} 触发来源：${from}`); return;
+  }
+  if (opt.expect && opt.via && !opt['observe-op'] && !opt.see) {
+    const e = findExp(String(opt.expect)) || die(`没有断言 ${opt.expect}`), v = viaOf();
+    stamp(`expect ${opt.expect} 读取通道 → ${v.via}`, { via: e.via || null, why_not_ui: e.why_not_ui || null });
+    if (v.via === 'ui') { delete e.via; delete e.why_not_ui; } else Object.assign(e, v);
+    const out = save(); if (JSON_MODE) return out; console.log(`✓ ${opt.expect} 读取通道：${v.via}`); return;
+  }
+  if (opt['add-expect'] || (opt.expect && opt['observe-op'])) {
+    const op = String(opt['observe-op'] || die('要给 --observe-op <观测操作>')), o = ops[op] || die(`操作库里没有 ${op}`);
+    const params = Object.fromEntries([].concat(opt.param ?? []).map(String).map(x => { const i = x.indexOf('='); if (i < 1) die(`--param 写成 名=值（写了 ${x}）`); return [x.slice(0, i), x.slice(i + 1)]; }));
+    let checks; try { checks = opt.checks ? JSON.parse(String(opt.checks)) : null; } catch { die('--checks 要是 JSON 数组：[{"pick":"read.x","predicate":{"eq":"y"},"say":"人话"}]'); }
+    if (opt['add-expect']) {
+      const n = findNode(String(opt.node || die('--add-expect 要配 --node <加在哪一步下>'))) || die(`用例 ${c.case} 里没有节点 ${opt.node}`);
+      const id = String(opt['add-expect']); if (findExp(id)) die(`${id} 已经有了`);
+      const assert = String(opt.assert || '').trim(); if (!assert) die('--assert 写一句话：功能坏了这条会不会失败');
+      if (!checks?.length) die('--checks 至少一条判据（机判才算数）');
+      const e = { id, assert, ...(viaOf() || {}), ...(opt.detail ? { detail: String(opt.detail) } : {}), ...([].concat(opt.see || []).length ? { see: [].concat(opt.see).map(String) } : {}),
+        observe: { op, ...(Object.keys(params).length ? { params } : {}), checks }, ...(o.input ? { input: { from: o.input, why: `观测操作 ${op} 登记的输入` } } : {}) };
+      (n.expect ||= []).push(e); stamp(`node ${opt.node} 加断言 ${id}`, null);
+      if (opt['twin-of']) { const t = findExp(String(opt['twin-of'])) || die(`没有断言 ${opt['twin-of']}`);
+        stamp(`expect ${opt['twin-of']} 的真实对照 → ${id}`, { input: t.input || null }); t.input = { ...(typeof t.input === 'string' ? { from: t.input } : t.input || {}), real_twin: id }; }
+    } else {
+      const e = findExp(String(opt.expect)) || die(`没有断言 ${opt.expect}`);
+      stamp(`expect ${opt.expect} 换观测 → ${op}`, { observe: e.observe });
+      // 前提（guards：读空时记「阻塞」而不是「失败」）在同一个观测操作上沿用；换了观测操作就不再适用，提示重写
+      const prevObs = e.observe || {}, keepGuards = prevObs.op === op ? { ...(prevObs.guards ? { guards: prevObs.guards } : {}), ...(prevObs.guard ? { guard: prevObs.guard } : {}), ...(prevObs.fallback ? { fallback: prevObs.fallback } : {}) } : {};
+      if (prevObs.op && prevObs.op !== op && (prevObs.guards || prevObs.guard)) console.error(`⚠️ ${e.id} 换了观测操作（${prevObs.op} → ${op}），原来的前提 guards 不再适用、已去掉：读空时会判失败，需要的话给新观测补前提`);
+      e.observe = { op, ...(Object.keys(params).length ? { params } : {}), checks: checks || e.observe?.checks || [], ...keepGuards };
+      { const v = viaOf(); if (v) { if (v.via === 'ui') { delete e.via; delete e.why_not_ui; } else Object.assign(e, v); } }
+      if (o.input) e.input = { ...(typeof e.input === 'string' ? {} : e.input || {}), from: o.input, why: `观测操作 ${op} 登记的输入` };
+    }
+    const out = save(); if (JSON_MODE) return out; console.log(`✓ 已写回（${out.status === 'clear' ? '用例清晰' : out.note}）；改了判法的旧结论 plan recheck 时作废重测`); return;
+  }
+  if (opt.node && opt['to-op']) {
+    const n = findNode(String(opt.node)) || die(`用例 ${c.case} 里没有节点 ${opt.node}`);
+    const cmd = commandOf(n.op) || die(`${opt.node} 的文字里没有命令可提（反引号里的命令或 adb / am start …）`);
+    const human = [].concat(opt.human || []).map(String).filter(Boolean);
+    if (!human.length || !human.every(h => CONCRETE_STEP.test(h))) die('--human 写人话：打开「…」页 / 点击「…」…（每一步都说得出具体对象）；命令会作为这个操作的机器步骤，看板上悬停看');
+    const id = String(opt['to-op']), plat = String(c.platform || 'android').split(/[,/]/)[0], cur = ops[id];
+    if (cur && JSON.stringify(cur).indexOf(cmd) < 0) die(`操作库里已经有 ${id}，做法和这条命令不一样：换个名字，或直接 --op-id ${id}`);
+    if (!cur) O.writeOp(ROOT, id, { title: human[0], why: `从用例 ${c.case} ${opt.node} 提出来的操作`, human, platform: plat, recipe: { steps: [{ do: human.join('，'), cmd }], state: 'confirmed', source: `clarify ${c.case} ${opt.node}` } });
+    stamp(`node ${opt.node} → 操作 ${id}`, { op: n.op, op_id: n.op_id }); n.op = human.join('，'); n.op_id = id;
+    const out = save();
+    // 同一条命令在别的用例里也写着：列出来，一条命令挂到同一个操作上
+    const same = readdirSync(join(ROOT, 'cases')).filter(f => f.endsWith('.case.json') && f !== `${c.case}.case.json`).filter(f => { try { return readFileSync(join(ROOT, 'cases', f), 'utf8').includes(cmd.slice(0, 60)); } catch { return false; } }).map(f => f.replace(/\.case\.json$/, ''));
+    if (JSON_MODE) return { ...out, op: id, same_command_in: same };
+    console.log(`✓ ${opt.node} 挂上操作 ${id}「${human[0]}」（命令作为机器步骤，看板悬停看）${same.length ? `\n  同一条命令还写在：${same.slice(0, 10).join(' ')} —— 用 clarify <用例> --node <nX> --op-id ${id} 挂上` : ''}`); return;
+  }
+  if (opt.node) {
+    const n = findNode(String(opt.node)) || die(`用例 ${c.case} 里没有节点 ${opt.node}（编号见 acceptkit clarify ${c.case} --json）`);
+    const next = { ...n, ...(opt.op ? { op: String(opt.op) } : {}), ...(opt['op-id'] ? { op_id: String(opt['op-id']) } : {}) };
+    if (opt.param) next.params = Object.fromEntries([].concat(opt.param).map(String).map(x => { const i = x.indexOf('='); if (i < 1) die(`--param 写成 名=值（写了 ${x}）`); return [x.slice(0, i), x.slice(i + 1)]; }));
+    const k = caseClarity({ case: c.case, platform: c.platform, tree: [{ ...next, expect: [], children: [] }] }, ops);   // 带平台：只登记了某一端人看步骤的操作才认得出
+    if (k.steps.length) die(`这样写还是不清晰：${k.steps[0].msg}\n   写成「动作 + 对象」：进入「…」页、点击「…」、在「…」输入 …，命令写在反引号里；常用的挂 --op-id（操作要有人看的步骤：ops set <op> --human …）`);
+    stamp(`node ${opt.node}`, { op: n.op, op_id: n.op_id, params: n.params }); Object.assign(n, next);
+    const out = save(); if (JSON_MODE) return out; console.log(`✓ ${opt.node} 已改清晰（${out.status === 'clear' ? '用例清晰了' : out.note}）`); return;
+  }
+  if (opt.expect) {
+    const e = findExp(String(opt.expect)) || die(`用例 ${c.case} 里没有预期 ${opt.expect}`);
+    const see = [].concat(opt.see || []).map(String).map(s => s.trim()).filter(Boolean);
+    if (!see.length) die('--see 至少一步：进哪一页、看哪一行、怎样算对');
+    // 怎么看要落到页面上的东西：至少一步说得出具体对象（引号里的页 / 行 / 按钮，或命令）
+    if (!see.some(s => /[「『“"'‘][^」』”"'’]{1,40}[」』”"'’]|`[^`]{2,}`/.test(s))) die('--see 要说得出具体看哪里：页名、那一行的名字、按钮写在「」里，例：进入「启动链路」页 → 看「did assembly succeed」这一行是不是 yes');
+    // --say：判据的人话，按判据顺序一句对一条（「did assembly succeed」这一行是 yes），看板上替换机器判据
+    const say = [].concat(opt.say || []).map(String).filter(Boolean);
+    const b = e.observe?.by ? Object.values(e.observe.by)[0] : e.observe;
+    if (say.length && say.length > (b?.checks || []).length) die(`--say 给了 ${say.length} 句，这条预期只有 ${(b?.checks || []).length} 条判据：一句对一条`);
+    stamp(`expect ${opt.expect}`, { see: e.see || null, say: (b?.checks || []).map(ch => ch.say || null) }); e.see = see;
+    say.forEach((x, i) => { b.checks[i].say = x; });
+    const out = save(); if (JSON_MODE) return out; console.log(`✓ ${opt.expect} 写清了怎么看（${out.status === 'clear' ? '用例清晰了' : out.note}）`); return;
+  }
+  // 只看：哪里不清晰 + 那次执行的事实（候选）
+  const k = caseClarity(c, ops), f = clarifyFacts(c, runId);
+  // 界面上的字要真的在：叫人点、叫人找的名字在被测代码里逐字找不到，就是写错了或者是编的（例：页面上根本没有「执行路径」这几个字）
+  { const plat = String(c.platform || '').split(/[,/]/)[0] || null, Ds = demandsOfCase(c.case);
+    const repos = Ds.flatMap(D => loadRounds(ROOT, D)?.repos || []).filter((r, i, a) => r.path && existsSync(r.path) && a.findIndex(x => x.path === r.path) === i);
+    const lines = []; (function w(ns, p) { (ns || []).forEach((n, i) => { const id = `${p}${i + 1}`;
+      // 操作的人看步骤按模板核对（不填参数）：{param.x} 填进来的是数据（策略名、单元名），不是界面上的字
+      if (n.op_id) lines.push({ at: id, ls: expandHuman(ops, n.op_id, new Set(), plat) }); else lines.push({ at: id, ls: [n.op] });
+      (n.expect || []).forEach(e => { const b = e.observe?.by ? Object.values(e.observe.by)[0] : e.observe;
+        lines.push({ at: e.id, ls: expandRefs(ops, [].concat(e.see || []).length ? [].concat(e.see) : expandHuman(ops, b?.op, new Set(), plat), new Set(), plat) }); });
+      w(n.children, `${id}.`); }); })(c.tree, 'n');
+    // 跑完的核对：这一步截图那一刻画面上的字（screen_texts）里，找不到步骤叫人点 / 找的名字 —— 代码里有、画面上没有（要先滑动、其实在别的页）
+    if (f) for (const x of lines.filter(y => y.at.startsWith('n'))) {
+      const shots = (f.steps[x.at]?.evidence || []).map(e => { try { return JSON.parse(readFileSync(join(runDir(f.run), e + '.json'), 'utf8')); } catch { return null; } }).filter(m => m?.screen_texts);
+      if (!shots.length) continue;
+      const seen = shots.flatMap(m => m.screen_texts).join('\n'), miss = TC.uiNames(x.ls).filter(nm => !seen.includes(nm));
+      if (miss.length) { k.steps.push({ at: x.at, level: 'vague', msg: `跑的时候这一步的截图上没出现「${miss.join('」「')}」（${f.run}）：照当时画面上的字改，要先滑动 / 切页的把那一步写上` }); k.status = 'unclear'; }
+    }
+    const missAll = TC.missingNamesBatch(repos, lines.map(x => TC.uiNames(x.ls)), join(ROOT, 'state', 'cache', 'ui-names.json'));
+    for (const [i, x] of lines.entries()) { const miss = missAll[i]; if (miss?.length) { (x.at.startsWith('n') ? k.steps : k.expects).push({ at: x.at, level: 'vague', msg: `说叫人点 / 找的「${miss.join('」「')}」在被测代码里逐字找不到：照页面上实际的字写（clarify 写回）` }); k.status = 'unclear'; } } }
+  const items = [...k.steps.map(x => ({ ...x, type: 'step', facts: f ? { did: f.byNode(x.at), shots: (f.steps[x.at]?.evidence || []) } : null,
+      fix: `acceptkit clarify ${c.case} --node ${x.at} --op "<进入「…」页，点击「…」>"` })),
+    ...k.expects.map(x => { const v = f?.results[x.at] || {}; return { ...x, type: 'expect', facts: f ? { status: v.status || 'todo', read: v.actual || '', evidence: v.evidence || [], spec: (() => { let e = null; (function w(ns) { (ns || []).forEach(n => { (n.expect || []).forEach(y => { if (y.id === x.at) e = y; }); w(n.children); }); })(c.tree); return e?.observe ? { op: e.observe.op, params: e.observe.params } : null; })() } : null,
+      fix: `acceptkit clarify ${c.case} --expect ${x.at} --see "进入「…」页" --see "看「…」这一行是不是 …"` }; })];
+  const card = { kind: 'clarify', case: c.case, status: k.status, run: f?.run || null, items, ...(f ? { did_in_run: f.all.slice(-30) } : {}),
+    note: k.status === 'unclear' ? '照 facts（那次执行实际做了什么、截了什么、读到了什么）写成人话，用每项的 fix 命令写回；做不了的整条判不可执行：acceptkit clarify ' + c.case + ' --unexecutable --why "…"' : '已经清晰' };
+  if (JSON_MODE) return card;
+  console.log(`用例 ${c.case}：${CLARITY_LABEL[k.status]}${f ? `（事实取自 ${f.run}）` : '（还没跑过，没有执行事实）'}`);
+  for (const it of items) { console.log(`■ ${it.at}：${it.msg}`); if (it.facts?.did?.length) console.log(`  这一步跑过：${it.facts.did.join(' ； ')}`);
+    if (it.facts?.shots?.length) console.log(`  截图：${it.facts.shots.join(' ')}`); if (it.facts?.spec) console.log(`  观测：${it.facts.spec.op} ${JSON.stringify(it.facts.spec.params || {}).slice(0, 160)}`);
+    if (it.facts?.read) console.log(`  读到：${String(it.facts.read).slice(0, 160)}`); console.log(`  写回：${it.fix}`); }
+}
+
+// ════════════ configset：配置集（一组用例跑之前被测端处在什么配置下）════════════
+const CFGSET_USAGE = '用法：acceptkit configset set <id> [--title "…"] --item 名=值 [--item …] --kind mock|env [--why "…"] [--replace]\n       acceptkit configset show [<id>] | diff <id> <id>';
+function cmdConfigSet({ pos, opt }) {
+  const sub = pos[0] || 'show', sets = loadConfigSets(ROOT);
+  if (sub === 'set') {
+    const id = pos[1] || die(CFGSET_USAGE);
+    const kind = opt.kind ? String(opt.kind) : null;
+    const items = [].concat(opt.item || []).map(String).map(x => { const i = x.indexOf('='); if (i < 1) die(`--item 要写成 名=值（写了 ${x}）`);
+      return { key: x.slice(0, i).trim(), value: x.slice(i + 1).trim(), ...(kind ? { kind } : {}), ...(opt.why ? { why: String(opt.why) } : {}), ...(opt.apply ? { apply: String(opt.apply) } : {}) }; });
+    let s; try { s = writeConfigSet(ROOT, id, { title: opt.title && String(opt.title), items, replace: !!opt.replace }); } catch (e) { die(e.message); }
+    if (JSON_MODE) return { id, ...s };
+    console.log(`✓ 配置集 ${id}「${s.title}」${s.items.length} 项；用例或节点写 config: ["${id}"] 引用`); return;
+  }
+  if (sub === 'diff') {
+    const [a, b] = [pos[1], pos[2]].map(x => sets[x] ? { id: x, ...sets[x] } : die(`没有配置集 ${x}`));
+    const d = configDiff(a, b);
+    if (JSON_MODE) return { a: a.id, b: b.id, diff: d };
+    console.log(d.length ? [`${a.id} 和 ${b.id} 不同的 ${d.length} 项：`, ...d.map(x => `  ${x.key}：${x.a ?? '（没有）'} | ${x.b ?? '（没有）'}`)].join('\n') : `${a.id} 和 ${b.id} 一样`); return;
+  }
+  if (sub !== 'show') die(CFGSET_USAGE);
+  const ids = pos[1] ? [pos[1]] : Object.keys(sets);
+  if (JSON_MODE) return Object.fromEntries(ids.map(id => [id, sets[id] || null]));
+  if (!ids.length) { console.log(`还没有配置集。${CFGSET_USAGE}`); return; }
+  for (const id of ids) { const s = sets[id] || die(`没有配置集 ${id}`);
+    console.log(`■ ${id}「${s.title}」`); s.items.forEach(x => console.log(`  ${x.key} = ${x.value}  [${ITEM_KINDS[x.kind] || x.kind}]${x.why ? ` —— ${x.why}` : ''}${x.apply ? `（用 @${x.apply} 施加）` : ''}`)); }
 }
 
 // ════════════ read：卡片 read 指针指向的长内容，分页取 ════════════
@@ -4947,7 +5589,185 @@ function fmtAssessment(a, title) {
   if (a.settled?.length) L.push(`   ↳ 这次评价里消失的旧问题：${a.settled.map(x => `S${x.id}→${x.status}`).join(' ')}`);
   return L.join('\n');
 }
+// ---- 用例评审：评审包 / 提交 / 状态 ----
+function reviewCtx(c, demand = null) {
+  const ops = loadOps(), platform = CR.reviewPlatform(c);
+  const sets = loadConfigSets(ROOT);
+  const Ds = demand ? [demand] : demandsOfCase(c.case);
+  const repos = Ds.flatMap(D => loadRounds(ROOT, D)?.repos || []).filter((r, i, a) => r.path && existsSync(r.path) && a.findIndex(x => x.path === r.path) === i);
+  const names = CR.walk(c).flatMap(x => TC.uiNames([x.n.op || '', ...(x.n.op_id ? expandHuman(ops, x.n.op_id, new Set(), platform) : [])]));
+  const st = TC.uiNameStates(repos, names, join(ROOT, 'state', 'cache', 'ui-names.json'));
+  const inputs = new Map(caseInputs(c, ops, sets).map(x => [x.id, x.from]));
+  const surfaces = surfacesOfCase(ROOT, c.case);
+  return { ops, platform, sets, nameState: n => st.get(n) || 'unknown', dupOf: dupIndex(c.case), inputs, surfaces };
+}
+let _dup = null;
+function dupIndex(self) {
+  if (!_dup) { _dup = new Map(); for (const f of readdirSync(CASES).filter(f => f.endsWith('.case.json'))) { let c; try { c = JSON.parse(readFileSync(join(CASES, f), 'utf8')); } catch { continue; }
+    for (const x of CR.walk(c)) { const k = String(x.n.op || '').replace(/\s+/g, ''); if (k.length < 12 || x.n.op_id) continue; (_dup.get(k) || _dup.set(k, new Set()).get(k)).add(c.case); } } }
+  return t => [...(_dup.get(String(t).replace(/\s+/g, '')) || [])].filter(n => n !== self);
+}
+function reviewStatusOf(name, { demand = null, mode = 'run' } = {}) {
+  const c = loadCase(name), card = CR.caseCard(c, reviewCtx(c, demand));
+  const runs = priorRunsForCase(name, null), lastRunAt = runs.map(r => r.started_at || r.created_at || '').sort().pop() || null;
+  // probe 类用例只要求 A1、E2：批准（mode plan）和开跑同一口径，不然批准时卡住、开跑时却放行
+  return { case: name, ...CR.reviewState(card, latestReviewItems(ROOT, name), { lastRunAt, mode: c.kind === 'probe' ? 'probe' : mode }) };
+}
+function assessCasesOf(opt) {
+  if (opt.case) return String(opt.case).split(',').map(s => s.trim()).filter(Boolean);
+  const plan = loadPlan(ROOT, String(opt.plan || die('给 --plan <需求> 或 --case a,b'))) || die(`需求 ${opt.plan} 没有评审单`);
+  return [...planCases(plan)].filter(n => tryLoadCase(n));
+}
+// E1 不能高于 because 指向那一步的 A1：把那一步现在的盲审分作为事实放进卡片，盲审不用等被拒才知道。
+// 打包和收分都要调：收分按现算的卡片核对 evidence 范围，少了这批事实，引用它们的 E1 会被错拒
+function addBecauseFacts(cards) {
+  for (const cd of cards) { const recs = latestReviewItems(ROOT, cd.case).filter(r => r.by === 'blind'), c = loadCase(cd.case);
+    let fno = cd.facts.reduce((m, f) => Math.max(m, Number(String(f.id).slice(1)) || 0), 0);
+    for (const x of CR.walk(c)) for (const e of x.n.expect || []) { const st = e.because?.from === 'step' ? e.because.step : null; if (!st) continue;
+      const y = CR.walk(c).find(z => z.ref === st || z.pos === st); if (!y) continue;
+      const a1 = recs.find(r => r.ikey === `case:${cd.case}|A1|${y.ref}`);
+      cd.facts.push({ id: `f${++fno}`, at: e.id, type: 'because_step_a1', text: a1 ? `because 指向的 ${y.pos}（${y.ref}）现在「能照着做」盲审 ${a1.score} 分：低于 2 时这一项也不能 ≥ 2` : `because 指向的 ${y.pos}（${y.ref}）还没有盲审分：和这一项同一批交那一步的 A1` }); } }
+}
+function assessPack(opt) {
+  const demand = opt.plan ? String(opt.plan) : null, names = assessCasesOf(opt);
+  let cards = names.map(n => { const c = loadCase(n); return CR.caseCard(c, reviewCtx(c, demand)); });
+  addBecauseFacts(cards);
+  if (opt.changed) cards = cards.map(cd => { const recs = latestReviewItems(ROOT, cd.case).filter(r => r.by === 'blind');
+    return { ...cd, items: cd.items.filter(it => !recs.some(r => r.ikey === it.key && r.item_fp === it.fp)) }; }).filter(cd => cd.items.length);
+  const limit = opt.limit ? Number(opt.limit) : 0; if (limit) cards = cards.slice(0, limit);
+  if (!cards.length) { const out = { kind: 'review_pack', note: '没有要评的项（都评过且没过期）' }; if (JSON_MODE) return out; console.log(out.note); return; }
+  const id = 'rc-' + createHash('sha256').update(new Date().toISOString() + names.join(',')).digest('hex').slice(0, 10);
+  // 考题：owner 判过不合格的原题。项目登记的优先，内置的补满 2 道；混在第一条用例里，长得和真的动作项一样
+  // （有位置编号、16 位指纹、f 开头的事实编号、触发来源事实、A1–A5 五项），盲审认不出哪道是考题；A1 评高了整批拒收
+  const proj = listCanaries(ROOT).map(x => ({ dim: x.dim, text: x.item, max: x.max_score, source: x.source })).filter(x => x.dim === 'A1');
+  const pick = [...proj, ...CR.BUILTIN_CANARIES].slice(0, 2), first = cards[0];
+  const top = (loadCase(first.case).tree || []).length;
+  let fno = first.facts.reduce((m, f) => Math.max(m, Number(String(f.id).slice(1)) || 0), 0);
+  const canaries = pick.map((x, i) => { const h = createHash('sha256').update(id + i).digest('hex'), at = 's' + h.slice(0, 4), pos = `n${top + 1 + i}`;
+    const facts = [{ id: `f${++fno}`, at, type: 'step_text', text: x.text }, { id: `f${++fno}`, at, type: 'step_input', text: '触发来源（工具算的）：unknown', hard: { dim: 'A3', max: 1 } }];
+    const items = ['A1', 'A2', 'A3', 'A4', 'A5'].map(d => ({ key: `case:${first.case}|${d}|${at}`, dim: d, at, pos, on: 'action', cap: d === 'A3' ? 1 : 3, cap_facts: d === 'A3' ? [facts[1].id] : [], signals: [], fp: createHash('sha256').update(h + d).digest('hex').slice(0, 16) }));
+    return { items, facts, max: x.max }; });
+  // 打乱位置：考题插在第一条用例的动作项中间，不总在末尾
+  for (const cn of canaries) { first.facts.push(...cn.facts); const k = Math.floor(parseInt(createHash('sha256').update(cn.items[0].fp).digest('hex').slice(0, 6), 16) % (first.items.length + 1)); first.items.splice(k, 0, ...cn.items); }
+  const canaryKeys = canaries.flatMap(cn => cn.items.map(it => ({ key: it.key, max: it.dim === 'A1' ? cn.max : 3 })));
+  const canarySet = new Set(canaryKeys.map(x => x.key));
+  saveReviewCard(ROOT, { id, demand, cases: cards.map(c => c.case), items: Object.fromEntries(cards.flatMap(cd => cd.items.filter(it => !canarySet.has(it.key)).map(it => [it.key, it.fp]))), canaries: canaryKeys });
+  const pack = { kind: 'review_pack', card: id, rubric: CR.rubricForCard(), how: [
+    '你是盲审：只看这份包，不看别的上下文。逐项（items）打 0–3 分，写成 jsonl，一行一项：',
+    '{ "card": "<包号>", "key": "<项 key>", "fp": "<项 fp>", "score": 0-3, "extract": <按 rubric[dim].restate 复述，值要是原文里的字>, "rulings": [{ "signal": "g…", "ruling": "accept|dismiss", "why": "…", "evidence": ["f…"] }], "reason": "…", "evidence": ["f…"], "fix": "<不到 3 分：一条 acceptkit clarify / ops set / configset set 命令>" }',
+    '分数不能高过 cap（上限由 cap_facts 里的事实定）；每个 signals 里的信号都要回答；evidence 只能引用本项范围内的事实。',
+    `提交：acceptkit assess --apply <文件.jsonl> --by blind --json`], cases: cards };
+  if (JSON_MODE) return pack;
+  console.log(JSON.stringify(pack, null, 1));
+}
+function assessApply(opt) {
+  const src = String(opt.apply), by = String(opt.by || 'self') === 'blind' ? 'blind' : 'self';
+  const text = src === '-' || src === 'true' ? readFileSync(0, 'utf8') : readFileSync(src, 'utf8');
+  const lines = text.split('\n').map(s => s.trim()).filter(Boolean).map((s, i) => { try { return { n: i + 1, ...JSON.parse(s) }; } catch { return { n: i + 1, bad: true }; } });
+  const results = [], ok = new Map(), cards = new Map(), live = new Map();
+  const cardOf = id => typeof id !== 'string' ? null : cards.has(id) ? cards.get(id) : cards.set(id, getReviewCard(ROOT, id)).get(id);
+  const caseOfKey = k => (String(k).match(/^case:([^|]+)\|/) || [])[1];
+  const liveOf = (name, demand) => { if (!live.has(name)) { const c = loadCase(name), ctx = reviewCtx(c, demand); const card = CR.caseCard(c, ctx); addBecauseFacts([card]); live.set(name, { c, ctx, card }); } return live.get(name); };
+  // 考题先判：评高了整批拒收
+  const failedCards = new Map();
+  for (const l of lines) { const cd = !l.bad && cardOf(l.card); const can = cd?.canaries?.find(x => x.key === l.key);
+    if (can && !(Number.isInteger(l.score) && l.score <= can.max)) failedCards.set(l.card, `考题被打了 ${l.score} 分（这一步照着做不了，应 ≤ ${can.max}）`); }
+  for (const l of lines) {
+    const refuse = msg => results.push({ line: l.n, key: l.key || null, refused: msg });
+    if (l.bad) { refuse('这一行不是 JSON'); continue; }
+    const cd = cardOf(l.card); if (!cd) { refuse(`没有评审包 ${l.card}`); continue; }
+    // 收分按「最新一次提交」生效：晚出的包已经给这一项打过分，早出的包再交上来会把新分盖回旧分 —— 拒收
+    { const name = caseOfKey(l.key), prev = name && l.by !== 'self' ? latestReviewItems(ROOT, name).find(r => r.ikey === l.key && r.by === 'blind') : null, pc = prev?.card_id && prev.card_id !== l.card ? cardOf(prev.card_id) : null;
+      if (by === 'blind' && pc && pc.at > cd.at) { refuse(`这一项已有更晚的包 ${prev.card_id} 的盲审分，旧包 ${l.card} 的结果不收（会把新分盖回旧分）`); continue; } }
+    if (failedCards.has(l.card)) { refuse(`整批拒收：${failedCards.get(l.card)}。重新打包，逐项照标准评`); continue; }
+    if (cd.canaries?.some(x => x.key === l.key)) { results.push({ line: l.n, key: l.key, ok: true }); continue; }
+    if (cd.items[l.key] == null) { refuse('评审包里没有这一项'); continue; }
+    if (cd.items[l.key] !== l.fp) { refuse('fp 和这张包里的不一样：照包里给的 fp 原样带回；包过期了就先重新打包（assess --pack）'); continue; }
+    const name = caseOfKey(l.key), L = liveOf(name, cd.demand);
+    const why = CR.checkLine(l, L.card, L.c, L.ctx);
+    if (why) { refuse(why); continue; }
+    const it = L.card.items.find(x => x.key === l.key);
+    (ok.get(name) || ok.set(name, []).get(name)).push({ ...it, score: l.score, reason: l.reason, evidence: l.evidence, fix: l.fix, extract: l.extract, rulings: l.rulings, line: l.n });
+  }
+  // 跨项一致：说「结果由某一步产生」（E1 ≥ 2）时，那一步自己得能照着做（A1 ≥ 2）
+  for (const [name, rows] of ok) { const recs = latestReviewItems(ROOT, name);
+    for (const r of rows.filter(x => x.dim === 'E1' && x.score >= 2)) { const st = r.extract?.because?.from === 'step' ? r.extract.because.step : null; if (!st) continue;
+      const ref = CR.walk(liveOf(name).c).find(y => y.ref === st || y.pos === st)?.ref;
+      const a1 = rows.find(x => x.dim === 'A1' && x.at === ref)?.score ?? recs.find(x => x.ikey === `case:${name}|A1|${ref}` && x.by === 'blind')?.score;
+      if (a1 == null || a1 < 2) { rows.splice(rows.indexOf(r), 1); results.push({ line: r.line, key: r.key, refused: a1 == null ? `结果由 ${st} 产生，那一步的「能照着做」还没评：同一批里一起交那一步的 A1` : `结果由 ${st} 产生，可那一步「能照着做」只有 ${a1} 分：E1 不能 ≥ 2` }); } } }
+  for (const [name, rows] of ok) if (rows.length) { saveReviewItems(ROOT, { caseName: name, by, demand: null, card: rows[0] && lines.find(l => l.n === rows[0].line)?.card, rows });
+    for (const r of rows) results.push({ line: r.line, key: r.key, ok: true }); }
+  results.sort((a, b) => a.line - b.line);
+  const out = { kind: 'review_apply', by, accepted: results.filter(r => r.ok).length, refused: results.filter(r => r.refused).length, results,
+    note: by === 'blind' ? '' : '自评只算草稿，门槛只认 --by blind（新上下文的子 agent 照评审包评）' };
+  if (JSON_MODE) return out;
+  console.log(`收下 ${out.accepted} 项，拒收 ${out.refused} 项${out.note ? '；' + out.note : ''}`); for (const r of results.filter(x => x.refused)) console.log(`  ✗ 第 ${r.line} 行 ${r.key || ''}：${r.refused}`);
+}
+// 逐节点走查：每条用例按树的顺序把每一步、每条预期连同评审分数和低分理由摆在一起，给人（或主 agent）一个节点一个节点地看。
+// 批量可以，但每个节点都要出现在输出里 —— 末尾给出「看到的节点数 / 用例里的节点数」，对不上就是漏了
+function assessWalk(opt) {
+  const names = assessCasesOf(opt), out = [];
+  for (const name of names) {
+    const c = loadCase(name), ctx = reviewCtx(c, opt.plan ? String(opt.plan) : null), card = CR.caseCard(c, ctx);
+    const st = CR.reviewState(card, latestReviewItems(ROOT, name), { liveCaps: false });
+    const byAt = new Map(); for (const i of st.items) (byAt.get(i.at) || byAt.set(i.at, []).get(i.at)).push(i);
+    const sc = at => (byAt.get(at) || []).map(i => `${i.dim}=${i.score ?? '·'}${['low', 'ran'].includes(i.state) ? '✗' : i.state === 'stale' ? '(旧)' : i.state === 'missing' ? '(未评)' : ''}`).join(' ');
+    const lows = at => (byAt.get(at) || []).filter(i => ['low', 'ran'].includes(i.state)).map(i => `      ✗ ${i.dim} ${i.score}：${String(i.reason || '').slice(0, 160)}`);
+    const lines = [`■ ${name}（${c.title || ''}）—— ${CR.STATUS_LABEL[st.status]}`, `  前置：${[].concat(c.preconditions || []).map((p, i) => `#${i} ${typeof p === 'string' ? p : p.text}${p?.op_id ? ` @${p.op_id}` : p?.manual ? ' [人工]' : ''}`).join('；') || '（无）'}  ${sc('case')}`, ...lows('case')];
+    let seen = 0; const nodes = CR.walk(c);
+    for (const x of nodes) { seen++; const n = x.n, ind = '  '.repeat(x.pos.split('.').length);
+      const human = n.op_id ? fillHuman(expandHuman(loadOps(), n.op_id, new Set(), ctx.platform), n.params || {}) : [];
+      lines.push(`${ind}${x.pos} [${x.ref}] ${CR.kindOf(n) === 'group' ? '〔分组〕' : ''}${n.op || ''}${n.op_id ? `  @${n.op_id}` : ''}${n.config ? `  配置:${[].concat(n.config).join(',')}` : ''}${n.config_unset ? `  撤:${[].concat(n.config_unset).join(',')}` : ''}${n.input ? `  来源:${n.input.from || n.input}` : ''}  ${sc(x.ref)}`);
+      if (human.length) lines.push(`${ind}   ↳ ${human.join(' → ').slice(0, 400)}`);
+      lines.push(...lows(x.ref).map(l => ind + l));
+      for (const e of n.expect || []) { const b = e.observe?.by ? Object.values(e.observe.by)[0] : e.observe;
+        lines.push(`${ind}  ◆ ${e.id}${e.role && e.role !== 'claim' ? ` (${e.role})` : ''} ${e.assert || ''}  ${sc(e.id)}`,
+          `${ind}     因：${e.because ? (e.because.from === 'step' ? `${e.because.step}「${e.because.input}」— ${e.because.why}` : `${e.because.from} — ${e.because.why}`) : '（没写）'}`,
+          `${ind}     看：${[].concat(e.see || []).join(' → ').slice(0, 400) || '（没写 see）'}`,
+          `${ind}     判：${b?.op || '—'} ${(b?.checks || []).map(ch => `${ch.pick} ${JSON.stringify(ch.predicate)}`).join('；').slice(0, 300)}`,
+          ...lows(e.id).map(l => ind + l)); } }
+    const ws = walkStateOf(name);
+    lines.push(`  —— 节点 ${seen}/${nodes.length}，预期 ${nodes.reduce((s, y) => s + (y.n.expect || []).length, 0)} 条；走查签收：${ws.state === 'ok' ? `${ws.by} ${ws.at.slice(0, 16)}` : ws.state === 'stale' ? `已作废（${ws.by} 签收后用例又改过）` : '没有'}`);
+    out.push({ case: name, status: st.status, nodes: nodes.length, text: lines.join('\n') });
+  }
+  if (JSON_MODE) return { kind: 'review_walk', cases: out };
+  console.log(out.map(x => x.text).join('\n\n'));
+}
+// 走查签收：走查的人把这条用例里每个节点、每条预期的 id 都列出来（--seen），工具核对一个不缺，记下签收时的用例指纹。
+// 用例之后再改，签收就作废（指纹对不上），要重新走查。盲审逐项打分管「每一项够不够格」，走查管「整条连起来看有没有人看过、说得通」
+export function walkIds(c) { const ids = []; for (const x of CR.walk(c)) { if (x.n.nid) ids.push(x.n.nid); for (const e of x.n.expect || []) ids.push(e.id); } return ids; }
+function assessWalkDone(opt) {
+  const name = String(opt['walk-done']), c = loadCase(name), by = String(opt.by || '').trim(), notes = String(opt.notes || '').trim();
+  if (!by) die('--by 写走查的人'); if (notes.length < 10) die('--notes 写这次走查看出了什么、改了什么（没问题也写一句为什么说得通）');
+  const want = walkIds(c), seen = new Set(String(opt.seen || '').split(',').map(s => s.trim()).filter(Boolean));
+  const miss = want.filter(id => !seen.has(id)); if (miss.length) die(`走查没覆盖全：还差 ${miss.length} 个节点 / 预期：${miss.join(', ')}（assess --walk --case ${name} 逐个看）`);
+  const fp = caseFingerprints(CASES, null, [name])[name], rec = { fp, by, at: new Date().toISOString(), nodes: want.length, notes };
+  setMeta(ROOT, `walk:${name}`, JSON.stringify(rec));
+  if (JSON_MODE) return { kind: 'walk_signed', case: name, ...rec };
+  console.log(`✓ ${name} 走查签收（${want.length} 个节点 / 预期，指纹 ${fp}）`);
+}
+export function walkStateOf(name) {
+  let rec = null; try { rec = JSON.parse(getMeta(ROOT, `walk:${name}`) || 'null'); } catch {}
+  if (!rec) return { state: 'missing' };
+  return rec.fp === caseFingerprints(CASES, null, [name])[name] ? { state: 'ok', ...rec } : { state: 'stale', ...rec };
+}
+function assessStatus(opt) {
+  const demand = opt.plan ? String(opt.plan) : null;
+  const rows = assessCasesOf(opt).map(n => reviewStatusOf(n, { demand }));
+  if (JSON_MODE) return { kind: 'review_status', demand, cases: rows.map(r => ({ case: r.case, status: r.status, counts: r.counts, low: r.items.filter(i => !['ok', 'warn'].includes(i.state)).map(({ key, dim, at, pos, state, score, reason, fix }) => ({ key, dim, at: pos || at, state, score, reason, fix })) })) };
+  for (const r of rows) { console.log(`${r.status === 'pass' ? '✓' : '✗'} ${r.case}：${CR.STATUS_LABEL[r.status]}  ${Object.entries(r.counts).filter(([, v]) => v).map(([k, v]) => `${k} ${v}`).join(' · ')}`);
+    for (const i of r.items.filter(x => ['low', 'ran'].includes(x.state)).slice(0, 5)) console.log(`    ${i.pos || i.at} ${CR.DIM_LABEL[i.dim]} ${i.score}：${String(i.reason || '').slice(0, 80)}${i.fix ? `\n      改：${i.fix}` : ''}`); }
+}
 function cmdAssess({ pos, opt }) {
+  if (opt['canary-add']) { const text = String(opt['canary-add']), max = Number(opt.max ?? 1);
+    if (!Number.isInteger(max) || max < 0 || max > 2) die('--max 是这道题最多能给几分（0–2）');
+    const id = addCanary(ROOT, { dim: 'A1', item: text, max_score: max, source: opt.source ? String(opt.source) : 'project', quote: opt.quote ? String(opt.quote) : null });
+    const out = { kind: 'canary', id, text, max }; if (JSON_MODE) return out; console.log(`✓ 考题 #${id}：「${text.slice(0, 60)}」最多 ${max} 分（以后打包时排在内置考题前面）`); return; }
+  if (opt.walk) return assessWalk(opt);
+  if (opt['walk-done']) return assessWalkDone(opt);
+  if (opt.pack) return assessPack(opt);
+  if (opt.apply) return assessApply(opt);
+  if (opt.status) return assessStatus(opt);
   const by = opt.by ? String(opt.by) : 'tool';
   if (opt.plan) {
     const plan = loadPlan(ROOT, String(opt.plan)) || die(`需求 ${opt.plan} 没有评审单`);
@@ -5005,20 +5825,37 @@ function cmdSuggest({ pos, opt }) {
   die(`未知子命令 ${sub}（list | decide | retro）`);
 }
 /** 评审单批准的卡口：每条用例当前指纹的事前评价（现评现存），有未处置 block ⇒ 拒绝理由 */
+/** 评审门槛：不过 → 拒绝的一段话（列最差的几项和 fix），过了 → null */
+function reviewGate(name, { mode = 'run', demand = null } = {}) {
+  const st = reviewStatusOf(name, { demand, mode });
+  const walk = getMeta(ROOT, 'review_gate_since') && tryLoadCase(name)?.kind !== 'smoke' ? walkStateOf(name) : { state: 'ok' };
+  const walkMsg = walk.state === 'ok' ? null : `用例 ${name} ${walk.state === 'missing' ? '还没逐节点走查' : '走查后又改过'}，不能${mode === 'plan' ? '批准' : '开跑'}：acceptkit assess --walk --case ${name} 逐个节点看，改完 acceptkit assess --walk-done ${name} --by <你> --seen <全部节点和预期 id> --notes "…"`;
+  if (st.status === 'pass') return walkMsg;
+  // 项目接入评审门槛（doctor --fix 打开）之前只提示：和质量基线同一个接入点；接入后每条用例都拦，不按用例新旧豁免
+  if (!getMeta(ROOT, 'review_gate_since')) { console.error(`⚠️ 用例 ${name} ${CR.STATUS_LABEL[st.status]}（项目还没接入评审门槛，只提示：acceptkit doctor --fix）`); return null; }
+  const bad = st.items.filter(i => !['ok', 'warn'].includes(i.state)).sort((a, b) => (a.score ?? -1) - (b.score ?? -1)).slice(0, 6);
+  return `用例 ${name} ${CR.STATUS_LABEL[st.status]}，不能${mode === 'plan' ? '批准' : '开跑'}：\n`
+    + bad.map(i => `   · ${i.pos || i.at} ${CR.DIM_LABEL[i.dim]}：${{ missing: '没评', stale: '用例改过、要重评', draft: '只有自评', low: `${i.score} 分`, ran: '跑过了还是 2 分，要补到 3' }[i.state]}${i.reason ? ` —— ${String(i.reason).slice(0, 80)}` : ''}${i.fix ? `\n       改：${i.fix}` : ''}`).join('\n')
+    + `\n   评审：acceptkit assess --pack --case ${name} --json → 新上下文的子 agent 盲审 → acceptkit assess --apply <文件> --by blind`
+    + (walkMsg ? `\n${walkMsg}` : '');
+}
 function planAssessGate(plan, by) {
   const res = [...planCases(plan)].filter(n => tryLoadCase(n)).map(n => assessCase(n, { demand: plan.demand, platform: plan.platform, by }));
   // 没接入质量标准的项目（从没 doctor --fix 登记过基线）与 case-quality.evaluate 同口径：只提示不拦。
   // 接入了的项目不豁免旧用例 —— 那是产品规则；这里豁免的是「项目还没接入」，不是「用例是旧的」
   const onboarded = loadQualityBaseline(ROOT).initialized;
   const bad = onboarded ? res.filter(a => a.gate === 'block') : [];
+  // 评审门槛不看「项目接没接入质量标准」：用例被评审单引用就要评审过
+  const rv = [...planCases(plan)].filter(n => tryLoadCase(n)).map(n => reviewGate(n, { mode: 'plan', demand: plan.demand })).filter(Boolean);
   if (!onboarded && res.some(a => a.gate === 'block')) console.error(`⚠️ 事前评价有拦截项，但项目还没接入质量标准（acceptkit doctor --fix 登记基线后才拦）`);
   const refuse = !bad.length ? null : `${bad.length} 条用例的事前评价有未处置的拦截项：\n`
     + bad.map(a => `   · ${a.case}（${a.total} 分）：` + a.items.filter(i => i.level === 'block' && !i.waived).slice(0, 4).map(i => `${i.target || i.at} ${AS.DIM_LABEL[i.dimension]}`).join('、')).join('\n')
     + `\n   看建议：acceptkit suggest list ${plan.demand}；owner 定：acceptkit suggest decide S<id> --choice adopt|accept|reject --by <他> --quote "<原话>"`;
-  return { res, refuse };
+  const refuse2 = [refuse, ...rv].filter(Boolean).join('\n');
+  return { res, refuse: refuse2 || null };
 }
 
-const coreTable = { assess: cmdAssess, suggest: cmdSuggest, next: cmdNext, context: cmdContext, consult: cmdConsult, read: cmdRead, round: cmdRound, plan: cmdPlan, blockers: cmdBlockers, shot: cmdShot, device: cmdDevice, dup: dupCheck, demands: cmdDemands, cases: cmdCases, new: cmdNew, validate: cmdValidate, coverage: cmdCoverage, run: cmdRun, regress: cmdRegress, record: cmdRecord, report: cmdReport, bug: cmdBug, history: cmdHistory, steps: cmdSteps, gate: cmdGate, probe: cmdProbe, review: cmdReview, reviewq: cmdReviewQ, observe: cmdObserve, platform: cmdPlatform, apparatus: cmdApparatus, refile: cmdRefile, smoke: cmdSmoke, adb: cmdAdb };
+const coreTable = { assess: cmdAssess, suggest: cmdSuggest, next: cmdNext, context: cmdContext, consult: cmdConsult, configset: cmdConfigSet, ask: cmdAsk, clarify: cmdClarify, read: cmdRead, round: cmdRound, plan: cmdPlan, blockers: cmdBlockers, shot: cmdShot, device: cmdDevice, dup: dupCheck, demands: cmdDemands, cases: cmdCases, new: cmdNew, validate: cmdValidate, tidy: cmdTidy, replay: cmdReplay, timing: cmdTiming, tune: cmdTune, coverage: cmdCoverage, run: cmdRun, regress: cmdRegress, record: cmdRecord, report: cmdReport, bug: cmdBug, history: cmdHistory, steps: cmdSteps, gate: cmdGate, probe: cmdProbe, review: cmdReview, reviewq: cmdReviewQ, observe: cmdObserve, platform: cmdPlatform, apparatus: cmdApparatus, refile: cmdRefile, smoke: cmdSmoke, adb: cmdAdb };
 // 领域命令（项目 pack.commands）：签名 (args, HELPERS)。不允许覆盖内核命令。
 const packCommands = Object.fromEntries(Object.entries(PACK.commands || {}).filter(([k]) => !coreTable[k]).map(([k, fn]) => [k, (a) => fn(a, HELPERS)]));
 const table = { ...coreTable, ...packCommands };
@@ -5038,6 +5875,10 @@ if (!table[cmd]) {
   dup                                     建新用例前查重（同一对象多处覆盖 / 近似标题 / 重复断言）
   new <case> --demand <D> --surface <S> --platform ios|android|both|web   用例骨架 + 加进评审单
   validate <case>                         用例校验
+  replay <run>                            执行缓存：照这条用例上次跑通的动作放一遍；跟上次差别大就作废缓存、退回待测，按正常流程重跑核对
+  timing [<demand>] [--json] [--limit N]  验收用时：按需求 / 用例 / 断言，跑过几次、每次多久、机判还是手记
+  tune [show | build | done <包> --note ..]  定期优化包：重复跑的用例时间花在哪、自动批准标准的表现；包里自带处理它要的全部上下文
+  tidy <case> [--write]                   整理给人读的那一层：修订记录挪进 history（一字不改）；列出还要改写成一句话的断言、结论树缺什么
   coverage <case>                         分类树(CTM)覆盖
   run <case> [--demand <D>] [--run id] [--build 组件@版本]   建运行（自动 run_seq + prev_run 挂链）
   regress <demand> [--session id]         回归轮：评审单点名的全部用例各建一轮

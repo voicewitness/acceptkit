@@ -8,12 +8,23 @@
 //
 // 机器判断不了的写成 QUESTIONS：新建用例和评审时列出来，由作者 / 评审人逐条回答。
 // 项目特有的规则（某个已淘汰的观测面、某类用例必须带的守卫）由 pack.qualityRules 追加，格式同 RULES。
-import { guardsOf, nonUiRead, bindingOf } from './evidence-gate.mjs';
+import { guardsOf, nonUiRead, bindingOf, walkClaims, claimExpectIds } from './evidence-gate.mjs';
 import { claimWordsOf, effectClaims, uncoveredClaims, opLayers, fmtMissing, LAYERS, observePointsOf, projectHasLayer, RESEARCH_STEPS } from './claims.mjs';
 import { recipeFor } from './ops.mjs';
 import { normalizePlatforms } from './platform.mjs';
 import { loadQualityBaseline } from './store/db.mjs';
 import { hostOfCase } from './hosts.mjs';
+import { caseClarity } from './clarity.mjs';
+import { caseInputs, walkSteps, inputShapeProblems, countsAsReal, INPUTS } from './input-source.mjs';
+// 冒烟 / 探针读的是运行时装配值，不是在验功能，不套输入来源的规则
+const NO_INPUT_KIND = new Set(['probe', 'smoke']);
+// 一步：一个动作。连接词 / 分号 / 箭头连着几个动作就算几步（只认形状）
+const STEP_MAX = 40;
+const MULTI_ACTION = /[；;]|→|->|，(然后|再|并|接着|之后)|(然后|接着)[^，。]{2,}/;
+// 配置赋值：代码名 / 开关样的名字 = 取值（true / false / 数字 / 短标识）。只按形状认
+const configAssignments = t => [...t.matchAll(/([A-Za-z_][A-Za-z0-9_.]{3,})\s*[=＝]\s*(true|false|on|off|\d+(?:\.\d+)?|[A-Za-z_][A-Za-z0-9_]{0,24})(?![A-Za-z0-9_])/gi)]
+  .filter(m => !/^(https?|url|host|path)$/i.test(m[1])).map(m => `${m[1]}=${m[2]}`);
+const RANK_OF = x => ['real', 'mock-global', 'unknown', 'injected'].indexOf(x);
 
 const NEG_PRED = new Set(['empty', 'none_eq', 'none_match']);
 // 阴性 = 判「没有」：空、都不等于、都不匹配，或计数类取值等于 0。布尔状态 eq false 是在判一个状态，不算阴性
@@ -43,11 +54,16 @@ const TOGGLE = /\b(true|false|on|off|enabled|disabled|yes|no)\b|开启|关闭|�
 const FRESH_INSTALL = /(全新安装|全新装包|首次安装|卸载重装|fresh install)/i;
 const EXEC_STATE_KEYS = ['status', 'result', 'blocked_on', 'root_cause', 'evidence'];
 const EXEC_STATE_TEXT = /(待测|待真机核对|当前必红|已验证通过|本轮通过|暂时跳过)/;
-const NODE_KEYS = new Set(['op', 'tags', 'expect', 'children', 'conclusion', 'given', 'op_id', 'data', 'id', 'note', 'notes', 'applies', 'danger', 'shows', 'quality_waive']);
+const NODE_KEYS = new Set(['op', 'tags', 'expect', 'children', 'conclusion', 'given', 'op_id', 'data', 'id', 'note', 'notes', 'applies', 'danger', 'shows', 'quality_waive', 'input', 'config', 'config_unset', 'params', 'kind', 'nid']);
 const EXPECT_KEYS = new Set(['id', 'assert', 'machine', 'observe', 'applies', 'platform', 'platforms', 'expect_data', 'desc', 'revisions', 'revision', 'assert_orig', 'assert_changelog',
-  'note', 'notes', 'scope_note', 'requires_uninstall', 'uninstall_why', 'tags', 'origin', 'source', 'judge', 'human_why', 'quality_waive', 'via', 'why_not_ui', 'why_not_ui_checked', 'seen_at', 'claims_off', 'why_presence_only']);
+  'note', 'notes', 'scope_note', 'requires_uninstall', 'uninstall_why', 'tags', 'origin', 'source', 'judge', 'human_why', 'quality_waive', 'via', 'why_not_ui', 'why_not_ui_checked', 'seen_at', 'claims_off', 'why_presence_only', 'detail', 'history', 'input', 'see', 'because', 'role', 'demand_ref']);
 const clauses = s => String(s).split(/[；;]|，且|并且|同时|以及/).map(x => x.trim()).filter(x => x.length >= 4);
 const norm = s => String(s).replace(/\s+/g, '').replace(/[0-9]+/g, '#');
+// 代码名：读的人得认识代码才看得懂的词 —— 下划线 / 点 / 冒号 / 斜杠连起来的标识符、小写开头的驼峰、JSON 片段、文件:行号。
+// 只按形状认，不认具体词：哪个项目的代码名都一样拦。连字符词（产品名、域名片段）和大写开头的专名不算
+const CODE_TOKEN = /\b[A-Za-z][A-Za-z0-9]*(?:[_.:\/][A-Za-z0-9]+)+|\b[a-z]+[A-Z][A-Za-z0-9]*|[{\[]\s*["'{]/g;
+export const codeTokens = s => [...new Set(String(s || '').match(CODE_TOKEN) || [])];
+const ASSERT_MAX = 80, CLAIM_MAX = 40, CLAIM_FANOUT = 7;
 // 行话：读的人得先弄懂一个概念才看得懂句子的词。用例正文（标题、为什么、操作、断言）是要念给人听的，
 // 结论尤其如此。内核只带通用的几条；项目自己的行话写在配置 quality.jargon（[{ match: 正则, say: 改成怎么说 }]）。
 // 内核自己的规则文字也过这份清单（test/case-quality-wording.test.mjs）：检查者说行话，这道闸永远不会把自己标红。
@@ -290,6 +306,22 @@ export const RULES = [
       });
       return out; } },
 
+  { id: 'Q39', level: 'block', title: '节点和预期的形状对',
+    why: '分组只是标题：带着操作 / 参数 / 触发声明的「分组」会让挂在下面的预期看起来是真实触发；because 是结构（哪一步、什么输入），写成一句话就回到猜字面；旧的 group 键运行时不认',
+    fix: '旧形状跑 acceptkit doctor --fix；分组改动作 clarify --node <nX> --kind action；because 用 clarify --expect <E> --because-from …',
+    check: ({ c }) => { const out = [], nids = new Map();
+      walkNodes(c.tree, ({ n, path }) => {
+        if ('group' in n) out.push({ at: `节点 ${path}`, msg: '还是旧的 group 键：acceptkit doctor --fix 改成 kind' });
+        if (n.kind != null && !['action', 'group'].includes(n.kind)) out.push({ at: `节点 ${path}`, msg: `kind 只能是 action / group（写了 ${n.kind}）` });
+        if (n.kind === 'group' && (n.op_id || n.params || n.input || n.data)) out.push({ at: `节点 ${path}`, msg: '分组挂着操作 / 参数 / 触发声明：它其实是一步动作' });
+        if (n.nid != null) { if (nids.has(n.nid)) out.push({ at: `节点 ${path}`, msg: `nid ${n.nid} 和 ${nids.get(n.nid)} 重复` }); else nids.set(n.nid, path); }
+        for (const e of n.expect || []) {
+          if (e.because != null && (typeof e.because !== 'object' || !['step', 'state', 'artifact'].includes(e.because.from))) out.push({ at: e.id, msg: 'because 要写成 { from: step|state|artifact, step?, input?, why }' });
+          if (e.role != null && !['claim', 'control', 'precondition'].includes(e.role)) out.push({ at: e.id, msg: `role 只能是 claim / control / precondition（写了 ${e.role}）` });
+        }
+      });
+      return out; } },
+
   { id: 'Q11', level: 'block', title: '对照分支的预期不能一样',
     why: '开关开和关、改动前和改动后两个分支写着同样的断言，测不出开关有没有起作用 —— 两个分支都通过说明不了任何事',
     fix: '对照的那个分支写出不同的预期；两个分支的预期确实一样，说明不需要分成两支',
@@ -310,8 +342,9 @@ export const RULES = [
   { id: 'Q12', level: 'warn', title: '主张要逐条有断言支撑',
     why: '一条主张的 proved_by 列了全部断言，等于没说哪条断言证明了它，复核无从下手',
     fix: 'proved_by 只列真正证明它的那几条',
-    check: ({ c }) => { const n = expects(c).length;
-      return n > 3 ? (c.claims || []).filter(cl => (cl.proved_by || []).length === n).map(cl => ({ at: '主张', msg: `「${String(cl.text).slice(0, 30)}」的 proved_by 是全部 ${n} 条断言` })) : []; } },
+    check: ({ c }) => { const n = expects(c).length, out = [];
+      if (n > 3) walkClaims(c.claims, ({ cl }) => { if ((cl.proved_by || []).length === n) out.push({ at: '主张', msg: `「${String(cl.text).slice(0, 30)}」的 proved_by 是全部 ${n} 条断言` }); });
+      return out; } },
 
   { id: 'Q13', level: 'warn', title: '页面判定不读整页文本',
     why: '整页文本里同时有背景页、隐藏层的旧内容，读到了不代表当前可见的那一层是这个值',
@@ -340,7 +373,143 @@ export const RULES = [
         scan(`节点 ${path}`, '操作', n.op);
         for (const e of n.expect || []) scan(e.id, '断言', e.assert);
       });
+      walkClaims(c.claims, ({ cl, path }) => scan(`主张 ${path}`, '结论树', cl.text));
       return out;
+    } },
+
+  // 下面三条管「给人读的那一层」：断言一句话、结论树盖住全部断言、结论树每层是结论不是做法。
+  // 只按形状判（长度、代码名、条数），不认任何业务词 —— 结论树每层叫什么由写用例的人定。
+  // 试行期只提示：一上来就拦，正在走评审的新用例会整单变成不合格（实测一张等批准的单子一下多了 18 处硬错）；
+  // owner 看过试改结果、定了铺开再改成 block
+  { id: 'Q28', level: 'warn', since: '2026-11-24', title: '断言只写一句话：功能坏了这条会不会失败',
+    why: '断言原文里同时堆着给 owner 看的预期、给执行者看的读数位置、给复核人看的源码依据和几轮修订，实测一条上千字、夹七八个代码名，owner 读不懂就批不了',
+    fix: `assert 只留一句人话（${ASSERT_MAX} 字内、最多点一个被测对象的名字、不换行）；读数位置和依据写进 detail，修订记录写进 history（[{ at, text }]），观测规格照旧写 observe`,
+    check: ({ c }) => expects(c).flatMap(({ e }) => {
+      const a = String(e.assert || ''), why = [];
+      if (a.length > ASSERT_MAX) why.push(`${a.length} 字`);
+      if (/\n/.test(a.trim())) why.push('分了好几段');
+      const ct = codeTokens(a); if (ct.length > 1) why.push(`有 ${ct.length} 个代码名（${ct.slice(0, 3).join('、')}${ct.length > 3 ? '…' : ''}）`);
+      return why.length ? [{ at: e.id, msg: `断言不是一句话：${why.join('，')}` }] : [];
+    }).concat((() => { const by = new Map(); expects(c).forEach(({ e }) => { const k = String(e.assert || '').replace(/[*\s]/g, ''); if (k) by.set(k, [...(by.get(k) || []), e.id]); });
+      // 几条断言一字不差：读的人分不出每条在验什么。差别（哪个入口、哪个分支）要写进这一句
+      return [...by.values()].filter(ids => ids.length > 1).map(ids => ({ at: ids.join('、'), msg: `${ids.length} 条断言一字不差，读的人分不出各自验什么：把这一条和别的不同之处（分支、入口、取值）写进这句话` })); })()) },
+  { id: 'Q29', level: 'warn', since: '2026-11-24', title: '断言多的用例要有结论树，每条断言都挂在树上',
+    why: '操作树是按执行顺序组织的，几十条断言平铺在操作步骤下面，读的人看不出它们合起来要证明什么、分哪几方面；没挂到结论上的断言，没人说得清它为什么存在',
+    fix: '写 claims：根是这条用例要证明的结论，children 拆成几方面，叶子的 proved_by 列证实它的断言；每条断言至少挂在一个叶子上',
+    check: ({ c }) => {
+      const all = expects(c).map(({ e }) => e.id).filter(Boolean);
+      if (all.length < 4) return [];
+      if (!(c.claims || []).length) return [{ at: '用例', msg: `${all.length} 条断言，没有结论树（claims）` }];
+      const hung = new Set((c.claims || []).flatMap(claimExpectIds));
+      const loose = all.filter(id => !hung.has(id));
+      return loose.length ? [{ at: '结论树', msg: `${loose.length} 条断言没挂到任何结论上：${loose.slice(0, 8).join(' ')}${loose.length > 8 ? ' …' : ''}` }] : [];
+    } },
+  { id: 'Q30', level: 'warn', since: '2026-11-24', title: '结论树每层写结论，不写做法；一层别挂太多',
+    why: '结论树是给人一眼看懂「要证明什么、分哪几方面」的；节点上写成操作步骤、贴配置原文，或者一层挂十几条，就又退回成看不懂的清单',
+    fix: `每个主张一句话（${CLAIM_MAX} 字内、最多点一个被测对象的名字、不写步骤）；一层超过 ${CLAIM_FANOUT} 条就再分一层 children`,
+    check: ({ c }) => {
+      const out = [];
+      if ((c.claims || []).length > CLAIM_FANOUT && !(c.claims || []).some(cl => (cl.children || []).length))
+        out.push({ at: '结论树', msg: `顶层平铺了 ${c.claims.length} 条主张，没有分层` });
+      walkClaims(c.claims, ({ cl, path }) => {
+        const t = String(cl.text || ''), why = [];
+        if (t.length > CLAIM_MAX) why.push(`${t.length} 字`);
+        // 和断言同一口径：点一个被测对象的名字可以，多了就是在讲实现
+        if (codeTokens(t).length > 1) why.push(`有 ${codeTokens(t).length} 个代码名（${codeTokens(t).slice(0, 2).join('、')}）`);
+        if (/[①②③]|^\s*\d+[.、)]/.test(t)) why.push('写成了步骤');
+        if (why.length) out.push({ at: `主张 ${path}`, msg: `「${t.slice(0, 20)}…」${why.join('，')}` });
+        if ((cl.proved_by || []).length > CLAIM_FANOUT) out.push({ at: `主张 ${path}`, msg: `直接挂了 ${cl.proved_by.length} 条断言，再分一层` });
+        if ((cl.children || []).length > CLAIM_FANOUT) out.push({ at: `主张 ${path}`, msg: `下一层有 ${cl.children.length} 条，再分一层` });
+      });
+      return out;
+    } },
+  // ── 步骤结构（2026-11-25，试行只提示）：读的人要一眼看清「在什么配置下、做了哪几步、每步看到什么」 ──
+  // 实测：一个项目两千多个步骤里，三成多一段话塞了好几个动作，近一半把开关 / AB / mock 值写在步骤文字里，步骤中位数 74 字、最长的一成超过 500 字
+  { id: 'Q35', level: 'warn', since: '2026-11-25', title: '一步只写一件事',
+    why: '一段话里塞好几个动作，读的人分不清哪一步做了什么、截图该对哪一步，执行的人也只能整段照念；解释、依据混在步骤里，步骤本身就看不见了',
+    fix: `op 只写这一步做什么（${STEP_MAX} 字内，一个动作）；几个动作拆成几个节点；要填的值写进 params（{ 名: 值 }）；为什么这么做写进 note；常用的一串步骤登记成操作（ops set … --steps …），节点挂 op_id`,
+    check: ({ c }) => { const out = []; walkSteps(c.tree, ({ id, n }) => {
+      const t = String(n.op || ''), why = [];
+      if (t.length > STEP_MAX) why.push(`${t.length} 字`);
+      if (MULTI_ACTION.test(t)) why.push('连着写了几个动作');
+      if (why.length) out.push({ at: id, msg: `「${t.slice(0, 24)}…」${why.join('，')}` });
+    }); return out; } },
+  { id: 'Q37', level: 'block', since: '2026-11-25', title: '每一步、每条预期都要有操作步骤（先写大致的也行）',
+    why: '第一次写用例时也大致知道进哪一页、看什么，只是不一定准（例：某个按钮要滑动才看得到）；一条预期连操作步骤都没有、一步是没填的模板，读的人和执行的人都无从下手',
+    fix: '预期写 see：进哪一页、看哪一行、怎样算对（acceptkit clarify <用例> --expect <E> --see …）；步骤写成「动作 + 对象」，或挂带人看步骤的操作。跑过以后照实际做的改准',
+    check: ({ c, ops }) => { if (!ops || c.kind === 'probe' || c.kind === 'smoke') return []; const k = caseClarity(c, ops); return [...k.steps, ...k.expects].filter(x => x.level === 'missing'); } },
+  { id: 'Q38', level: 'warn', since: '2026-11-25', title: '操作步骤要准：在哪一页点什么、看哪一行',
+    why: '大致的步骤（「看上报」「发一条 trigger」）换个人照着做不出来；跑过一次就知道页面长什么样了，跑过还不准的用例不能再开跑',
+    fix: '照实际做的改准：acceptkit clarify <用例> --json 给出那次执行的事实和写回命令；命令放进操作集（--to-op），步骤只写人话',
+    check: ({ c, ops }) => { if (!ops || c.kind === 'probe' || c.kind === 'smoke') return []; const k = caseClarity(c, ops); return [...k.steps, ...k.expects].filter(x => x.level === 'vague'); } },
+  { id: 'Q36', level: 'warn', since: '2026-11-25', title: '配置写进配置集，不写在步骤里',
+    why: '开关、AB、mock 值写在步骤文字里：读的人分不出哪些是配置、哪些是操作，两组用例的配置差在哪只能逐字对，换一份配置要改每一条用例',
+    fix: '把这些值登记成配置集（acceptkit configset set <id> --title … --item 名=值 --kind mock|env --why …），用例或这一支节点写 config: [<id>]',
+    check: ({ c, cfgSets }) => { const out = []; const known = cfgSets || {};
+      for (const id of [].concat(c.config || [])) if (cfgSets && !known[id]) out.push({ at: '用例', msg: `config 引用的配置集 ${id} 不存在（acceptkit configset show）` });
+      walkSteps(c.tree, ({ id, n }) => {
+        for (const k of [].concat(n.config || [])) if (cfgSets && !known[k]) out.push({ at: id, msg: `config 引用的配置集 ${k} 不存在` });
+        const hit = configAssignments(String(n.op || ''));
+        if (hit.length) out.push({ at: id, msg: `步骤里写着配置值：${hit.slice(0, 3).join('、')}${hit.length > 3 ? ' …' : ''}` });
+      }); return out; } },
+
+  // ── 触发方式（2026-11-25）：操作树上每一步怎么触发被测系统。注入构造好的输入只验了判定那一段，真实组装那一段没人验过 ──
+  // 实测：一条链路用例往判定入口注入的事件里直接写好了一个调用点字段，三轮全过；真实流量里这个字段算不出来，整条链路不生效，是 QA 抓包才发现的。
+  // 不知道就不算真实：说不清怎么触发的步骤，下面的断言不能拿来证明真实路径（见 core/input-source.mjs）
+  { id: 'Q31', level: 'block', since: '2026-11-25', title: '每一步都要说清怎么触发：真实路径 / 只 mock 全局信号 / 直接注入',
+    why: '同一句断言，经真实路径触发和把构造好的输入直接交给判定入口，证明的是两回事；操作只写一句话、没挂操作库里登记过的操作，评审时谁也看不出这一步是不是在注入',
+    fix: '节点挂 op_id 并给操作登记 ops set <op> --input real|mock-global|injected，或在节点上写 input: { from, why }；不知道怎么真实触发：acceptkit consult <用例> --node <节点>（读被测代码给线索，提建议交 owner 定）',
+    check: ({ c, ops, cfgSets }) => {
+      if (!ops || NO_INPUT_KIND.has(c.kind)) return [];
+      const ids = new Set(expects(c).map(x => x.e.id)), out = [];
+      walkSteps(c.tree, ({ id, n }) => inputShapeProblems(n, ids, `${id} 的 input`).forEach(msg => out.push({ at: id, msg })));
+      for (const x of caseInputs(c, ops, cfgSets)) {
+        inputShapeProblems(x.e, ids).forEach(msg => out.push({ at: x.id, msg }));
+        if (x.declared && RANK_OF(x.declared) < RANK_OF(x.from)) out.push({ at: x.id, msg: `断言写 input=${x.declared}，链上的步骤 / 观测操作是 ${x.from}：按更假的算` });
+      }
+      const unk = new Map();
+      for (const x of caseInputs(c, ops, cfgSets)) for (const s of x.steps) if (s.from === 'unknown' && !(x.declared && INPUTS[x.declared])) unk.set(s.id, s.op);
+      for (const [id, op] of unk) out.push({ at: id, msg: `「${op}」没说怎么触发（没挂登记了 --input 的操作，节点上也没写 input）` });
+      return out;
+    } },
+  { id: 'Q32', level: 'block', title: '一条用例至少要有一条断言经真实路径触发',
+    why: '断言全是直接注入：这条用例和单测没有区别，真实路径上组装输入的那一段一次都没走过',
+    fix: '至少有一条断言整条链都是真实路径（或只 mock 了全局信号）；不知道怎么真实触发：acceptkit consult <用例> --node <节点>',
+    check: ({ c, ops, cfgSets }) => {
+      if (!ops || NO_INPUT_KIND.has(c.kind)) return [];
+      const xs = caseInputs(c, ops, cfgSets).filter(x => x.e.observe || x.e.input || x.e.judge === 'human');
+      // 只拦「有注入、没真实」的：全是说不清的由 Q31 拦（存量只提示），这里不替它判
+      return xs.some(x => x.from === 'injected') && !xs.some(countsAsReal)
+        ? [{ at: '用例', msg: `${xs.length} 条断言没有一条经真实路径触发（直接注入的：${xs.filter(x => x.from === 'injected').map(x => x.id).join(' ')}）` }] : [];
+    } },
+  { id: 'Q33', level: 'warn', since: '2026-11-25', title: '直接注入的断言只算低分证据',
+    why: '注入时手写的字段，正是真实世界里要由系统自己算出来的；注入通过只说明「输入对了判定就对」，说明不了「真实输入会是对的」',
+    fix: '用例评审时 acceptkit consult <用例> --node <节点>：顺着代码线索追到真实情况下产生这个输入的入口，写成测法建议交 owner 定；他同意就改成真实触发。追不到也补不出入口，在这一步写 input.research 并登记 finding',
+    check: ({ c, ops, cfgSets }) => !ops || NO_INPUT_KIND.has(c.kind) ? [] : caseInputs(c, ops, cfgSets).filter(x => x.from === 'injected')
+      .map(x => ({ at: x.id, msg: x.research?.alt ? `直接注入；研究过的替代测法：${String(x.research.alt).slice(0, 40)}` : '直接注入，还没研究过不用注入怎么触发' })) },
+  { id: 'Q34', level: 'block', title: '手写的输入字段要说清是全局信号还是调用点字段；调用点字段不能只靠 mock',
+    why: '在步骤里手写调用点字段（本该由系统按这一次调用算出来的值），等于替系统把最容易出错的那一步做了；全局信号（全局特征、AB / 配置值）mock 不改变输入怎么组装，但也要让评审人知道为什么不用真值',
+    fix: '节点或断言的 input.mocks 逐项写 { field, scope: global|call-site|tool, why }（tool = 操作自己的参数，如打到哪个入口，不进被测系统的输入）；mock-global 写 input.why；call-site 字段真要手写，写 why 并用 input.real_twin 指向一条证明同一结论的真实对照（real，或只 mock 了全局信号的 mock-global）',
+    check: ({ c, ops, cfgSets }) => {
+      if (!ops || NO_INPUT_KIND.has(c.kind)) return [];
+      const all = caseInputs(c, ops, cfgSets), byId = new Map(all.map(x => [x.id, x])), out = [];
+      for (const x of all) {
+        const said = new Set(x.mocks.map(m => m.field)), un = x.fields.filter(f => !said.has(f));
+        if (un.length) out.push({ at: x.id, msg: `手写了 ${un.slice(0, 6).join('、')}${un.length > 6 ? ' …' : ''}，没在 input.mocks 里说清是全局信号还是调用点字段` });
+        // 节点上自己声明「真实」、文字里又写着字段：要说清这是真实请求自带的内容 —— 不然一句声明就把手写字段全放过了
+        for (const s of x.realLiteral) out.push({ at: s.id, msg: `声明是真实触发，文字里却写着 ${s.fields.slice(0, 4).join('、')}：在 input.why 里说清这是真实请求 / 操作自带的内容，不是替系统填的字段` });
+        if (x.from === 'mock-global' && !x.why && !x.mocks.some(m => m.why)) out.push({ at: x.id, msg: '只 mock 全局信号，没写为什么不用真值（input.why）' });
+        for (const m of x.mocks) {
+          if (m.scope === 'global' && !String(m.why || '').trim()) out.push({ at: x.id, msg: `mock 了全局信号「${m.field}」，没写 why` });
+          if (m.scope === 'tool' && !String(m.why || '').trim()) out.push({ at: x.id, msg: `「${m.field}」标成操作自己的参数，没写 why（为什么它不进被测系统的输入）` });
+          if (m.scope !== 'call-site') continue;
+          const tw = x.twin && byId.get(x.twin), ok = countsAsReal(tw);
+          if (!String(m.why || '').trim() || !ok)
+            out.push({ at: x.id, msg: `手写了调用点字段「${m.field}」${!String(m.why || '').trim() ? '，没写 why' : ''}${!x.twin ? '，也没有 real_twin 指向证明同一结论的真实对照' : !ok ? `，real_twin ${x.twin} 本身不是真实触发（要 real，或只 mock 了全局信号的 mock-global）` : ''}` });
+        }
+      }
+      // 同一处问题在一条链下的每条断言上都会报一遍：按（位置、话）去重
+      return [...new Map(out.map(f => [`${f.at}|${f.msg}`, f])).values()];
     } },
 ];
 
@@ -365,12 +534,12 @@ function waivedBy(c, f) {
 }
 
 /** 检查一条用例 → [{ rule, level, title, at, msg, why, fix, waived? }] */
-export function checkCase(c, { packRules = [], extraKeys = {}, cfg = {}, hosts = {}, ops = null } = {}) {
+export function checkCase(c, { packRules = [], extraKeys = {}, cfg = {}, hosts = {}, ops = null, cfgSets = null } = {}) {
   const ek = { node: new Set(extraKeys.node || []), expect: new Set(extraKeys.expect || []) };
   const out = [];
   for (const r of [...RULES, ...packRules]) {
     let fs = [];
-    try { fs = r.check({ c, extraKeys: ek, cfg, hosts, ops }) || []; } catch (e) { fs = [{ at: '用例', msg: `规则执行出错：${e.message}` }]; }
+    try { fs = r.check({ c, extraKeys: ek, cfg, hosts, ops, cfgSets }) || []; } catch (e) { fs = [{ at: '用例', msg: `规则执行出错：${e.message}` }]; }
     for (const f of fs) {
       const x = { rule: r.id, level: r.level, since: r.since, title: r.title, why: r.why, fix: r.fix, ...f };
       const w = waivedBy(c, x);
@@ -423,4 +592,21 @@ export function standardSummary(packRules = []) {
   return ['用例质量标准（validate / 评审单 / 开跑时检查；✗ 不达标不能批准、不能开跑）',
     ...rs.map(r => `   ${r.level === 'block' ? '✗' : '⚠'} ${r.id} ${r.title} —— ${r.fix}`),
     '   写完后自问（机器判断不了，评审时也会问）：', ...QUESTIONS.map(q => `     · ${q}`)].join('\n');
+}
+
+// ── 机械整理：把断言原文里堆着的修订记录挪进 history，一个字不改 ──
+// 只搬「带日期的修订段落及其后面的续段」，正文原样留在 assert。正文拆成一句话不做机械处理：
+// 按句号截出来的第一句常常只是个标签（「开关：xxx。」），形状上像一句话、其实什么也没断言 ——
+// 那一句要写用例的人照「功能坏了这条会不会失败」改写，旧正文整段挪进 detail；改写是改意思，批准后改要写理由、旧结论作废重测。
+const REVISION_PARA = /\d{4}-\d{2}-\d{2}[^\n]{0,40}(修订|更正|撤回|作废|补记|改判)|(修订|更正|撤回|作废)[^\n]{0,20}\d{4}-\d{2}-\d{2}/;
+export function splitAssert(e) {
+  const paras = String(e?.assert || '').split(/\n+/).map(p => p.trim()).filter(Boolean);
+  // 第一段永远是正文；从第一个带日期的修订段起，后面都算修订记录（续段没有日期，但接着上一段说）
+  const cut = paras.findIndex((p, i) => i > 0 && REVISION_PARA.test(p));
+  const body = cut < 0 ? paras : paras.slice(0, cut);
+  const h = cut < 0 ? [] : paras.slice(cut).map(t => ({ at: (t.match(/\d{4}-\d{2}-\d{2}/) || [''])[0], text: t }));
+  // 正文第一段是断言；后面的段落（依据、预期产出、判据面 …）是给复核的人看的，原样挪进 detail
+  const extra = body.slice(1);
+  if (!h.length && !extra.length) return null;
+  return { ...e, assert: body[0], ...(extra.length ? { detail: [e.detail, ...extra].filter(Boolean).join('\n') } : {}), ...(h.length ? { history: [...[].concat(e.history || []), ...h] } : {}) };
 }

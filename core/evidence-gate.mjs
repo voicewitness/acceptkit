@@ -454,20 +454,30 @@ export function orphanImages(dir, r) {
   return out;
 }
 
-// 用例主张：c.claims = [{ text, proved_by: [断言 id] }]。标题/摘要里说出口的每句话都要有断言撑着，
-// 且这些断言都 pass 并通过复核 —— 否则就是「标题说了、没人验过」。
+// 用例主张 = 结论树：c.claims = [{ text, proved_by: [断言 id], children: [主张…] }]。
+// 根是这条用例要证明的结论，往下拆成几方面，叶子由断言证实 —— 给人读、给 owner 批的是这棵树；
+// 操作树（c.tree）是给执行者按顺序跑的，两棵树靠断言 id 连起来。
+// 标题/摘要里说出口的每句话都要有断言撑着，且这些断言都 pass 并通过复核 —— 否则就是「标题说了、没人验过」。
+/** 遍历结论树：fn({ cl, depth, path }) */
+export function walkClaims(claims, fn, depth = 1, path = []) {
+  (claims || []).forEach((cl, i) => { const p = [...path, i + 1]; fn({ cl, depth, path: p.join('.') }); walkClaims(cl.children, fn, depth + 1, p); });
+}
+/** 一条主张连同它下面各层引用的全部断言 id */
+export const claimExpectIds = cl => [...(cl.proved_by || []), ...(cl.children || []).flatMap(claimExpectIds)];
 export function claimGaps(c, r) {
   const out = [];
-  for (const cl of c.claims || []) {
-    const ids = cl.proved_by || [];
-    if (!ids.length) { out.push(`「${cl.text}」没有 proved_by`); continue; }
-    const bad = ids.filter(id => {
-      const v = r.results?.[id];
-      if (!v || v.status !== 'pass') return true;
-      return (v.evidence || []).some(ev => (r.reviews?.[rkey(id, ev)]?.state || 'pending') !== 'ok');
-    });
-    if (bad.length) out.push(`「${cl.text}」未被证实：${bad.map(id => `${id}=${r.results?.[id]?.status || '?'}`).join(' ')}`);
-  }
+  const bad = id => {
+    const v = r.results?.[id];
+    if (!v || v.status !== 'pass') return true;
+    return (v.evidence || []).some(ev => (r.reviews?.[rkey(id, ev)]?.state || 'pending') !== 'ok');
+  };
+  walkClaims(c.claims, ({ cl }) => {
+    const ids = cl.proved_by || [], kids = cl.children || [];
+    if (!ids.length && !kids.length) { out.push(`「${cl.text}」没有 proved_by`); return; }
+    // 上层主张：它下面任何一条没证实，它就没证实（下层各自另报一条，这里只报数）
+    const miss = claimExpectIds(cl).filter(bad);
+    if (miss.length) out.push(`「${cl.text}」未被证实：${[...new Set(miss)].map(id => `${id}=${r.results?.[id]?.status || '?'}`).join(' ')}`);
+  });
   return out;
 }
 
